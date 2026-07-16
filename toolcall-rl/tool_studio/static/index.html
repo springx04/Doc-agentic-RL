@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>OpenClaw Tool Studio</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header>
+    <div><strong>OpenClaw Tool Studio</strong><span>Document tool-call test bench</span><span id="version">server: loading</span></div>
+    <div id="status" class="status idle">就绪</div>
+  </header>
+  <main>
+    <aside class="settings">
+      <h2>模型 API</h2>
+      <label>Base URL<input id="baseUrl" value="https://api.deepseek.com" spellcheck="false"></label>
+      <label>API Key<input id="apiKey" type="password" placeholder="可留空（本地服务）" autocomplete="off"></label>
+      <label>Model<input id="model" value="deepseek-chat" placeholder="例如 Qwen/Qwen3-4B-Instruct"></label>
+      <label>Temperature<input id="temperature" type="number" value="0.1" min="0" max="2" step="0.1"></label>
+      <label>Max turns<input id="maxTurns" type="number" value="8" min="1" max="16"></label>
+      <label>System prompt<textarea id="systemPrompt" rows="6">You are a document-understanding agent. Use the provided tools when evidence from the document is needed. Use absolute local paths supplied by the user. Summarize results precisely. An output image path is not visual input to the language model. When you need text or visual evidence from a page or region, call ocr_region and rely on the returned OCR text. Do not repeat render_page, crop_region, or zoom_region for the same region unless their arguments materially differ. Verify every Figure or Table reference against its caption and page; if the question conflates two sources, explicitly identify the mismatch rather than combining them as if they were one figure.</textarea></label>
+      <p class="hint">API Key 仅保存在当前浏览器内存，并只随本次请求发送到你配置的端点。</p>
+      <h2>已注册工具</h2>
+      <div id="tools" class="tools">加载中…</div>
+    </aside>
+    <section class="workspace">
+      <section class="task-panel">
+        <div class="panel-heading"><h1>Agent 任务</h1><div class="task-actions"><button id="referenceButton" class="icon-button" type="button">离线 ToolRL 验证</button><button id="runButton" type="button">运行 Agent</button></div></div>
+        <label>Document path<input id="documentPath" value="C:\Users\30738\Desktop\project\agent\paper\ToolRL.pdf" spellcheck="false"></label>
+        <textarea id="prompt" rows="7">According to the paper text and Figure 1, what tool-use behavior is ToolRL illustrating, and in the right-side response shown inside Figure 1, what missing information does the green sentence say prevents buying the movie ticket? Answer with both the paper-context claim and the visual evidence from the figure.</textarea>
+      </section>
+      <section class="result-panel">
+        <div class="panel-heading"><h2>最终回答</h2><button id="clearButton" class="icon-button" type="button" title="清空本次记录">清空</button></div>
+        <pre id="answer">尚未运行。</pre>
+      </section>
+      <section class="log-panel">
+        <div class="panel-heading"><h2>运行日志</h2><div class="log-actions"><span id="turnCount">0 turns</span><button id="copyLogsButton" class="icon-button" type="button">复制日志</button></div></div>
+        <div id="logs" aria-live="polite"></div>
+      </section>
+    </section>
+  </main>
+  <template id="logTemplate"><article class="log-entry"><div class="log-meta"></div><pre></pre></article></template>
+  <script src="/app.js"></script>
+</body>
+</html>
