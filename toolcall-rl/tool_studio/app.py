@@ -79,6 +79,7 @@ for dependency_path in (Path(site.getusersitepackages()), *_store_sites, _TEMP_B
         sys.path.append(str(dependency_path))
 
 from tool_sandbox import tool_registry  # noqa: E402
+from tool_protocol import parse_assistant_action  # noqa: E402
 
 
 def json_text(value: Any) -> str:
@@ -126,25 +127,43 @@ def openai_chat_completion(config: dict[str, Any], messages: list[dict[str, Any]
 
 
 def text_tool_call(content: str) -> tuple[str, dict[str, Any]] | None:
-    """Accept the JSON/XML tool-call formats used by the rollout templates."""
-    json_match = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", content, re.DOTALL)
-    if json_match:
-        try:
-            call = json.loads(json_match.group(1))
-            return str(call["name"]), dict(call.get("arguments", {}))
-        except (KeyError, TypeError, json.JSONDecodeError):
-            return None
-    xml_match = re.search(r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>", content, re.DOTALL)
-    if not xml_match:
+    """Return a text tool call only when the whole assistant turn parses."""
+    parsed = parse_assistant_action(content)
+    if parsed.kind != "tool_call" or not isinstance(parsed.value, dict):
         return None
-    arguments: dict[str, Any] = {}
-    for match in re.finditer(r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>", xml_match.group(2), re.DOTALL):
-        value = match.group(2)
-        try:
-            arguments[match.group(1)] = json.loads(value)
-        except json.JSONDecodeError:
-            arguments[match.group(1)] = value
-    return xml_match.group(1).strip(), arguments
+    return str(parsed.value["name"]), dict(parsed.value.get("arguments", {}))
+
+
+def _validate_tool_action(name: str, arguments: dict[str, Any]) -> tuple[bool, str | None]:
+    """Reject placeholder/example arguments before sending them to a tool."""
+    if name not in tool_registry.tools:
+        return False, f"unknown tool: {name}"
+    if not isinstance(arguments, dict):
+        return False, "tool arguments must be an object"
+    if "_invalid_arguments" in arguments:
+        return False, "tool arguments are not valid JSON"
+
+    def visit(value: Any, key: str | None = None) -> str | None:
+        if isinstance(value, str) and (key or "").endswith("path"):
+            normalized = value.strip().casefold().replace("\\", "/")
+            if normalized in {"/path/to/file.pdf", "/path/to/document.pdf", "path/to/file.pdf", "path/to/document.pdf"}:
+                return f"placeholder path is not a valid parameter: {value}"
+            if "/path/to/" in normalized or (normalized.startswith("<") and normalized.endswith(">")):
+                return f"placeholder path is not a valid parameter: {value}"
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                reason = visit(child_value, str(child_key))
+                if reason:
+                    return reason
+        elif isinstance(value, list):
+            for child_value in value:
+                reason = visit(child_value, key)
+                if reason:
+                    return reason
+        return None
+
+    reason = visit(arguments)
+    return reason is None, reason
 
 
 def event(kind: str, **payload: Any) -> str:
@@ -290,6 +309,15 @@ def run_agent(payload: dict[str, Any]) -> Iterator[str]:
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
+    action_stats = {
+        "candidate_action_count": 0,
+        "executed_action_count": 0,
+        "valid_action_count": 0,
+        "invalid_action_count": 0,
+        "ignored_action_count": 0,
+        "protocol_error_count": 0,
+        "tool_error_count": 0,
+    }
     yield event("run_started", max_turns=max_turns, tool_count=len(tool_registry.get_tool_specs()))
 
     for turn in range(1, max_turns + 1):
@@ -311,10 +339,22 @@ def run_agent(payload: dict[str, Any]) -> Iterator[str]:
 
         content = choice.get("content") or ""
         native_calls = choice.get("tool_calls") or []
-        parsed_text_call = text_tool_call(content) if not native_calls else None
+        parsed_text_action = parse_assistant_action(content) if not native_calls else None
         yield event("assistant", turn=turn, content=content, finish_reason=response["choices"][0].get("finish_reason"))
 
         if native_calls:
+            action_stats["candidate_action_count"] += len(native_calls)
+            if len(native_calls) != 1 or content.strip():
+                action_stats["invalid_action_count"] += max(1, len(native_calls))
+                action_stats["ignored_action_count"] += len(native_calls)
+                action_stats["protocol_error_count"] += 1
+                yield event(
+                    "protocol_error",
+                    turn=turn,
+                    reason="assistant turn must contain exactly one native tool call and no suffix text",
+                    **action_stats,
+                )
+                return
             messages.append({"role": "assistant", "content": content, "tool_calls": native_calls})
             calls = []
             for call in native_calls:
@@ -324,21 +364,60 @@ def run_agent(payload: dict[str, Any]) -> Iterator[str]:
                 except json.JSONDecodeError as exc:
                     arguments = {"_invalid_arguments": str(exc), "_raw": function.get("arguments")}
                 calls.append((str(call.get("id", "")), str(function.get("name", "")), arguments))
-        elif parsed_text_call:
-            name, arguments = parsed_text_call
+        elif parsed_text_action is not None and parsed_text_action.kind == "tool_call":
+            action_stats["candidate_action_count"] += parsed_text_action.candidate_action_count
+            name = str(parsed_text_action.value["name"])
+            arguments = dict(parsed_text_action.value.get("arguments", {}))
             messages.append({"role": "assistant", "content": content})
             calls = [("text-call", name, arguments)]
-        else:
+        elif parsed_text_action is not None and parsed_text_action.kind == "final":
+            action_stats["candidate_action_count"] += parsed_text_action.candidate_action_count
+            action_stats["valid_action_count"] += 1
+            messages.append({"role": "assistant", "content": content})
+            yield event("rollout_summary", rollout_status="completed", valid_for_rl=True, **action_stats)
             yield event("completed", answer=content, turns=turn)
+            return
+        else:
+            candidate_count = parsed_text_action.candidate_action_count if parsed_text_action is not None else 0
+            action_stats["candidate_action_count"] += candidate_count
+            action_stats["invalid_action_count"] += max(1, candidate_count)
+            action_stats["ignored_action_count"] += candidate_count
+            action_stats["protocol_error_count"] += 1
+            yield event(
+                "protocol_error",
+                turn=turn,
+                reason=(parsed_text_action.reason if parsed_text_action is not None else "no assistant action"),
+                **action_stats,
+            )
             return
 
         for call_id, name, arguments in calls:
+            valid, validation_error = _validate_tool_action(name, arguments)
+            if not valid:
+                action_stats["invalid_action_count"] += 1
+                action_stats["ignored_action_count"] += 1
+                action_stats["protocol_error_count"] += 1
+                yield event(
+                    "protocol_error",
+                    turn=turn,
+                    reason=validation_error,
+                    **action_stats,
+                )
+                return
+        action_stats["valid_action_count"] += 1
+
+        for call_id, name, arguments in calls:
+            action_stats["executed_action_count"] += 1
             result = yield from run_registered_tool(turn, call_id, name, arguments)
+            result_kind = result_status(result)
+            if result_kind != "ok":
+                action_stats["tool_error_count"] += 1
             if call_id == "text-call":
                 messages.append({"role": "user", "content": f"<tool_result name=\"{name}\">\n{result}\n</tool_result>"})
             else:
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
 
+    yield event("rollout_summary", rollout_status="model_protocol_error", valid_for_rl=True, **action_stats)
     yield event("completed", answer="Agent reached the configured maximum number of turns.", turns=max_turns)
 
 

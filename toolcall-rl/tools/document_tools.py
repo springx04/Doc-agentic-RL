@@ -895,6 +895,7 @@ def _parse_pdf_document(path: Path, page_range: tuple[int, int] | None = None) -
             pages.append(
                 {
                     "page_number": page_number,
+                    "markdown": "\n\n".join(page_markdown),
                     "width": float(page.rect.width),
                     "height": float(page.rect.height),
                     "text": text,
@@ -1023,6 +1024,97 @@ def _parse_document_local(path: Path, page_range: tuple[int, int] | None = None)
     return _parse_text_document(path)
 
 
+def _requested_page_numbers(arguments: dict[str, Any]) -> list[int] | None:
+    value = arguments.get("page_numbers")
+    if value not in (None, "", []):
+        if isinstance(value, str):
+            value = [part.strip() for part in value.split(",") if part.strip()]
+        if not isinstance(value, (list, tuple, set)):
+            raise ValueError("page_numbers must be a list of 1-based page numbers")
+        pages = sorted({int(item) for item in value})
+        if any(page < 1 for page in pages):
+            raise ValueError("page_numbers must contain values >= 1")
+        return pages
+    page_range = _parse_page_range(arguments.get("page_range"))
+    if page_range is None:
+        return None
+    start, end = page_range
+    if start < 1 or end < start:
+        raise ValueError("page_range must be a valid 1-based inclusive range")
+    return list(range(start, end + 1))
+
+
+def _page_records_from_document(path: Path, document: dict[str, Any], markdown: str) -> list[dict[str, Any]]:
+    """Convert local parser output into stable page-boundary records."""
+    raw_pages = document.get("pages") if isinstance(document, dict) else None
+    if isinstance(raw_pages, list) and raw_pages:
+        records: list[dict[str, Any]] = []
+        for index, page in enumerate(raw_pages, start=1):
+            if not isinstance(page, dict):
+                continue
+            page_number = int(page.get("page_number", index))
+            page_markdown = str(page.get("markdown") or page.get("text") or "").strip()
+            if not page_markdown.startswith("#"):
+                page_markdown = f"## Page {page_number}\n\n{page_markdown}".strip()
+            records.append({"page_number": page_number, "markdown": page_markdown, "source": page})
+        if records:
+            return records
+
+    slides = document.get("slides") if isinstance(document, dict) else None
+    if isinstance(slides, list) and slides:
+        records = []
+        for index, slide in enumerate(slides, start=1):
+            slide_number = int(slide.get("slide_number", index)) if isinstance(slide, dict) else index
+            texts = slide.get("texts", []) if isinstance(slide, dict) else []
+            body = "\n\n".join(str(item) for item in texts if str(item).strip())
+            records.append({"page_number": slide_number, "markdown": f"## Slide {slide_number}\n\n{body}".strip(), "source": slide})
+        return records
+
+    # DOCX, image and plain-text inputs are single logical pages for the
+    # purpose of follow-up reads.  The explicit boundary is still valuable to
+    # the agent and keeps the return schema uniform across formats.
+    body = markdown.strip()
+    return [{"page_number": 1, "markdown": f"## Page 1\n\n{body}".strip(), "source": document}]
+
+
+def _select_page_records(
+    records: list[dict[str, Any]],
+    requested_pages: list[int] | None,
+    max_chars: int,
+) -> tuple[list[dict[str, Any]], bool, bool]:
+    page_count = len(records)
+    available = {int(page["page_number"]) for page in records}
+    selected_numbers = requested_pages if requested_pages is not None else [int(page["page_number"]) for page in records]
+    missing = [page for page in selected_numbers if page not in available]
+    if missing:
+        raise ValueError(f"requested page does not exist: {missing[0]}")
+
+    selected = [page for page in records if int(page["page_number"]) in set(selected_numbers)]
+    returned: list[dict[str, Any]] = []
+    used_chars = 0
+    truncated = False
+    for page in selected:
+        page_copy = dict(page)
+        page_copy.pop("source", None)
+        page_markdown = str(page_copy.get("markdown", ""))
+        separator_chars = 2 if returned else 0
+        if max_chars > 0 and used_chars + separator_chars + len(page_markdown) > max_chars:
+            if not returned:
+                remaining = max(1, max_chars - separator_chars)
+                page_copy["markdown"] = page_markdown[:remaining] + f"\n... [truncated {len(page_markdown) - remaining} chars]"
+                returned.append(page_copy)
+            truncated = True
+            break
+        returned.append(page_copy)
+        used_chars += separator_chars + len(page_markdown)
+
+    returned_numbers = {int(page["page_number"]) for page in returned}
+    has_more_pages = returned_numbers != set(range(1, page_count + 1))
+    if len(returned) < len(selected):
+        truncated = True
+    return returned, truncated, has_more_pages
+
+
 def parse_document(arguments: dict[str, Any]) -> str:
     tool = "parse_document"
     document_path = _path_arg(arguments, "document_path")
@@ -1036,13 +1128,38 @@ def parse_document(arguments: dict[str, Any]) -> str:
     if output_format not in {"markdown", "json", "both"}:
         return _error(tool, "output_format must be one of: markdown, json, both")
     max_chars = int(arguments.get("max_chars", 6000))
-    page_range = _parse_page_range(arguments.get("page_range"))
 
     try:
-        _, document = _docling_convert(document_path, page_range=page_range)
-        markdown = _docling_export_markdown(document)
-        document_json = _docling_export_dict(document)
-        engine = "docling"
+        requested_pages = _requested_page_numbers(arguments)
+        # Keep the existing Docling path when available, but always build page
+        # boundaries from a deterministic local parser.  This prevents a
+        # character preview from becoming the only representation of a long
+        # document and gives follow-up page reads a stable contract.
+        docling_markdown = ""
+        docling_document: dict[str, Any] | None = None
+        docling_engine = ""
+        try:
+            page_range = None
+            if requested_pages:
+                page_range = (min(requested_pages), max(requested_pages))
+            _, converted = _docling_convert(document_path, page_range=page_range)
+            docling_markdown = _docling_export_markdown(converted)
+            docling_document = _docling_export_dict(converted)
+            docling_engine = "docling"
+        except Exception:
+            # The local parser is the documented fallback for environments
+            # without Docling artifacts; its pagewise output is still valid.
+            docling_document = None
+
+        local_markdown, local_document, local_engine = _parse_document_local(document_path)
+        page_records = _page_records_from_document(document_path, local_document, local_markdown)
+        page_count = len(page_records)
+        selected_pages, truncated, has_more_pages = _select_page_records(page_records, requested_pages, max_chars)
+        returned_pages = [int(page["page_number"]) for page in selected_pages]
+        selected_markdown = "\n\n".join(str(page["markdown"]) for page in selected_pages)
+        markdown = docling_markdown or local_markdown
+        document_json = local_document
+        engine = f"{docling_engine}+{local_engine}" if docling_engine else local_engine
 
         payload: dict[str, Any] = {
             "status": "ok",
@@ -1050,18 +1167,22 @@ def parse_document(arguments: dict[str, Any]) -> str:
             "engine": engine,
             "document_path": str(document_path),
             "output_format": output_format,
+            "page_count": page_count,
+            "returned_pages": returned_pages,
+            "truncated": truncated,
+            "has_more_pages": has_more_pages,
+            "pages": selected_pages,
         }
 
         if output_format in {"markdown", "both"}:
             md_path = _resolve_output_path(arguments.get("markdown_path") or arguments.get("output_path"), ".md", tool, document_path)
             _write_text(md_path, markdown)
-            preview, truncated = _truncate_text(markdown, max_chars)
-            payload.update({"markdown": preview, "markdown_path": str(md_path), "markdown_truncated": truncated})
+            payload.update({"markdown": selected_markdown, "markdown_path": str(md_path), "markdown_truncated": truncated})
 
         if output_format in {"json", "both"}:
             json_path = _resolve_output_path(arguments.get("json_path") or arguments.get("output_path"), ".json", tool, document_path)
             _write_json(json_path, document_json)
-            json_preview, truncated = _truncate_text(json.dumps(document_json, ensure_ascii=False, indent=2, default=str), max_chars)
+            json_preview = json.dumps({"page_count": page_count, "returned_pages": returned_pages, "pages": selected_pages}, ensure_ascii=False, indent=2, default=str)
             payload.update({"json_preview": json_preview, "json_path": str(json_path), "json_truncated": truncated})
 
         return _json_result(**payload)
@@ -1876,6 +1997,7 @@ _register_tool(
         "document_path": {"type": "string", "description": "Path to PDF, DOCX, PPTX, image, Markdown, or text file."},
         "output_format": {"type": "string", "enum": ["markdown", "json", "both"], "default": "markdown"},
         "page_range": {"description": "Optional 1-based page range for Docling conversion, e.g. '1-3' or [1, 3]."},
+        "page_numbers": {"type": "array", "items": {"type": "integer", "minimum": 1}, "description": "Optional explicit 1-based pages to return, e.g. [3, 5]."},
         "max_chars": {"type": "integer", "description": "Maximum preview characters returned in the tool observation.", "default": 6000},
         "output_path": {"type": "string", "description": "Optional output file path or directory."},
         "markdown_path": {"type": "string", "description": "Optional Markdown output path."},
