@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+from pathlib import Path
 import re
 import time
 import uuid
@@ -19,6 +20,7 @@ from slime.utils.types import Sample
 # Import tool sandbox functionality
 from document_reward import compute_document_reward, extract_final_answer
 from tool_sandbox import TOOL_CONFIGS, tool_registry
+from tool_protocol import ParsedAction, parse_assistant_action
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +165,7 @@ def format_conversation_with_tools(
             "with the available tools before answering. Choose tools deliberately: parse_document for "
             "general text, render/crop/zoom plus OCR for visual regions, detect_layout for coordinates, "
             "extract_table for tables, and chart_to_table for charts. Ground the answer in tool output, "
-            "do not invent unread evidence, and return the final answer exactly as <final>answer</final>."
+            "do not invent unread evidence, and wrap the supported answer in <final>...</final>."
         )
 
     messages_to_render.append({"role": "system", "content": system_content})
@@ -192,8 +194,12 @@ def _extract_task_prompt(prompt: str | list[dict[str, str]]) -> str:
 
 
 def _find_last_final_span(text: str) -> tuple[int, int] | None:
-    matches = list(re.finditer(r"<final>\s*.*?\s*</final>", text, re.IGNORECASE | re.DOTALL))
-    return matches[-1].span() if matches else None
+    """Return a span only for a complete final-only assistant turn."""
+    parsed = parse_assistant_action(text)
+    if parsed.kind != "final":
+        return None
+    start = len(text) - len(text.lstrip())
+    return start, len(text.rstrip())
 
 
 def _maybe_json_value(value: str) -> Any:
@@ -239,50 +245,27 @@ def _parse_xml_tool_call(xml_body: str, tool_name: str) -> dict[str, Any]:
 
 
 def postprocess_predictions(prediction: str):
-    """Extract answer or a generic tool call from a model prediction."""
-    final_answer, has_final = extract_final_answer(prediction)
-    if has_final:
-        return "answer", final_answer
-
-    tool_call_json = re.search(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", prediction, re.DOTALL)
-    if tool_call_json:
-        parsed = _parse_json_tool_call(tool_call_json.group(1))
-        if parsed:
-            return "tool", parsed
-
-    tool_call_xml = re.search(
-        r"<tool_call>\s*<function=([A-Za-z_][\w.-]*)>\s*(.*?)\s*</function>\s*</tool_call>",
-        prediction,
-        re.DOTALL,
-    )
-    if tool_call_xml:
-        return "tool", _parse_xml_tool_call(tool_call_xml.group(2), tool_call_xml.group(1))
-
-    tool_call_xml_partial = re.search(
-        r"<tool_call>\s*<function=([A-Za-z_][\w.-]*)>\s*(.*)",
-        prediction,
-        re.DOTALL,
-    )
-    if tool_call_xml_partial:
-        return "tool", _parse_xml_tool_call(tool_call_xml_partial.group(2), tool_call_xml_partial.group(1))
-
+    """Convert a strict protocol result to the historical tuple API."""
+    parsed = parse_assistant_action(prediction)
+    if parsed.kind == "final":
+        return "answer", parsed.value
+    if parsed.kind == "tool_call":
+        return "tool", parsed.value
+    if parsed.kind == "protocol_error":
+        return "protocol_error", {
+            "reason": parsed.reason,
+            "candidate_action_count": parsed.candidate_action_count,
+        }
     return None, ""
 
 
 def postprocess_responses(resp: str) -> str:
-    """Post-process response to ensure tag completeness"""
-    if "<final>" in resp.lower():
-        span = _find_last_final_span(resp)
-        if span is not None:
-            return resp[: span[1]]
+    """Keep the raw model turn so invalid suffixes remain observable.
 
-    # Handle <tool_call> tags (JSON or XML format)
-    if "<tool_call>" in resp and "</tool_call>" in resp:
-        matches = list(re.finditer(r"<tool_call>.*?</tool_call>", resp, re.DOTALL))
-        if matches:
-            last_match = matches[-1]
-            return resp[: last_match.end()]
-
+    Trimming to the last tag would silently turn a multi-action response into
+    a valid action.  The strict parser is the only component allowed to decide
+    whether a turn is executable.
+    """
     return resp
 
 
@@ -507,58 +490,379 @@ def _format_tool_hint(tool_call_format: str) -> str:
     )
 
 
-async def execute_predictions(prediction: str, execution_trace: list[dict[str, Any]] | None = None) -> tuple[str, bool]:
-    """Execute predictions and return results"""
-    action, content = postprocess_predictions(prediction)
+def _set_terminal_status(action_log: dict[str, Any] | None, status: str) -> None:
+    if action_log is not None:
+        action_log["_terminal_status"] = status
 
-    if action == "tool":
-        tool_call = content if isinstance(content, dict) else {}
-        tool_name = tool_call.get("name")
-        arguments = tool_call.get("arguments", {})
-        if tool_name and isinstance(arguments, dict):
-            result = await tool_registry.execute_tool(str(tool_name), arguments)
-            success = False
-            try:
-                parsed_result = json.loads(result)
-                success = isinstance(parsed_result, dict) and parsed_result.get("status") == "ok"
-            except (json.JSONDecodeError, TypeError):
-                success = not result.lower().startswith("error:")
-            if execution_trace is not None:
-                execution_trace.append(
-                    {
-                        "tool": str(tool_name),
-                        "arguments": arguments,
-                        "success": success,
-                    }
-                )
-            max_obs_chars = TOOL_CONFIGS.get("max_obs_chars", 1024)
-            if len(result) > max_obs_chars:
-                result = result[:max_obs_chars] + f"\n... [truncated {len(result) - max_obs_chars} chars]"
-            next_obs = f"\n\n<interpreter>\nTool: {tool_name}\n{result}\n</interpreter>\n\n"
-            done = False
-        else:
-            if execution_trace is not None:
-                execution_trace.append({"tool": "", "arguments": arguments, "success": False})
-            next_obs = "\n\n<interpreter>\nError: Invalid tool call; missing tool name or arguments object\n</interpreter>\n\n"
-            done = False
-    elif action == "answer":
-        next_obs = ""
-        done = True
-    else:
-        tc_fmt = _TOOL_CALL_FORMAT or "json"
-        next_obs = (
-            "\nMy previous action is invalid. "
-            + _format_tool_hint(tc_fmt)
-            + "If I want to give the final answer, I should use the format "
-            "'<final>answer</final>'. Let me try again.\n"
+
+def _record_action_candidate(
+    action_log: dict[str, Any] | None,
+    parsed: ParsedAction,
+    *,
+    turn: int | None,
+    raw: str,
+    **extra: Any,
+) -> None:
+    if action_log is None:
+        return
+    action_log["candidate_action_count"] = int(action_log.get("candidate_action_count", 0)) + parsed.candidate_action_count
+    action_log.setdefault("actions", []).append(
+        {
+            "turn": turn,
+            "kind": parsed.kind,
+            "candidate_action_count": parsed.candidate_action_count,
+            "raw": raw[:16000],
+            "reason": parsed.reason,
+            **extra,
+        }
+    )
+
+
+def _looks_like_placeholder_path(value: str) -> bool:
+    normalized = value.strip().casefold().replace("\\", "/")
+    if normalized in {
+        "/path/to/file.pdf",
+        "/path/to/document.pdf",
+        "path/to/file.pdf",
+        "path/to/document.pdf",
+        "<document-path>",
+        "<absolute-document-path>",
+        "...",
+    }:
+        return True
+    return "/path/to/" in normalized or normalized.startswith("<") and normalized.endswith(">")
+
+
+def _validate_tool_call(tool_call: dict[str, Any]) -> tuple[bool, str | None]:
+    name = tool_call.get("name")
+    arguments = tool_call.get("arguments")
+    if not isinstance(name, str) or not name.strip():
+        return False, "missing tool name"
+    if name not in tool_registry.tools:
+        return False, f"unknown tool: {name}"
+    if not isinstance(arguments, dict):
+        return False, "arguments must be an object"
+
+    def visit(value: Any, key: str | None = None) -> str | None:
+        if isinstance(value, str) and (key or "").endswith("path") and _looks_like_placeholder_path(value):
+            return f"placeholder path is not a valid parameter: {value}"
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                reason = visit(child_value, str(child_key))
+                if reason:
+                    return reason
+        elif isinstance(value, list):
+            for child_value in value:
+                reason = visit(child_value, key)
+                if reason:
+                    return reason
+        return None
+
+    reason = visit(arguments)
+    return (reason is None), reason
+
+
+def _parse_tool_result(result: str) -> tuple[bool, dict[str, Any] | None, str | None]:
+    try:
+        payload = json.loads(result)
+    except (TypeError, json.JSONDecodeError):
+        return not str(result).lstrip().casefold().startswith("error"), None, None
+    if not isinstance(payload, dict):
+        return False, None, "tool result must be an object"
+    status = str(payload.get("status", "")).casefold()
+    return status == "ok", payload, status or None
+
+
+def _image_paths_from_result(payload: dict[str, Any] | None) -> tuple[list[str], list[str]]:
+    if not isinstance(payload, dict):
+        return [], []
+    candidates: list[str] = []
+    for key in ("image_path", "image_paths"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            candidates.append(value)
+        elif isinstance(value, list):
+            candidates.extend(item for item in value if isinstance(item, str))
+    valid = [path for path in candidates if Path(path).is_file()]
+    return valid, candidates
+
+
+def _limit_tool_result(result: str, max_chars: int) -> str:
+    """Limit observations without cutting a page JSON object in half."""
+    if max_chars <= 0 or len(result) <= max_chars:
+        return result
+    try:
+        payload = json.loads(result)
+    except (TypeError, json.JSONDecodeError):
+        return result[:max_chars] + f"\n... [truncated {len(result) - max_chars} chars]"
+    if not isinstance(payload, dict) or not isinstance(payload.get("pages"), list):
+        return result[:max_chars] + f"\n... [truncated {len(result) - max_chars} chars]"
+
+    original_pages = payload["pages"]
+    kept: list[Any] = []
+    for page in original_pages:
+        candidate_pages = kept + [page]
+        candidate = dict(payload)
+        candidate["pages"] = candidate_pages
+        candidate["returned_pages"] = [item.get("page_number") for item in candidate_pages if isinstance(item, dict)]
+        candidate["truncated"] = len(candidate_pages) < len(original_pages)
+        candidate["has_more_pages"] = len(candidate_pages) < int(candidate.get("page_count", len(original_pages)))
+        encoded = json.dumps(candidate, ensure_ascii=False, indent=2, default=str)
+        if len(encoded) > max_chars and kept:
+            break
+        if len(encoded) > max_chars:
+            page_copy = dict(page) if isinstance(page, dict) else {"markdown": str(page)}
+            page_copy["markdown"] = str(page_copy.get("markdown", ""))[: max(1, max_chars // 2)]
+            kept = [page_copy]
+            break
+        kept = candidate_pages
+    payload["pages"] = kept
+    payload["returned_pages"] = [item.get("page_number") for item in kept if isinstance(item, dict)]
+    payload["truncated"] = len(kept) < len(original_pages) or bool(payload.get("truncated"))
+    payload["has_more_pages"] = bool(payload.get("has_more_pages")) or len(kept) < int(payload.get("page_count", len(original_pages)))
+    return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+
+
+async def execute_predictions(
+    prediction: str,
+    execution_trace: list[dict[str, Any]] | None = None,
+    action_log: dict[str, Any] | None = None,
+    turn: int | None = None,
+) -> tuple[str, bool]:
+    """Parse and execute one assistant turn without silently recovering it."""
+    if action_log is not None:
+        for key in (
+            "candidate_action_count",
+            "executed_action_count",
+            "valid_action_count",
+            "invalid_action_count",
+            "ignored_action_count",
+            "protocol_error_count",
+            "tool_error_count",
+        ):
+            action_log.setdefault(key, 0)
+        action_log.setdefault("actions", [])
+    parsed = parse_assistant_action(prediction)
+    _record_action_candidate(action_log, parsed, turn=turn, raw=prediction)
+
+    if parsed.kind == "final":
+        if action_log is not None:
+            action_log["valid_action_count"] = int(action_log.get("valid_action_count", 0)) + 1
+            action_log["actions"][-1].update({"valid": True, "executed": False})
+        if execution_trace is not None:
+            execution_trace.append({"kind": "final", "turn": turn, "raw": prediction, "valid": True, "executed": False})
+        _set_terminal_status(action_log, "completed")
+        return "", True
+
+    if parsed.kind != "tool_call":
+        invalid_count = max(1, parsed.candidate_action_count)
+        if action_log is not None:
+            action_log["invalid_action_count"] = int(action_log.get("invalid_action_count", 0)) + invalid_count
+            action_log["ignored_action_count"] = int(action_log.get("ignored_action_count", 0)) + parsed.candidate_action_count
+            action_log["protocol_error_count"] = int(action_log.get("protocol_error_count", 0)) + 1
+            action_log["actions"][-1].update({"valid": False, "executed": False})
+        if execution_trace is not None:
+            execution_trace.append(
+                {
+                    "kind": parsed.kind,
+                    "turn": turn,
+                    "raw": prediction,
+                    "valid": False,
+                    "executed": False,
+                    "reason": parsed.reason,
+                    "candidate_action_count": parsed.candidate_action_count,
+                }
+            )
+        _set_terminal_status(action_log, "model_protocol_error")
+        return "", True
+
+    tool_call = parsed.value if isinstance(parsed.value, dict) else {}
+    valid, validation_error = _validate_tool_call(tool_call)
+    if not valid:
+        if action_log is not None:
+            action_log["invalid_action_count"] = int(action_log.get("invalid_action_count", 0)) + 1
+            action_log["ignored_action_count"] = int(action_log.get("ignored_action_count", 0)) + 1
+            action_log["protocol_error_count"] = int(action_log.get("protocol_error_count", 0)) + 1
+            action_log["actions"][-1].update({"valid": False, "executed": False, "reason": validation_error})
+        if execution_trace is not None:
+            execution_trace.append(
+                {
+                    "kind": "tool_call",
+                    "turn": turn,
+                    "tool": tool_call.get("name", ""),
+                    "arguments": tool_call.get("arguments", {}),
+                    "valid": False,
+                    "executed": False,
+                    "success": False,
+                    "reason": validation_error,
+                }
+            )
+        _set_terminal_status(action_log, "model_protocol_error")
+        return "", True
+
+    tool_name = str(tool_call["name"])
+    arguments = dict(tool_call.get("arguments", {}))
+    if action_log is not None:
+        action_log["valid_action_count"] = int(action_log.get("valid_action_count", 0)) + 1
+        action_log["executed_action_count"] = int(action_log.get("executed_action_count", 0)) + 1
+        action_log["actions"][-1].update({"valid": True, "executed": True, "tool": tool_name})
+
+    try:
+        result = await tool_registry.execute_tool(tool_name, arguments)
+    except Exception as exc:  # the model action was sent, but the tool failed
+        if action_log is not None:
+            action_log["tool_error_count"] = int(action_log.get("tool_error_count", 0)) + 1
+            action_log["actions"][-1].update({"success": False, "tool_error": str(exc)})
+        if execution_trace is not None:
+            execution_trace.append(
+                {
+                    "kind": "tool_call",
+                    "turn": turn,
+                    "tool": tool_name,
+                    "arguments": arguments,
+                    "valid": True,
+                    "executed": True,
+                    "success": False,
+                    "error": str(exc),
+                }
+            )
+        _set_terminal_status(action_log, "tool_error")
+        return "", True
+
+    success, parsed_result, result_status = _parse_tool_result(result)
+    image_paths, image_candidates = _image_paths_from_result(parsed_result if success else None)
+    media_error = bool(success and image_candidates and not image_paths)
+    trace_item = {
+        "kind": "tool_call",
+        "turn": turn,
+        "tool": tool_name,
+        "arguments": arguments,
+        "valid": True,
+        "executed": True,
+        "success": success,
+        "result_status": result_status,
+        "image_paths": image_paths,
+        "image_candidates": image_candidates,
+        "media_error": media_error,
+        "result": result,
+    }
+    if isinstance(parsed_result, dict) and parsed_result.get("error"):
+        trace_item["error"] = str(parsed_result["error"])
+    if execution_trace is not None:
+        execution_trace.append(trace_item)
+    if action_log is not None:
+        action_log["actions"][-1].update(
+            {
+                "success": success,
+                "result_status": result_status,
+                "image_paths": image_paths,
+                "media_error": media_error,
+            }
         )
-        done = False
 
-    return next_obs, done
+    if not success:
+        if action_log is not None:
+            action_log["tool_error_count"] = int(action_log.get("tool_error_count", 0)) + 1
+        _set_terminal_status(action_log, "tool_error")
+        return "", True
+
+    limited_result = _limit_tool_result(str(result), int(TOOL_CONFIGS.get("max_obs_chars", 8192)))
+    next_obs = f"<interpreter>\nTool: {tool_name}\n{limited_result}\n</interpreter>"
+    return next_obs, False
 
 
-async def generate(args, sample: Sample, sampling_params, evaluation: bool = False) -> Sample:
-    """Custom generation function supporting tool calls.
+def _image_token_count(tokenizer: Any, processor: Any, token_ids: list[int]) -> int:
+    candidate_ids: set[int] = set()
+    for owner in (processor, tokenizer):
+        for attr in ("image_token_id", "image_token_index"):
+            value = getattr(owner, attr, None)
+            if isinstance(value, int) and value >= 0:
+                candidate_ids.add(value)
+        convert = getattr(owner, "convert_tokens_to_ids", None)
+        if callable(convert):
+            for token in ("<|image_pad|>", "<image>", "<|image|>"):
+                try:
+                    value = convert(token)
+                except Exception:
+                    continue
+                if isinstance(value, int) and value >= 0:
+                    candidate_ids.add(value)
+    return sum(1 for token_id in token_ids if token_id in candidate_ids)
+
+
+def _merge_multimodal_train_inputs(chunks: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not chunks:
+        return None
+    try:
+        import torch
+    except ImportError:
+        return None
+    values_by_key: dict[str, list[Any]] = {}
+    for chunk in chunks:
+        for key, value in chunk.items():
+            if isinstance(value, torch.Tensor):
+                values_by_key.setdefault(key, []).append(value)
+    merged: dict[str, Any] = {}
+    for key, values in values_by_key.items():
+        try:
+            merged[key] = torch.cat(values, dim=0)
+        except (RuntimeError, TypeError):
+            # A backend-specific scalar/grid field may not be concatenable;
+            # dropping it is safer than passing a misaligned tensor to RL.
+            continue
+    return merged or None
+
+
+def _encode_tool_observation(
+    state: GenerateState,
+    observation: str,
+    image_paths: list[str],
+) -> tuple[list[int], str, list[str], list[Any], dict[str, Any] | None, int]:
+    """Encode an observation as a new user turn, including real image tokens."""
+    if not image_paths:
+        encoded_text = f"<|im_end|>\n<|im_start|>user\n{observation}<|im_end|>\n<|im_start|>assistant\n"
+        token_ids = state.tokenizer(encoded_text, add_special_tokens=False)["input_ids"]
+        return token_ids, encoded_text, [], [], None, 0
+
+    if state.processor is None:
+        raise RuntimeError("tool returned an image but the multimodal processor is unavailable")
+
+    try:
+        from PIL import Image
+        from slime.utils.processing_utils import encode_image_for_rollout_engine
+
+        images = []
+        for image_path in image_paths:
+            with Image.open(image_path) as image:
+                images.append(image.convert("RGB").copy())
+
+        image_token = str(getattr(state.processor, "image_token", "<|image_pad|>"))
+        vision_start = str(getattr(state.processor, "vision_start_token", "<|vision_start|>"))
+        vision_end = str(getattr(state.processor, "vision_end_token", "<|vision_end|>"))
+        vision_tokens = "\n".join(f"{vision_start}{image_token}{vision_end}" for _ in images)
+        encoded_text = (
+            f"<|im_end|>\n<|im_start|>user\n{vision_tokens}\n{observation}"
+            "<|im_end|>\n<|im_start|>assistant\n"
+        )
+        processor_output = state.processor(text=[encoded_text], images=images, return_tensors="pt")
+        input_ids = processor_output["input_ids"][0]
+        token_ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
+        train_inputs = {
+            key: value
+            for key, value in processor_output.items()
+            if key not in {"input_ids", "attention_mask"}
+        } or None
+        image_data = [encode_image_for_rollout_engine(image) for image in images]
+        image_tokens_count = _image_token_count(state.tokenizer, state.processor, token_ids)
+        if image_tokens_count <= 0:
+            raise RuntimeError("multimodal processor produced no image token for a returned image")
+        return token_ids, encoded_text, image_data, images, train_inputs, image_tokens_count
+    except Exception as exc:
+        raise RuntimeError(f"image observation encoding failed: {exc}") from exc
+
+
+async def _legacy_generate(args, sample: Sample, sampling_params, evaluation: bool = False) -> Sample:
+    """Legacy generation implementation retained only for forensic comparison.
 
     When ``evaluation=True`` (the dispatcher in ``slime.rollout.sglang_rollout``
     detects the kwarg via ``inspect.signature`` and forwards it for eval
@@ -606,7 +910,12 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     else:
         max_context_length = 32768
 
-    for turn in range(TOOL_CONFIGS["max_turns"]):
+    # Reserve two turns after tool use: one gives the model an explicit
+    # no-more-tools instruction, the other is a final recovery attempt.
+    # Without this reserve, a rendered image can consume the last normal turn
+    # and leave a rollout with observations but no final answer.
+    normal_turns = TOOL_CONFIGS["max_turns"]
+    for turn in range(normal_turns + 2):
         total_length = len(prompt_tokens_ids) + len(response_token_ids)
         if total_length >= max_context_length:
             sample.status = Sample.Status.TRUNCATED
@@ -634,6 +943,21 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         if "</final>" not in existing_stop:
             existing_stop.append("</final>")
         turn_sampling_params["stop"] = existing_stop
+
+        forcing_final = turn >= normal_turns or tool_call_count >= TOOL_CONFIGS["max_tool_calls"]
+        if forcing_final:
+            final_reminder = (
+                "\nTool use is complete. Do not call another tool. Based only on the "
+                "document evidence already returned, now answer the question using exactly "
+                "the supported value enclosed between <final> and </final>.\n"
+            )
+            reminder_ids = state.tokenizer(final_reminder, add_special_tokens=False)["input_ids"]
+            if len(prompt_tokens_ids) + len(response_token_ids) + len(reminder_ids) < max_context_length:
+                response += final_reminder
+                response_token_ids += reminder_ids
+                loss_masks += [0] * len(reminder_ids)
+                if sample.rollout_log_probs is not None:
+                    sample.rollout_log_probs += [0.0] * len(reminder_ids)
 
         # Use token IDs instead of text
         current_token_ids = prompt_tokens_ids + response_token_ids
@@ -714,7 +1038,17 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
             break
 
         trace_count_before = len(tool_execution_trace)
-        next_obs, done = await execute_predictions(cur_response, execution_trace=tool_execution_trace)
+        # Recovery turns must terminate with an answer.  Do not execute a new
+        # tool call there, otherwise image rendering can endlessly consume the
+        # final-answer budget.
+        if forcing_final:
+            done = _find_last_final_span(cur_response) is not None
+            next_obs = "" if done else (
+                "\nA final answer is still required. Do not call tools; reply only as "
+                "the supported value enclosed between <final> and </final>.\n"
+            )
+        else:
+            next_obs, done = await execute_predictions(cur_response, execution_trace=tool_execution_trace)
 
         if getattr(args, "prm_enable", False):
             # Run PRM for every action step, including the final "Answer" step.
@@ -760,7 +1094,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
             ), f"Token/logp length mismatch at turn {turn}: {len(response_token_ids)} tokens vs {len(sample.rollout_log_probs)} logps"
 
         if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]:
-            break
+            continue
 
     # Set sample attributes
     sample.tokens = prompt_tokens_ids + response_token_ids
@@ -851,16 +1185,424 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     return sample
 
 
+_INFRA_STATUSES = {"generation_error", "context_overflow", "infra_error"}
+
+
+def _set_rollout_status(sample: Sample, status: str, *, reason: str | None = None) -> None:
+    """Persist the rollout state in both runtime fields and serialized metadata."""
+    valid_for_rl = status not in _INFRA_STATUSES
+    sample.rollout_status = status
+    sample.valid_for_rl = valid_for_rl
+    if status == "context_overflow":
+        sample.status = Sample.Status.TRUNCATED
+    elif status == "completed":
+        sample.status = Sample.Status.COMPLETED
+    elif status != "completed":
+        sample.status = Sample.Status.FAILED
+    if not valid_for_rl:
+        sample.remove_sample = True
+    if sample.metadata is None:
+        sample.metadata = {}
+    sample.metadata["rollout_status"] = status
+    sample.metadata["valid_for_rl"] = valid_for_rl
+    if reason:
+        sample.metadata["rollout_status_reason"] = reason
+
+
+def _finish_reason_type(output: dict[str, Any]) -> str | None:
+    meta_info = output.get("meta_info") or {}
+    finish_reason = meta_info.get("finish_reason")
+    if isinstance(finish_reason, dict):
+        value = finish_reason.get("type")
+    else:
+        value = finish_reason
+    return str(value) if value is not None else None
+
+
+async def generate(args, sample: Sample, sampling_params, evaluation: bool = False) -> Sample:
+    """Generate a strict, multi-turn document-tool rollout.
+
+    Tool observations are appended as separate user turns.  When a tool
+    returns an image, the observation is processed with the model processor,
+    the expanded image placeholder tokens are appended to the context, and
+    the accumulated base64 image data is sent on the next generation request.
+    """
+    assert not getattr(args, "partial_rollout", False), "Partial rollout is not supported for this function."
+
+    state = GenerateState(args)
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    tool_specs = tool_registry.get_tool_specs()
+    tc_format = _detect_tool_call_format(state.tokenizer)
+    task_prompt = _extract_task_prompt(sample.prompt)
+    # Do not carry a model-specific <think> suffix into the strict action
+    # protocol.  The assistant turn must begin with its one action tag.
+    prompt = format_conversation_with_tools(prompt=task_prompt, tools=tool_specs, tool_call_format=tc_format)
+    prompt_tokens_ids = list(state.tokenizer(prompt, add_special_tokens=False)["input_ids"])
+
+    im_end_id: int | None = None
+    try:
+        converted = state.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        if isinstance(converted, int) and converted >= 0:
+            im_end_id = converted
+    except Exception:
+        pass
+
+    response = ""
+    response_token_ids: list[int] = []
+    loss_masks: list[int] = []
+    current_image_data: list[str] = []
+    current_images: list[Any] = []
+    multimodal_train_inputs_buffer: list[dict[str, Any]] = []
+    execution_trace: list[dict[str, Any]] = []
+    action_log: dict[str, Any] = {
+        "candidate_action_count": 0,
+        "executed_action_count": 0,
+        "valid_action_count": 0,
+        "invalid_action_count": 0,
+        "ignored_action_count": 0,
+        "protocol_error_count": 0,
+        "tool_error_count": 0,
+        "actions": [],
+    }
+    generation_steps: list[dict[str, Any]] = []
+    prm_step_scores: list[float] = []
+    prm_step_details: list[dict[str, Any]] = []
+    prm_pending_tasks: list[tuple[int, asyncio.Task]] = []
+    step_action_spans: list[dict[str, int]] = []
+    terminal_status: str | None = None
+    terminal_reason: str | None = None
+
+    eval_context = getattr(args, "eval_max_context_len", None)
+    train_context = getattr(args, "rollout_max_context_len", None)
+    if evaluation and eval_context is not None:
+        max_context_length = int(eval_context)
+    elif train_context is not None:
+        max_context_length = int(train_context)
+    else:
+        max_context_length = 32768
+    max_new_tokens = int(sampling_params.get("max_new_tokens") or getattr(args, "rollout_max_response_len", 2048))
+    max_turns = max(2, int(TOOL_CONFIGS.get("max_turns", 16)))
+
+    if sample.rollout_log_probs is None:
+        sample.rollout_log_probs = []
+
+    for turn in range(max_turns):
+        input_token_count = len(prompt_tokens_ids) + len(response_token_ids)
+        image_token_count = _image_token_count(state.tokenizer, state.processor, prompt_tokens_ids + response_token_ids)
+        if input_token_count >= max_context_length:
+            terminal_status = "context_overflow"
+            terminal_reason = "input token count reached rollout context limit"
+            break
+
+        remaining_context = max_context_length - input_token_count
+        turn_max_new_tokens = min(max_new_tokens, remaining_context)
+        if turn_max_new_tokens <= 0:
+            terminal_status = "context_overflow"
+            terminal_reason = "no generation tokens remain after context accounting"
+            break
+
+        turn_sampling_params = sampling_params.copy()
+        turn_sampling_params["max_new_tokens"] = turn_max_new_tokens
+        existing_stop = turn_sampling_params.get("stop") or []
+        existing_stop = [existing_stop] if isinstance(existing_stop, str) else list(existing_stop)
+        for stop_text in ("</tool_call>", "</final>"):
+            if stop_text not in existing_stop:
+                existing_stop.append(stop_text)
+        turn_sampling_params["stop"] = existing_stop
+
+        payload = {
+            "input_ids": prompt_tokens_ids + response_token_ids,
+            "sampling_params": turn_sampling_params,
+            "return_logprob": True,
+        }
+        if current_image_data:
+            payload["image_data"] = list(current_image_data)
+
+        step: dict[str, Any] = {
+            "step_index": turn,
+            "input_token_count": input_token_count,
+            "image_token_count": image_token_count,
+            "remaining_generation_tokens": turn_max_new_tokens,
+            "finish_reason": None,
+            "assistant_output_token_count": 0,
+            "generation_error": None,
+        }
+
+        try:
+            output = await post(url, payload)
+            if not isinstance(output, dict):
+                raise RuntimeError("generation backend returned a non-object response")
+            finish_reason = _finish_reason_type(output)
+            step["finish_reason"] = finish_reason
+            meta_info = output.get("meta_info") or {}
+            logprob_items = meta_info.get("output_token_logprobs")
+            if isinstance(logprob_items, list):
+                cur_response_token_ids = [int(item[1]) for item in logprob_items if isinstance(item, (list, tuple)) and len(item) >= 2]
+                cur_log_probs = [float(item[0]) for item in logprob_items if isinstance(item, (list, tuple)) and len(item) >= 2]
+                if im_end_id is not None and cur_response_token_ids and cur_response_token_ids[-1] == im_end_id:
+                    cur_response_token_ids.pop()
+                    cur_log_probs.pop()
+                cur_response = state.tokenizer.decode(cur_response_token_ids)
+            else:
+                cur_response = str(output.get("text") or "")
+                cur_response_token_ids = list(state.tokenizer(cur_response, add_special_tokens=False)["input_ids"])
+                cur_log_probs = [0.0] * len(cur_response_token_ids)
+        except Exception as exc:
+            step["generation_error"] = str(exc)
+            generation_steps.append(step)
+            terminal_status = "generation_error"
+            terminal_reason = str(exc)
+            break
+
+        step["assistant_output_token_count"] = len(cur_response_token_ids)
+        generation_steps.append(step)
+        if not cur_response_token_ids:
+            # An empty response after a successful tool result is an engine or
+            # multimodal-context failure, never a valid terminal answer.
+            step["generation_error"] = "empty assistant output"
+            terminal_status = "generation_error"
+            terminal_reason = "assistant output token count is zero"
+            break
+
+        action_token_start = len(response_token_ids)
+        response += cur_response
+        response_token_ids.extend(cur_response_token_ids)
+        loss_masks.extend([1] * len(cur_response_token_ids))
+        sample.rollout_log_probs.extend(cur_log_probs)
+        step_action_spans.append(
+            {"step_index": turn, "token_start": action_token_start, "token_end": len(response_token_ids)}
+        )
+
+        next_obs, done = await execute_predictions(
+            cur_response,
+            execution_trace=execution_trace,
+            action_log=action_log,
+            turn=turn,
+        )
+        if getattr(args, "prm_enable", False):
+            prm_pending_tasks.append(
+                (
+                    turn,
+                    asyncio.create_task(
+                        _judge_step_with_prm(
+                            args,
+                            sample,
+                            step_index=turn,
+                            action=cur_response,
+                            observation=next_obs,
+                            history=response + next_obs,
+                        )
+                    ),
+                )
+            )
+
+        if done:
+            terminal_status = str(action_log.get("_terminal_status") or "model_protocol_error")
+            if terminal_status == "completed":
+                sample.metadata = sample.metadata or {}
+                sample.metadata["final_action"] = cur_response
+                sample.metadata["final_answer"] = cur_response
+            break
+
+        latest_tool = execution_trace[-1] if execution_trace else {}
+        if not latest_tool.get("executed") or not latest_tool.get("success"):
+            terminal_status = "infra_error"
+            terminal_reason = "successful tool execution did not produce a sendable observation"
+            break
+        if latest_tool.get("media_error"):
+            terminal_status = "infra_error"
+            terminal_reason = "tool reported an image path that could not be loaded"
+            break
+
+        try:
+            (
+                obs_token_ids,
+                encoded_obs_text,
+                obs_image_data,
+                obs_images,
+                obs_train_inputs,
+                _new_image_token_count,
+            ) = _encode_tool_observation(state, next_obs, latest_tool.get("image_paths", []))
+        except Exception as exc:
+            step["generation_error"] = str(exc)
+            terminal_status = "infra_error"
+            terminal_reason = str(exc)
+            break
+
+        if not obs_token_ids:
+            terminal_status = "infra_error"
+            terminal_reason = "tool result was not converted into model input tokens"
+            break
+        response += encoded_obs_text
+        response_token_ids.extend(obs_token_ids)
+        loss_masks.extend([0] * len(obs_token_ids))
+        sample.rollout_log_probs.extend([0.0] * len(obs_token_ids))
+        current_image_data.extend(obs_image_data)
+        current_images.extend(obs_images)
+        if obs_train_inputs:
+            multimodal_train_inputs_buffer.append(obs_train_inputs)
+
+    if terminal_status is None:
+        terminal_status = "model_protocol_error"
+        terminal_reason = "rollout ended before a final action"
+
+    sample.tokens = prompt_tokens_ids + response_token_ids
+    sample.response_length = len(response_token_ids)
+    sample.response = response
+    sample.loss_mask = loss_masks
+    sample.multimodal_train_inputs = _merge_multimodal_train_inputs(multimodal_train_inputs_buffer)
+    if current_images:
+        sample.multimodal_inputs = {"images": current_images, "videos": None}
+
+    sample.tool_call_count = sum(1 for item in execution_trace if item.get("kind") == "tool_call" and item.get("executed"))
+    sample.valid_tool_call_count = sum(
+        1 for item in execution_trace if item.get("kind") == "tool_call" and item.get("executed") and item.get("success")
+    )
+    sample.tool_error_count = int(action_log.get("tool_error_count", 0))
+    sample.tool_execution_trace = execution_trace
+    for key in (
+        "candidate_action_count",
+        "executed_action_count",
+        "valid_action_count",
+        "invalid_action_count",
+        "ignored_action_count",
+        "protocol_error_count",
+    ):
+        action_log[key] = int(action_log.get(key, 0))
+
+    sample.metadata = sample.metadata or {}
+    sample.metadata["tool_execution"] = {
+        "calls": execution_trace,
+        "call_count": sample.tool_call_count,
+        "valid_call_count": sample.valid_tool_call_count,
+        "error_count": sample.tool_error_count,
+        "unique_tools": sorted({str(item["tool"]) for item in execution_trace if item.get("tool")}),
+    }
+    sample.metadata["action_statistics"] = {key: action_log[key] for key in (
+        "candidate_action_count",
+        "executed_action_count",
+        "valid_action_count",
+        "invalid_action_count",
+        "ignored_action_count",
+        "protocol_error_count",
+    )}
+    sample.metadata["generation_steps"] = generation_steps
+    last_generation = generation_steps[-1] if generation_steps else {
+        "input_token_count": len(prompt_tokens_ids),
+        "image_token_count": 0,
+        "remaining_generation_tokens": 0,
+        "finish_reason": None,
+        "assistant_output_token_count": 0,
+        "generation_error": terminal_reason,
+    }
+    for key in (
+        "input_token_count",
+        "image_token_count",
+        "remaining_generation_tokens",
+        "finish_reason",
+        "assistant_output_token_count",
+        "generation_error",
+    ):
+        sample.metadata[key] = last_generation.get(key)
+    sample.metadata["generation"] = dict(last_generation)
+    sample.metadata["generation"]["steps"] = generation_steps
+
+    _set_rollout_status(sample, terminal_status, reason=terminal_reason)
+
+    if getattr(args, "prm_enable", False):
+        if prm_pending_tasks:
+            prm_results = await asyncio.gather(*[task for _, task in prm_pending_tasks], return_exceptions=True)
+            for (step_idx, _), result in zip(prm_pending_tasks, prm_results, strict=False):
+                if isinstance(result, Exception):
+                    prm_step_details.append({"status": "exception", "step_index": step_idx, "scores": [0], "mean_score": 0.0, "votes": []})
+                    continue
+                result["step_index"] = step_idx
+                prm_step_details.append(result)
+            prm_step_details.sort(key=lambda item: item.get("step_index", 10**9))
+            prm_step_scores = [float(item.get("mean_score", 0.0)) for item in prm_step_details]
+        sample.metadata["prm"] = {
+            "enabled": True,
+            "step_scores": prm_step_scores,
+            "step_mean_score": (sum(prm_step_scores) / len(prm_step_scores)) if prm_step_scores else 0.0,
+            "step_details": prm_step_details,
+        }
+
+    prm_score_by_step = {
+        int(item["step_index"]): float(item.get("mean_score", 0.0))
+        for item in sample.metadata.get("prm", {}).get("step_details", [])
+        if isinstance(item, dict) and "step_index" in item
+    }
+    step_wise_steps = [
+        {
+            "step_index": int(span["step_index"]),
+            "token_start": int(span["token_start"]),
+            "token_end": int(span["token_end"]),
+            "prm_score": float(prm_score_by_step.get(int(span["step_index"]), 0.0)),
+        }
+        for span in step_action_spans
+    ]
+    sample.metadata["step_wise"] = {
+        "steps": step_wise_steps,
+        "step_token_spans": [[item["token_start"], item["token_end"]] for item in step_wise_steps],
+        "step_scores": [item["prm_score"] for item in step_wise_steps],
+    }
+    return sample
+
+
 async def reward_func(args, sample, **kwargs):
     """Reward a grounded document answer with optional step-wise PRM scores."""
     if not isinstance(sample, Sample):
         raise TypeError("Sample must be an instance of Sample class.")
 
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    rollout_status = str(getattr(sample, "rollout_status", metadata.get("rollout_status", "")))
+    valid_for_rl = bool(getattr(sample, "valid_for_rl", metadata.get("valid_for_rl", True)))
+    if rollout_status in _INFRA_STATUSES or not valid_for_rl:
+        # Infrastructure failures must never become the ordinary -1 answer
+        # reward.  Marking the sample removed also prevents policy-gradient
+        # construction from consuming its partial token trajectory.
+        sample.remove_sample = True
+        result = {
+            "score": 0.0,
+            "acc": 0.0,
+            "exact_acc": 0.0,
+            "quality": 0.0,
+            "format": 0.0,
+            "pred": "",
+            "metric": "invalid_rollout",
+            "valid_for_rl": False,
+            "rollout_status": rollout_status or "infra_error",
+        }
+        for key in (
+            "tool_call_count",
+            "valid_tool_call_count",
+            "tool_error_count",
+            "candidate_action_count",
+            "executed_action_count",
+            "valid_action_count",
+            "invalid_action_count",
+            "ignored_action_count",
+            "protocol_error_count",
+        ):
+            result[key] = int(getattr(sample, key, metadata.get(key, 0) or 0))
+        return result
+
     result = compute_document_reward(sample.response, sample.label, metadata)
     result["tool_call_count"] = int(getattr(sample, "tool_call_count", 0))
     result["valid_tool_call_count"] = int(getattr(sample, "valid_tool_call_count", 0))
     result["tool_error_count"] = int(getattr(sample, "tool_error_count", 0))
+    action_statistics = metadata.get("action_statistics", {}) if isinstance(metadata, dict) else {}
+    for key in (
+        "candidate_action_count",
+        "executed_action_count",
+        "valid_action_count",
+        "invalid_action_count",
+        "ignored_action_count",
+        "protocol_error_count",
+    ):
+        result[key] = int(action_statistics.get(key, 0)) if isinstance(action_statistics, dict) else 0
+    result["valid_for_rl"] = True
+    result["rollout_status"] = rollout_status or "completed"
 
     outcome_reward = float(result["score"])
 

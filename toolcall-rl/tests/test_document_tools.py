@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import sys
 
@@ -60,3 +61,38 @@ def test_docling_rejects_torch_development_build(monkeypatch, tmp_path):
         assert "development build" in str(exc)
     else:
         raise AssertionError("development Torch build should be rejected")
+
+
+def test_parse_document_returns_page_boundaries_and_supports_follow_up_page(monkeypatch, tmp_path):
+    fitz = __import__("fitz")
+    pdf_path = tmp_path / "five-pages.pdf"
+    with fitz.open() as document:
+        for page_number in range(1, 6):
+            page = document.new_page()
+            page.insert_text((72, 72), f"Page {page_number} unique evidence")
+        document.save(str(pdf_path))
+
+    monkeypatch.setattr(document_tools, "_docling_convert", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("no docling")))
+
+    first_read = json.loads(
+        document_tools.parse_document(
+            {"document_path": str(pdf_path), "output_format": "markdown", "max_chars": 55}
+        )
+    )
+    assert first_read["status"] == "ok"
+    assert first_read["page_count"] == 5
+    assert first_read["returned_pages"] == [1]
+    assert first_read["truncated"] is True
+    assert first_read["has_more_pages"] is True
+    assert "Page 1" in first_read["pages"][0]["markdown"]
+
+    later_read = json.loads(
+        document_tools.parse_document(
+            {"document_path": str(pdf_path), "page_numbers": [5], "output_format": "markdown"}
+        )
+    )
+    assert later_read["status"] == "ok"
+    assert later_read["page_count"] == 5
+    assert later_read["returned_pages"] == [5]
+    assert later_read["pages"][0]["page_number"] == 5
+    assert "Page 5" in later_read["pages"][0]["markdown"]

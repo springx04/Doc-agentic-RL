@@ -18,16 +18,38 @@ import unicodedata
 from collections import Counter
 from typing import Any
 
+from tool_protocol import parse_assistant_action
 
-FINAL_PATTERN = re.compile(r"<final>\s*(.*?)\s*</final>", re.IGNORECASE | re.DOTALL)
+ANSWER_PREFIX_PATTERN = re.compile(
+    r"^\s*(?:(?:the\s+)?(?:final\s+)?answer|答案|最终答案)\s*(?:is|是|为)?\s*[:：\-—]?\s*",
+    re.IGNORECASE,
+)
+FIELD_LABEL_PATTERN = re.compile(
+    # A document-QA answer is often returned as ``Field name: value``.  Keep
+    # the raw candidate too, so this never turns into unconstrained substring
+    # matching or prevents a reference that includes the field name from
+    # matching exactly.
+    r"^\s*[\w\u3400-\u9fff][\w\u3400-\u9fff #_./()'&-]{0,47}\s*:\s*(?=\S)",
+    re.UNICODE,
+)
 
 
-def extract_final_answer(response: str) -> tuple[str, bool]:
-    """Return the last strict ``<final>`` answer and whether it was present."""
-    matches = FINAL_PATTERN.findall(response or "")
-    if not matches:
+def extract_final_answer(response: str, metadata: dict[str, Any] | None = None) -> tuple[str, bool]:
+    """Return a final answer only when one complete assistant action parses.
+
+    A generated rollout contains several assistant turns and tool
+    observations.  The generation loop records the raw final assistant turn
+    in ``metadata['final_action']``; using that field avoids searching the
+    concatenated trajectory for a tag that may have appeared in an example or
+    observation.  Standalone responses are parsed directly as one turn.
+    """
+    candidate = response or ""
+    if isinstance(metadata, dict) and isinstance(metadata.get("final_action"), str):
+        candidate = metadata["final_action"]
+    parsed = parse_assistant_action(candidate)
+    if parsed.kind != "final":
         return "", False
-    return matches[-1].strip(), True
+    return str(parsed.value).strip(), True
 
 
 def normalize_answer(value: Any) -> str:
@@ -62,6 +84,44 @@ def _edit_distance(left: str, right: str) -> int:
 
 def exact_match(prediction: Any, reference: Any) -> float:
     return float(normalize_answer(prediction) == normalize_answer(reference))
+
+
+def answer_variants(prediction: Any) -> list[Any]:
+    """Return raw and safely canonicalized answer candidates.
+
+    We deliberately strip only conventional answer lead-ins (for example,
+    ``The answer is:`` or ``答案是：``).  Free-form explanations are retained so
+    exact-match metrics do not turn into unconstrained substring matching.
+    """
+    if not isinstance(prediction, str):
+        return [prediction]
+    stripped = ANSWER_PREFIX_PATTERN.sub("", prediction, count=1).strip()
+    variants = [prediction]
+    if stripped and stripped != prediction:
+        variants.append(stripped)
+
+    # Treat a short leading field label as presentation, not part of the
+    # answer.  For example, ``Proposal #: 14-3006-14`` and the reference
+    # ``14-3006-14`` are semantically the same short answer.  The raw form is
+    # retained above, and only this anchored one-label form is stripped.
+    field_value = FIELD_LABEL_PATTERN.sub("", prediction, count=1).strip()
+    if field_value and field_value != prediction:
+        variants.append(field_value)
+
+    # VLMs often return a complete explanatory sentence such as
+    # `The full form of "ILS" is "International Litigation Services".`.
+    # The quoted spans are explicit candidate answers, not arbitrary
+    # substrings, so retaining them avoids penalising a semantically exact
+    # answer merely for a harmless explanatory wrapper.
+    variants.extend(match.strip() for match in re.findall(r'["“]([^"”]+)["”]', prediction) if match.strip())
+    expansion = re.search(
+        r"\b(?:stands\s+for|full\s+form\s+(?:of\s+.+?\s+)?is)\s+(.+?)[.!]?\s*$",
+        prediction,
+        re.IGNORECASE,
+    )
+    if expansion and expansion.group(1).strip():
+        variants.append(expansion.group(1).strip().strip('"“”'))
+    return list(dict.fromkeys(variants))
 
 
 def anls(prediction: Any, reference: Any, threshold: float = 0.5) -> float:
@@ -142,24 +202,27 @@ def parse_label(label: Any, metadata: dict[str, Any] | None = None) -> tuple[lis
 def score_answer(prediction: str, answers: list[Any], metric: str = "auto") -> float:
     metric = (metric or "auto").lower().replace("-", "_")
 
-    def score_pair(reference: Any) -> float:
+    def score_pair(candidate: Any, reference: Any) -> float:
         if metric in {"exact", "em", "exact_match", "accuracy", "acc"}:
-            return exact_match(prediction, reference)
+            return exact_match(candidate, reference)
         if metric == "anls":
-            return anls(prediction, reference)
+            return anls(candidate, reference)
         if metric in {"f1", "token_f1"}:
-            return token_f1(prediction, reference)
+            return token_f1(candidate, reference)
         if metric == "contains":
-            pred = normalize_answer(prediction)
+            pred = normalize_answer(candidate)
             ref = normalize_answer(reference)
             return float(bool(ref) and ref in pred)
         if metric in {"json", "json_exact"}:
-            return json_match(prediction, reference)
+            return json_match(candidate, reference)
         if metric == "auto":
-            return max(exact_match(prediction, reference), anls(prediction, reference), token_f1(prediction, reference))
+            return max(exact_match(candidate, reference), anls(candidate, reference), token_f1(candidate, reference))
         raise ValueError(f"Unsupported document reward metric: {metric}")
 
-    return max((score_pair(reference) for reference in answers), default=0.0)
+    return max(
+        (score_pair(candidate, reference) for candidate in answer_variants(prediction) for reference in answers),
+        default=0.0,
+    )
 
 
 def compute_document_reward(
@@ -168,13 +231,18 @@ def compute_document_reward(
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute a GRPO-friendly reward in [-1, 1] and evaluation metrics."""
-    prediction, format_ok = extract_final_answer(response)
+    prediction, format_ok = extract_final_answer(response, metadata)
     answers, metric = parse_label(label, metadata)
     quality = score_answer(prediction, answers, metric) if format_ok else 0.0
     quality = max(0.0, min(1.0, float(quality)))
+    answer_acc = score_answer(prediction, answers, "exact_match") if format_ok else 0.0
+    strict_acc = max((exact_match(prediction, answer) for answer in answers), default=0.0) if format_ok else 0.0
     return {
         "score": 2.0 * quality - 1.0,
-        "acc": max((exact_match(prediction, answer) for answer in answers), default=0.0) if format_ok else 0.0,
+        # ``acc`` remains exact-answer accuracy, but tolerates a conventional
+        # answer lead-in. ``exact_acc`` is retained for strict-format reporting.
+        "acc": answer_acc,
+        "exact_acc": strict_acc,
         "quality": quality,
         "format": float(format_ok),
         "pred": prediction,
