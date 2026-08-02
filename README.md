@@ -45,3 +45,36 @@ bash ../toolcall-rl/retool_qwen3_4b_rl.sh
 
 See [`toolcall-rl/README.md`](./toolcall-rl/README.md) for dataset schemas,
 environment variables, SFT and PRM workflows, and testing instructions.
+
+## Qwen3-VL document-QA workflows
+
+The repository also contains a verified Qwen3-VL-4B workflow for local DocVQA
+data on the remote workspace. It separates preflight validation, strict
+initial-weight baseline evaluation (`num_rollout=0`), and RL training. The
+detailed commands, retained rollout artifacts, and reward/agent method notes
+are in [the tool-call README](./toolcall-rl/README.md#qwen3-vl-docvqa-operations).
+
+## Agent design contract
+
+Document QA uses a bounded multi-turn loop: every successful tool result
+triggers another model decision until a strict `<final>...</final>` action is
+accepted or the search budget is exhausted. The runner tracks parsed,
+rendered, cropped, and OCR-checked pages separately. `evidence_sufficient` is
+set only by a question-constrained structured evidence candidate; seeing a
+page, number, table hint, or answer-page annotation alone is not sufficient.
+
+`parse_document` is page-scoped: `pages` and `returned_pages` describe exactly
+the content returned, while `document_has_unreturned_pages` and
+`content_truncated` distinguish unvisited pages from truncated content. Table-
+like questions can fall back from text parsing to table extraction, layout,
+rendering, cropping, or OCR. Visual input is attached only when the next model
+decision requires pixels, and each such turn records the actual placeholder,
+tensor, forward attachment, and consumed image path.
+
+Infrastructure failures (empty/error generation, context overflow, media or
+tool infrastructure failures) are marked `valid_for_rl: false` and excluded
+from group statistics and policy gradients. Model protocol errors remain
+observable as model actions; rejected actions receive a zero policy mask and a
+separate action-level negative signal. Reward reports keep answer correctness,
+evidence localization/alignment, tool cost, format validity, and consistency
+audits separate from the final scalar reward.

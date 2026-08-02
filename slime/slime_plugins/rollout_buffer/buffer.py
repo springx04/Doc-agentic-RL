@@ -32,11 +32,28 @@ def default_get_group_data_meta_info(temp_data: dict[str, list[dict[str, Any]]])
             "avg_reward": 0,
         }
 
-    meta_info = {"total_samples": 0, "num_groups": len(temp_data)}
+    excluded_statuses = {"generation_empty", "generation_error", "context_overflow", "infra_error", "tool_error"}
+
+    def is_valid_for_statistics(sample: dict[str, Any]) -> bool:
+        metadata = sample.get("metadata") if isinstance(sample.get("metadata"), dict) else sample
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return not (
+            metadata.get("exclude_from_group_statistics") is True
+            or metadata.get("valid_for_rl") is False
+            or str(metadata.get("rollout_status", "")) in excluded_statuses
+        )
+
+    filtered_data = {
+        instance_id: [sample for sample in samples if is_valid_for_statistics(sample)]
+        for instance_id, samples in temp_data.items()
+    }
+    filtered_data = {instance_id: samples for instance_id, samples in filtered_data.items() if samples}
+    meta_info = {"total_samples": 0, "num_groups": len(filtered_data)}
 
     all_rewards = []
     # Calculate per-group statistics
-    for _instance_id, samples in temp_data.items():
+    for _instance_id, samples in filtered_data.items():
         group_size = len(samples)
         group_rewards = [s["reward"] for s in samples]  # Calculate group reward standard deviation
         meta_info["total_samples"] += group_size

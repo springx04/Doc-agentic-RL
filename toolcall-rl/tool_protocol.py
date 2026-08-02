@@ -1,10 +1,12 @@
 """Strict parsing for assistant tool-call and final-answer turns.
 
 The rollout protocol is deliberately small: one assistant turn contains one
-complete ``<tool_call>...</tool_call>`` or ``<final>...</final>`` action.  This
-module never searches for a usable action inside arbitrary prose.  That is
-important because tool instructions and previous observations can themselves
-contain the protocol tags as examples.
+complete ``<tool_call>...</tool_call>`` or ``<final>...</final>`` action.  Both
+actions must occupy the whole turn; reward evaluation may separately recover a
+single final span to distinguish semantic correctness from protocol validity.
+This module never searches for a usable tool call inside arbitrary prose.  That
+is important because tool instructions and previous observations can
+themselves contain the protocol tags as examples.
 """
 
 from __future__ import annotations
@@ -39,6 +41,7 @@ class ParsedAction:
     candidate_action_count: int = 0
     reason: str | None = None
     raw: str = ""
+    parsed_tool_name: str | None = None
 
     @property
     def is_action(self) -> bool:
@@ -99,12 +102,13 @@ def _parse_xml_tool_body(body: str) -> tuple[dict[str, Any] | None, str | None]:
 
 
 def parse_assistant_action(text: str | None) -> ParsedAction:
-    """Parse a complete assistant turn with no substring fallback.
+    """Parse one assistant action while preserving malformed raw text.
 
-    Whitespace outside the single action is accepted.  Any prose, extra
-    action, unclosed tag, or malformed payload makes the turn a protocol error.
-    A completely tag-free turn is reported as ``no_action`` so callers can
-    distinguish an empty model response from an action syntax error.
+    Tool calls and final answers must occupy the whole turn.  A completely
+    tag-free turn is reported as ``no_action`` so callers can distinguish an
+    empty model response from an action syntax error.  A final span embedded
+    in prose is deliberately a protocol error; reward code can still score
+    its answer content independently.
     """
 
     raw = text or ""
@@ -140,7 +144,13 @@ def parse_assistant_action(text: str | None) -> ParsedAction:
             value, reason = _parse_xml_tool_body(body)
         if value is None:
             return ParsedAction("protocol_error", candidate_action_count=1, reason=reason, raw=raw)
-        return ParsedAction("tool_call", value=value, candidate_action_count=1, raw=raw)
+        return ParsedAction(
+            "tool_call",
+            value=value,
+            candidate_action_count=1,
+            raw=raw,
+            parsed_tool_name=str(value.get("name")),
+        )
 
     return ParsedAction(
         "protocol_error",

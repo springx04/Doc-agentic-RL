@@ -83,6 +83,13 @@ def transform_record(
     task_id = record.get("id") or record.get("task_id")
     metadata = dict(record.get("metadata") or {})
     metadata.update({"document_path": document_path, "metric": metric})
+    for key in ("answer_page", "target_page", "answer_bbox", "page_count", "num_pages"):
+        if key in record and record.get(key) is not None:
+            metadata[key] = record.get(key)
+    if "answer_page" not in metadata and metadata.get("target_page") is not None:
+        metadata["answer_page"] = metadata.get("target_page")
+    if "page_count" not in metadata and metadata.get("num_pages") is not None:
+        metadata["page_count"] = metadata.get("num_pages")
     if task_id is not None:
         metadata["task_id"] = task_id
 

@@ -12,6 +12,7 @@ import hashlib
 import html
 import importlib.util
 import json
+import math
 import os
 import multiprocessing
 import subprocess
@@ -251,6 +252,37 @@ def _normalize_bbox(
     return x0, y0, x1, y1
 
 
+_VLM_MAX_ASPECT_RATIO = 100.0
+
+
+def _pad_extreme_aspect(image: Any, max_aspect_ratio: float = _VLM_MAX_ASPECT_RATIO) -> tuple[Any, bool]:
+    """Pad ultra-thin crops so multimodal processors can encode them.
+
+    Layout/OCR boxes can legitimately be a one-pixel-high text line. Qwen-VL's
+    image processor rejects images whose absolute aspect ratio is >= 200, so
+    preserve the pixels and add a white margin rather than stretching or
+    discarding the visual evidence.
+    """
+    width, height = int(image.width), int(image.height)
+    if width <= 0 or height <= 0:
+        return image, False
+    limit = max(1.0, float(max_aspect_ratio))
+    ratio = max(width / height, height / width)
+    if ratio < limit:
+        return image, False
+
+    Image = _import_pil()
+    if width >= height:
+        target_height = max(height, int(math.ceil(width / limit)))
+        canvas = Image.new("RGB", (width, target_height), (255, 255, 255))
+        canvas.paste(image, (0, (target_height - height) // 2))
+    else:
+        target_width = max(width, int(math.ceil(height / limit)))
+        canvas = Image.new("RGB", (target_width, height), (255, 255, 255))
+        canvas.paste(image, ((target_width - width) // 2, 0))
+    return canvas, True
+
+
 def _render_pdf_page(document_path: Path, page_number: int, dpi: int, output_path: Path) -> dict[str, Any]:
     fitz = _import_fitz()
     with fitz.open(str(document_path)) as doc:
@@ -329,7 +361,15 @@ def render_page(arguments: dict[str, Any]) -> str:
 
 def _image_for_region(arguments: dict[str, Any], tool: str) -> tuple[Path, dict[str, Any]]:
     image_path = _path_arg(arguments, "image_path")
+    document_path = _path_arg(arguments, "document_path")
+    if image_path is not None and document_path is not None:
+        raise ValueError("provide exactly one of image_path or document_path")
     if image_path is not None:
+        if image_path.suffix.lower() not in IMAGE_SUFFIXES:
+            raise ValueError(
+                f"{tool}: image_path must point to an image ({sorted(IMAGE_SUFFIXES)}); "
+                "use document_path for a PDF"
+            )
         problem = _ensure_file(image_path, tool)
         if problem:
             raise ValueError(problem)
@@ -345,9 +385,13 @@ def _image_for_region(arguments: dict[str, Any], tool: str) -> tuple[Path, dict[
                 "coordinate_space": "pixel_top_left",
             }
 
-    document_path = _path_arg(arguments, "document_path")
     if document_path is None:
         raise ValueError("Either image_path or document_path is required")
+    if document_path.suffix.lower() not in PDF_SUFFIXES | IMAGE_SUFFIXES:
+        raise ValueError(
+            f"{tool}: document_path must point to a PDF or image; "
+            "pass a rendered PNG/JPG through image_path"
+        )
     problem = _ensure_file(document_path, tool)
     if problem:
         raise ValueError(problem)
@@ -368,6 +412,8 @@ def crop_region(arguments: dict[str, Any]) -> str:
             image = image.convert("RGB")
             box = _normalize_bbox(arguments.get("bbox"), image.width, image.height, unit=unit, padding=padding)
             crop = image.crop(box)
+            original_size = crop.size
+            crop, aspect_padding_applied = _pad_extreme_aspect(crop)
             out_path = _resolve_output_path(arguments.get("output_path"), ".png", tool, source_path, {"bbox": box})
             crop.save(out_path)
         return _json_result(
@@ -379,6 +425,9 @@ def crop_region(arguments: dict[str, Any]) -> str:
             bbox_pixels=list(box),
             width=crop.width,
             height=crop.height,
+            original_width=original_size[0],
+            original_height=original_size[1],
+            aspect_padding_applied=aspect_padding_applied,
             coordinate_space="pixel_top_left",
         )
     except Exception as exc:
@@ -401,6 +450,8 @@ def zoom_region(arguments: dict[str, Any]) -> str:
             crop = image.crop(box)
             target_size = (max(1, int(round(crop.width * scale))), max(1, int(round(crop.height * scale))))
             resized = crop.resize(target_size, Image.Resampling.LANCZOS)
+            original_size = resized.size
+            resized, aspect_padding_applied = _pad_extreme_aspect(resized)
             out_path = _resolve_output_path(arguments.get("output_path"), ".png", tool, source_path, {"bbox": box, "scale": scale})
             resized.save(out_path)
         return _json_result(
@@ -413,6 +464,9 @@ def zoom_region(arguments: dict[str, Any]) -> str:
             scale=scale,
             width=resized.width,
             height=resized.height,
+            original_width=original_size[0],
+            original_height=original_size[1],
+            aspect_padding_applied=aspect_padding_applied,
             coordinate_space="pixel_top_left",
         )
     except Exception as exc:
@@ -836,6 +890,16 @@ def _pdf_table_records(path: Path, page_number: int) -> list[dict[str, Any]]:
     return records
 
 
+def _bbox_overlaps(left: Any, right: Any) -> bool:
+    """Return whether two xyxy boxes have a non-empty intersection."""
+    try:
+        lx1, ly1, lx2, ly2 = (float(value) for value in left[:4])
+        rx1, ry1, rx2, ry2 = (float(value) for value in right[:4])
+    except (TypeError, ValueError, IndexError):
+        return False
+    return min(lx2, rx2) > max(lx1, rx1) and min(ly2, ry2) > max(ly1, ry1)
+
+
 def _parse_pdf_document(path: Path, page_range: tuple[int, int] | None = None) -> tuple[str, dict[str, Any], str]:
     fitz = _import_fitz()
     markdown_chunks: list[str] = []
@@ -846,7 +910,7 @@ def _parse_pdf_document(path: Path, page_range: tuple[int, int] | None = None) -
         end = min(len(doc), end)
         for page_number in range(start, end + 1):
             page = doc[page_number - 1]
-            text = page.get_text("text").strip()
+            raw_text = page.get_text("text").strip()
             blocks: list[dict[str, Any]] = []
             for block_index, block in enumerate((page.get_text("dict") or {}).get("blocks", [])):
                 block_type = block.get("type")
@@ -884,6 +948,18 @@ def _parse_pdf_document(path: Path, page_range: tuple[int, int] | None = None) -
                     }
                 )
             tables = _pdf_table_records(path, page_number)
+            # pdfplumber gives us the table cell matrix.  Do not append the
+            # same cells once more as PyMuPDF's linear text stream: that was
+            # the source of the old label/value split and duplicate tables.
+            body_blocks = [
+                block
+                for block in blocks
+                if block.get("type") != "image"
+                and not any(_bbox_overlaps(block.get("bbox"), table.get("bbox")) for table in tables)
+            ]
+            text = "\n".join(str(block.get("text", "")).strip() for block in body_blocks if str(block.get("text", "")).strip()).strip()
+            if not text and not tables:
+                text = raw_text
             page_markdown = [f"## Page {page_number}"]
             if text:
                 page_markdown.append(text)
@@ -1077,6 +1153,43 @@ def _page_records_from_document(path: Path, document: dict[str, Any], markdown: 
     return [{"page_number": 1, "markdown": f"## Page 1\n\n{body}".strip(), "source": document}]
 
 
+def _page_observation(page: dict[str, Any]) -> dict[str, Any]:
+    """Build the only page representation exposed by parse_document.
+
+    Parser internals such as raw blocks and source-page JSON stay in the
+    artifact, never beside a second full-document markdown string in the
+    model observation.  Table/image metadata is deliberately small and gives
+    the agent an explicit route to visual follow-up tools.
+    """
+    source = page.get("source") if isinstance(page.get("source"), dict) else page
+    tables = source.get("tables", []) if isinstance(source, dict) else []
+    tables = tables if isinstance(tables, list) else []
+    table_regions = [
+        {"page_number": int(source.get("page_number", page.get("page_number", 1))), "bbox": table.get("bbox")}
+        for table in tables
+        if isinstance(table, dict) and table.get("bbox")
+    ]
+    blocks = source.get("blocks", []) if isinstance(source, dict) else []
+    blocks = blocks if isinstance(blocks, list) else []
+    image_regions = [
+        {"page_number": int(source.get("page_number", page.get("page_number", 1))), "bbox": block.get("bbox")}
+        for block in blocks
+        if isinstance(block, dict) and block.get("type") == "image" and block.get("bbox")
+    ]
+    has_images = bool(image_regions) or int(source.get("image_count", 0) or 0) > 0
+    return {
+        "page_number": int(page.get("page_number", source.get("page_number", 1))),
+        "markdown": str(page.get("markdown", "")),
+        "has_tables": bool(tables),
+        "table_count": len(tables),
+        "table_extraction_recommended": bool(tables),
+        "table_regions": table_regions,
+        "has_images": has_images,
+        "visual_content_omitted": has_images,
+        "image_regions": image_regions,
+    }
+
+
 def _select_page_records(
     records: list[dict[str, Any]],
     requested_pages: list[int] | None,
@@ -1094,8 +1207,7 @@ def _select_page_records(
     used_chars = 0
     truncated = False
     for page in selected:
-        page_copy = dict(page)
-        page_copy.pop("source", None)
+        page_copy = _page_observation(page)
         page_markdown = str(page_copy.get("markdown", ""))
         separator_chars = 2 if returned else 0
         if max_chars > 0 and used_chars + separator_chars + len(page_markdown) > max_chars:
@@ -1109,10 +1221,57 @@ def _select_page_records(
         used_chars += separator_chars + len(page_markdown)
 
     returned_numbers = {int(page["page_number"]) for page in returned}
-    has_more_pages = returned_numbers != set(range(1, page_count + 1))
+    has_more_pages = len(returned_numbers) < page_count
     if len(returned) < len(selected):
         truncated = True
     return returned, truncated, has_more_pages
+
+
+def _project_document_json(
+    document: dict[str, Any],
+    returned_pages: list[int],
+    page_count: int,
+    content_truncated: bool,
+    has_more_pages: bool,
+    selected_page_observations: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Write a page-scoped JSON artifact without leaking unreturned pages."""
+    returned = set(returned_pages)
+    projected: dict[str, Any] = {}
+    for key, value in document.items():
+        if key in {"pages", "markdown"}:
+            continue
+        if key == "tables" and isinstance(value, list):
+            projected[key] = [
+                item
+                for item in value
+                if not isinstance(item, dict) or int(item.get("page_number", 0) or 0) in returned
+            ]
+        else:
+            projected[key] = value
+    projected.update(
+        {
+            "page_count": page_count,
+            "returned_pages": returned_pages,
+            "truncated": bool(content_truncated),
+            "content_truncated": bool(content_truncated),
+            "has_more_pages": bool(has_more_pages),
+            "document_has_unreturned_pages": bool(has_more_pages),
+            "pages": [
+                {
+                    **(
+                        dict(page.get("source"))
+                        if isinstance(page.get("source"), dict)
+                        else {"page_number": page.get("page_number")}
+                    ),
+                    "page_number": int(page.get("page_number", 0)),
+                    "markdown": str(page.get("markdown", "")),
+                }
+                for page in selected_page_observations
+            ],
+        }
+    )
+    return projected
 
 
 def parse_document(arguments: dict[str, Any]) -> str:
@@ -1131,34 +1290,44 @@ def parse_document(arguments: dict[str, Any]) -> str:
 
     try:
         requested_pages = _requested_page_numbers(arguments)
-        # Keep the existing Docling path when available, but always build page
-        # boundaries from a deterministic local parser.  This prevents a
-        # character preview from becoming the only representation of a long
-        # document and gives follow-up page reads a stable contract.
+        # The deterministic local parser is the fast/default path.  Docling
+        # conversion may initialize a CPU OCR pipeline and take minutes even
+        # for a text PDF, while its preview is not used to build the returned
+        # page records.  Keep it available for an explicit request (or an
+        # application-wide opt-in) so scan-heavy workflows can still use the
+        # bundled OCR artifacts without slowing every rollout.
+        use_docling_value = arguments.get("use_docling", os.environ.get("OPENCLAW_PARSE_USE_DOCLING", "0"))
+        use_docling = str(use_docling_value).strip().lower() in {"1", "true", "yes", "on"}
         docling_markdown = ""
         docling_document: dict[str, Any] | None = None
         docling_engine = ""
-        try:
-            page_range = None
-            if requested_pages:
-                page_range = (min(requested_pages), max(requested_pages))
-            _, converted = _docling_convert(document_path, page_range=page_range)
-            docling_markdown = _docling_export_markdown(converted)
-            docling_document = _docling_export_dict(converted)
-            docling_engine = "docling"
-        except Exception:
-            # The local parser is the documented fallback for environments
-            # without Docling artifacts; its pagewise output is still valid.
-            docling_document = None
-
         local_markdown, local_document, local_engine = _parse_document_local(document_path)
+        if use_docling:
+            try:
+                page_range = None
+                if requested_pages:
+                    page_range = (min(requested_pages), max(requested_pages))
+                _, converted = _docling_convert(document_path, page_range=page_range)
+                docling_markdown = _docling_export_markdown(converted)
+                docling_document = _docling_export_dict(converted)
+                docling_engine = "docling"
+            except Exception:
+                # The local parser remains the documented fallback when an
+                # explicit Docling/OCR request cannot be initialized.
+                docling_document = None
         page_records = _page_records_from_document(document_path, local_document, local_markdown)
         page_count = len(page_records)
         selected_pages, truncated, has_more_pages = _select_page_records(page_records, requested_pages, max_chars)
         returned_pages = [int(page["page_number"]) for page in selected_pages]
         selected_markdown = "\n\n".join(str(page["markdown"]) for page in selected_pages)
-        markdown = docling_markdown or local_markdown
-        document_json = local_document
+        document_json = _project_document_json(
+            local_document,
+            returned_pages,
+            page_count,
+            truncated,
+            has_more_pages,
+            selected_pages,
+        )
         engine = f"{docling_engine}+{local_engine}" if docling_engine else local_engine
 
         payload: dict[str, Any] = {
@@ -1167,23 +1336,26 @@ def parse_document(arguments: dict[str, Any]) -> str:
             "engine": engine,
             "document_path": str(document_path),
             "output_format": output_format,
+            "docling_used": bool(docling_engine),
             "page_count": page_count,
             "returned_pages": returned_pages,
             "truncated": truncated,
+            "content_truncated": truncated,
             "has_more_pages": has_more_pages,
+            "document_has_unreturned_pages": has_more_pages,
             "pages": selected_pages,
         }
 
         if output_format in {"markdown", "both"}:
             md_path = _resolve_output_path(arguments.get("markdown_path") or arguments.get("output_path"), ".md", tool, document_path)
-            _write_text(md_path, markdown)
-            payload.update({"markdown": selected_markdown, "markdown_path": str(md_path), "markdown_truncated": truncated})
+            _write_text(md_path, selected_markdown)
+            payload.update({"markdown_path": str(md_path)})
 
         if output_format in {"json", "both"}:
             json_path = _resolve_output_path(arguments.get("json_path") or arguments.get("output_path"), ".json", tool, document_path)
             _write_json(json_path, document_json)
-            json_preview = json.dumps({"page_count": page_count, "returned_pages": returned_pages, "pages": selected_pages}, ensure_ascii=False, indent=2, default=str)
-            payload.update({"json_preview": json_preview, "json_path": str(json_path), "json_truncated": truncated})
+            json_preview = json.dumps(document_json, ensure_ascii=False, indent=2, default=str)
+            payload.update({"json_preview": json_preview, "json_path": str(json_path)})
 
         return _json_result(**payload)
     except Exception as exc:
@@ -1324,6 +1496,63 @@ def _filter_elements(
     return filtered
 
 
+def _local_layout_elements(document: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build a lightweight layout view without Docling or GUI dependencies.
+
+    The headless server may not have ``libGL.so.1``.  PyMuPDF already gives
+    us stable text/image boxes and pdfplumber gives us table boxes, so this
+    fallback is sufficient for navigation and region selection even when the
+    richer Docling layout backend cannot be imported.
+    """
+    elements: list[dict[str, Any]] = []
+    pages = document.get("pages", []) if isinstance(document, dict) else []
+    if not isinstance(pages, list):
+        return elements
+    for page in pages:
+        if not isinstance(page, dict):
+            continue
+        page_number = page.get("page_number")
+        try:
+            page_number = int(page_number)
+        except (TypeError, ValueError):
+            continue
+        blocks = page.get("blocks", [])
+        if isinstance(blocks, list):
+            for index, block in enumerate(blocks):
+                if not isinstance(block, dict):
+                    continue
+                element_type = str(block.get("type") or "paragraph")
+                elements.append(
+                    {
+                        "id": str(block.get("id") or f"page:{page_number}:block:{index}"),
+                        "type": element_type,
+                        "source_container": "pymupdf_blocks",
+                        "page_number": page_number,
+                        "bbox": block.get("bbox"),
+                        "text": _short_text(block.get("text")),
+                    }
+                )
+        tables = page.get("tables", [])
+        if isinstance(tables, list):
+            for index, table in enumerate(tables):
+                if not isinstance(table, dict):
+                    continue
+                rows = table.get("rows") if isinstance(table.get("rows"), list) else []
+                elements.append(
+                    {
+                        "id": f"page:{page_number}:table:{index}",
+                        "type": "table",
+                        "source_container": "pdfplumber_tables",
+                        "page_number": page_number,
+                        "bbox": table.get("bbox"),
+                        "row_count": int(table.get("row_count", len(rows)) or 0),
+                        "column_count": int(table.get("column_count", max((len(row) for row in rows), default=0)) or 0),
+                        "text": _short_text(_rows_to_markdown(rows), 320),
+                    }
+                )
+    return elements
+
+
 def detect_layout(arguments: dict[str, Any]) -> str:
     tool = "detect_layout"
     document_path = _path_arg(arguments, "document_path")
@@ -1361,8 +1590,39 @@ def detect_layout(arguments: dict[str, Any]) -> str:
             "coordinate_space": "docling_backend_native",
         }
         return _json_result(**payload)
-    except Exception as exc:
-        return _error(tool, str(exc), document_path=str(document_path))
+    except Exception as docling_exc:
+        # Docling is useful when available, but it is not a prerequisite for
+        # visual navigation.  In particular, headless workers commonly lack
+        # libGL.so.1.  Fall back to the deterministic local PDF parser and
+        # preserve the original backend error for diagnostics.
+        try:
+            _, local_document, local_engine = _parse_document_local(document_path, page_range=page_range)
+            elements = _local_layout_elements(local_document)
+            filtered = _filter_elements(elements, page_number, element_types, max_items)
+            out_path = _resolve_output_path(arguments.get("output_path"), ".json", tool, document_path)
+            _write_json(out_path, {"engine": local_engine, "elements": filtered})
+            payload = {
+                "status": "ok",
+                "tool": tool,
+                "engine": local_engine,
+                "document_path": str(document_path),
+                "page_number": page_number,
+                "element_count": len(filtered),
+                "elements": filtered,
+                "json_path": str(out_path),
+                "coordinate_space": "pdf_points",
+                "fallback_from": "docling",
+                "fallback_error": str(docling_exc),
+            }
+            return _json_result(**payload)
+        except Exception as fallback_exc:
+            return _error(
+                tool,
+                str(fallback_exc),
+                document_path=str(document_path),
+                fallback_from="docling",
+                fallback_error=str(docling_exc),
+            )
 
 
 def _rapidocr_lines(result: Any) -> list[dict[str, Any]]:
@@ -1566,12 +1826,32 @@ def _run_ocr(image_path: Path, lang: str, engine: str) -> tuple[str, list[dict[s
 
 def ocr_region(arguments: dict[str, Any]) -> str:
     tool = "ocr_region"
+    image_path: Path | None = None
+    region_meta: dict[str, Any] | None = None
     try:
+        if _path_arg(arguments, "image_path") is not None and _path_arg(arguments, "document_path") is not None:
+            raise ValueError("provide exactly one of image_path or document_path")
         bbox = arguments.get("bbox")
         if bbox is not None:
-            crop_result = json.loads(crop_region(arguments))
+            crop_arguments = dict(arguments)
+            # ``output_path`` belongs to the OCR text artifact.  Passing a
+            # .json path through to crop_region makes PIL try to encode the
+            # image as JSON (the historical ``unknown file extension: .json``
+            # failure).  A separate image output may be requested explicitly.
+            region_output_path = crop_arguments.pop("region_output_path", None)
+            if region_output_path:
+                crop_arguments["output_path"] = region_output_path
+            else:
+                crop_arguments.pop("output_path", None)
+            crop_result = json.loads(crop_region(crop_arguments))
             if crop_result.get("status") != "ok":
-                return _json_result(**crop_result)
+                return _json_result(
+                    status="error",
+                    tool=tool,
+                    error=str(crop_result.get("error", "crop_region failed")),
+                    source_tool="crop_region",
+                    source_result=crop_result,
+                )
             image_path = Path(crop_result["image_path"])
             region_meta = crop_result
         else:
@@ -1600,7 +1880,36 @@ def ocr_region(arguments: dict[str, Any]) -> str:
         _write_json(out_path, {"engine": engine, "text": text, "lines": lines, "region": region_meta, **payload})
         return _json_result(**payload)
     except Exception as exc:
-        return _error(tool, str(exc))
+        # OCR is an optional accelerator.  Keep the rendered/cropped image
+        # usable by the vision model when every OCR backend is unavailable
+        # (for example because libGL.so.1 is missing), instead of turning a
+        # recoverable visual observation into a terminal tool_error.
+        input_error = isinstance(exc, ValueError) and any(
+            marker in str(exc).casefold()
+            for marker in ("image_path", "document_path", "provide exactly one", "either image_path")
+        )
+        payload: dict[str, Any] = {
+            "status": "error" if input_error else "partial",
+            "tool": tool,
+            "engine": "unavailable",
+            "text": "",
+            "lines": [],
+            "line_count": 0,
+            "ocr_unavailable": not input_error,
+            "error": str(exc),
+        }
+        if image_path is not None and image_path.is_file():
+            payload["image_path"] = str(image_path)
+        if region_meta is not None:
+            payload["region"] = region_meta
+        try:
+            if image_path is not None:
+                out_path = _resolve_output_path(arguments.get("output_path"), ".json", tool, image_path)
+                payload["json_path"] = str(out_path)
+                _write_json(out_path, payload)
+        except Exception as write_exc:
+            payload["diagnostic_write_error"] = str(write_exc)
+        return _json_result(**payload)
 
 
 def _rows_to_csv(rows: list[list[Any]]) -> str:
@@ -1774,39 +2083,64 @@ def extract_table(arguments: dict[str, Any]) -> str:
     if output_format not in {"all", "csv", "markdown", "html", "json"}:
         return _error(tool, "output_format must be one of: all, csv, markdown, html, json")
     table_index = int(arguments.get("table_index", 0))
-    engine = str(arguments.get("engine", "auto")).lower()
+    requested_engine = str(arguments.get("engine", "auto")).lower()
+    engine = requested_engine
+
+    def finish(payload: dict[str, Any], used_engine: str, **extra: Any) -> str:
+        out_path = _resolve_output_path(arguments.get("output_path"), ".json", tool, document_path)
+        _write_json(out_path, payload)
+        return _json_result(
+            status="ok",
+            tool=tool,
+            engine=used_engine,
+            document_path=str(document_path),
+            json_path=str(out_path),
+            **extra,
+            **payload,
+        )
 
     try:
+        if engine == "auto" and document_path.suffix.lower() in PDF_SUFFIXES:
+            # Docling can import a GPU/GUI dependency that is unavailable in
+            # headless workers (notably libGL.so.1).  A table request must not
+            # become an infrastructure failure merely because the preferred
+            # extractor is unavailable; fall back to the deterministic PDF
+            # backend and expose both engines in the observation.
+            try:
+                payload, used_engine = _extract_table_docling(arguments, table_index, output_format)
+                return finish(payload, used_engine)
+            except Exception as docling_exc:
+                payload, used_engine = _extract_table_pdfplumber(arguments, table_index, output_format)
+                return finish(
+                    payload,
+                    used_engine,
+                    requested_engine="auto",
+                    fallback_from="docling",
+                    fallback_error=str(docling_exc),
+                )
+
         if engine == "auto":
             engine = "docling"
 
         if engine == "docling":
             payload, used_engine = _extract_table_docling(arguments, table_index, output_format)
-            out_path = _resolve_output_path(arguments.get("output_path"), ".json", tool, document_path)
-            _write_json(out_path, payload)
-            return _json_result(status="ok", tool=tool, engine=used_engine, document_path=str(document_path), json_path=str(out_path), **payload)
+            return finish(payload, used_engine)
 
         if document_path.suffix.lower() in DOC_SUFFIXES and engine == "docx":
             payload, used_engine = _extract_table_docx(arguments, table_index, output_format)
-            out_path = _resolve_output_path(arguments.get("output_path"), ".json", tool, document_path)
-            _write_json(out_path, payload)
-            return _json_result(status="ok", tool=tool, engine=used_engine, document_path=str(document_path), json_path=str(out_path), **payload)
+            return finish(payload, used_engine)
 
         if engine == "pdfplumber" and document_path.suffix.lower() in PDF_SUFFIXES:
             payload, used_engine = _extract_table_pdfplumber(arguments, table_index, output_format)
-            out_path = _resolve_output_path(arguments.get("output_path"), ".json", tool, document_path)
-            _write_json(out_path, payload)
-            return _json_result(status="ok", tool=tool, engine=used_engine, document_path=str(document_path), json_path=str(out_path), **payload)
+            return finish(payload, used_engine)
 
         if engine == "camelot" and document_path.suffix.lower() in PDF_SUFFIXES:
             payload, used_engine = _extract_table_camelot(arguments, table_index, output_format)
-            out_path = _resolve_output_path(arguments.get("output_path"), ".json", tool, document_path)
-            _write_json(out_path, payload)
-            return _json_result(status="ok", tool=tool, engine=used_engine, document_path=str(document_path), json_path=str(out_path), **payload)
+            return finish(payload, used_engine)
 
         return _error(tool, f"engine={engine!r} does not support file type {document_path.suffix!r}", document_path=str(document_path))
     except Exception as exc:
-        return _error(tool, str(exc), document_path=str(document_path), engine=engine)
+        return _error(tool, str(exc), document_path=str(document_path), engine=requested_engine)
 
 
 def _get_deplot(model_name: str, device: str, local_files_only: bool) -> tuple[Any, Any]:
@@ -1992,13 +2326,14 @@ _register_tool(
 
 _register_tool(
     "parse_document",
-    "Convert a full PDF/DOCX/PPTX/image/text document to Markdown and/or JSON using Docling.",
+    "Read a document with a consistent page-scoped schema. The observation contains only pages listed in returned_pages; use page_numbers for targeted reads. Table/image metadata explicitly points to extract_table, render_page, crop_region, zoom_region, or ocr_region when text parsing is insufficient.",
     {
         "document_path": {"type": "string", "description": "Path to PDF, DOCX, PPTX, image, Markdown, or text file."},
         "output_format": {"type": "string", "enum": ["markdown", "json", "both"], "default": "markdown"},
         "page_range": {"description": "Optional 1-based page range for Docling conversion, e.g. '1-3' or [1, 3]."},
         "page_numbers": {"type": "array", "items": {"type": "integer", "minimum": 1}, "description": "Optional explicit 1-based pages to return, e.g. [3, 5]."},
         "max_chars": {"type": "integer", "description": "Maximum preview characters returned in the tool observation.", "default": 6000},
+        "use_docling": {"type": "boolean", "description": "Opt into the slower Docling/OCR conversion for scan-heavy documents; the default uses the fast local parser."},
         "output_path": {"type": "string", "description": "Optional output file path or directory."},
         "markdown_path": {"type": "string", "description": "Optional Markdown output path."},
         "json_path": {"type": "string", "description": "Optional JSON output path."},
@@ -2034,6 +2369,7 @@ _register_tool(
         "max_lines": {"type": "integer", "description": "Maximum OCR lines returned in the tool observation.", "default": 200},
         "max_chars": {"type": "integer", "description": "Maximum OCR text characters returned in the tool observation.", "default": 12000},
         "output_path": {"type": "string", "description": "Optional JSON output path or directory."},
+        "region_output_path": {"type": "string", "description": "Optional PNG/JPG path for the intermediate crop; separate from the OCR JSON output_path."},
     },
 )
 

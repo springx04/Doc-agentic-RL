@@ -87,7 +87,7 @@ EVAL_ARGS=(
    --eval-max-response-len 16384
    --eval-max-context-len 32768
    --eval-top-p 1
-   --eval-reward-key acc
+   --eval-reward-key quality
 )
 
 PERF_ARGS=(

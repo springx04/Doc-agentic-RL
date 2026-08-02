@@ -102,7 +102,7 @@ EVAL_ARGS=(
    --eval-max-response-len "${EVAL_MAX_RESPONSE_LEN}"
    --eval-max-context-len "${EVAL_MAX_CONTEXT_LEN}"
    --eval-top-p 1
-   --eval-reward-key acc
+   --eval-reward-key quality
 )
 
 PERF_ARGS=(

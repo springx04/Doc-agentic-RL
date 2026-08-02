@@ -32,12 +32,23 @@ from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
+from .reward_statistics import normalize_group_rewards
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+_RL_EXCLUDED_STATUSES = {"generation_empty", "generation_error", "context_overflow", "infra_error", "tool_error"}
+
+
+def _sample_excluded_from_rl(sample: Sample) -> bool:
+    """Return whether a rollout is infrastructure-invalid for GRPO."""
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    status = str(metadata.get("rollout_status", ""))
+    return bool(metadata.get("exclude_from_group_statistics")) or metadata.get("valid_for_rl") is False or status in _RL_EXCLUDED_STATUSES
 
 
 @ray.remote
@@ -342,6 +353,16 @@ class RolloutManager:
 
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
         rewards = list(raw_rewards)
+        excluded = [_sample_excluded_from_rl(sample) for sample in samples]
+        for sample, is_excluded in zip(samples, excluded):
+            if is_excluded:
+                # This guard also covers callers that invoke this method
+                # directly, before _convert_samples_to_train_data drops
+                # removed samples.
+                sample.remove_sample = True
+        for index, is_excluded in enumerate(excluded):
+            if is_excluded:
+                rewards[index] = 0.0
         if not self.args.rewards_normalization:
             return raw_rewards, rewards
 
@@ -363,8 +384,11 @@ class RolloutManager:
                 # the same trajectory.
                 traj_reward_by_key: dict[tuple[int, int], float] = {}
                 group_to_keys: dict[int, list[tuple[int, int]]] = {}
-                key_by_sample: list[tuple[int, int]] = []
+                key_by_sample: list[tuple[int, int] | None] = []
                 for i, sample in enumerate(samples):
+                    if excluded[i]:
+                        key_by_sample.append(None)
+                        continue
                     group_idx = int(sample.group_index) if sample.group_index is not None else -1
                     traj_idx = int(sample.index) if sample.index is not None else i
                     key = (group_idx, traj_idx)
@@ -380,20 +404,19 @@ class RolloutManager:
                     for j, key in enumerate(keys):
                         normalized_by_key[key] = float(vals[j].item())
 
-                rewards = [normalized_by_key[key] for key in key_by_sample]
+                rewards = [
+                    0.0 if excluded[i] else normalized_by_key[key_by_sample[i]]  # type: ignore[index]
+                    for i in range(len(samples))
+                ]
             else:
                 # non-dynamic_history + GRPO/GSPO:
                 # normalize reward directly inside each task(group).
-                group_to_indices: dict[int, list[int]] = {}
-                for i, sample in enumerate(samples):
-                    group_idx = int(sample.group_index) if sample.group_index is not None else -1
-                    group_to_indices.setdefault(group_idx, []).append(i)
-
-                for _, idxs in group_to_indices.items():
-                    vals = torch.tensor([raw_rewards[i] for i in idxs], dtype=torch.float32)
-                    vals = normalize_vals(vals, std_norm)
-                    for j, sample_idx in enumerate(idxs):
-                        rewards[sample_idx] = float(vals[j].item())
+                rewards = normalize_group_rewards(
+                    raw_rewards,
+                    [int(sample.group_index) if sample.group_index is not None else -1 for sample in samples],
+                    excluded,
+                    std_norm,
+                )
 
         return raw_rewards, rewards
 
@@ -407,11 +430,20 @@ class RolloutManager:
         if self.args.advantage_estimator not in ["grpo", "gspo"] or not self.args.rewards_normalization:
             return samples
 
+        for sample in samples:
+            if _sample_excluded_from_rl(sample):
+                sample.remove_sample = True
+
         raw_rewards = [float(sample.get_reward_value(self.args)) for sample in samples]
         group_to_indices: dict[int, list[int]] = {}
         for i, sample in enumerate(samples):
+            if sample.remove_sample:
+                continue
             group_idx = int(sample.group_index) if sample.group_index is not None else -1
             group_to_indices.setdefault(group_idx, []).append(i)
+
+        if not group_to_indices:
+            return []
 
         constant_groups: list[int] = []
         for group_idx, idxs in group_to_indices.items():
@@ -422,7 +454,7 @@ class RolloutManager:
                 constant_groups.append(group_idx)
 
         if not constant_groups:
-            return samples
+            return [sample for sample in samples if not sample.remove_sample]
 
         keep_groups = [g for g in group_to_indices.keys() if g not in set(constant_groups)]
         dropped_groups = list(constant_groups)
@@ -435,6 +467,8 @@ class RolloutManager:
         keep_set = set(keep_groups)
         filtered_samples = []
         for sample in samples:
+            if sample.remove_sample:
+                continue
             group_idx = int(sample.group_index) if sample.group_index is not None else -1
             if group_idx in keep_set:
                 filtered_samples.append(sample)
@@ -608,6 +642,9 @@ class RolloutManager:
 
         # TODO: This logic should be moved to the sample builder
         def _mark_removed_samples(samples: list[Sample]) -> None:
+            for sample in samples:
+                if _sample_excluded_from_rl(sample):
+                    sample.remove_sample = True
             if any(sample.multimodal_train_inputs is not None for sample in samples):
                 missing_mm_indices = []
                 for sample in samples:
@@ -672,6 +709,30 @@ class RolloutManager:
             "group_indices": [sample.group_index for sample in samples],
             "sample_indices": [sample.index for sample in samples],
         }
+
+        # Carry action-level diagnostics into the trainer.  The ordinary
+        # sample loss mask remains the rollout's public/diagnostic mask; the
+        # actor can use these spans to apply a separate negative advantage to
+        # rejected actions instead of allowing them to inherit the final
+        # sequence reward.
+        train_data["action_rewards"] = [
+            list((sample.metadata or {}).get("action_rewards", []))
+            if isinstance(sample.metadata, dict)
+            else []
+            for sample in samples
+        ]
+        train_data["action_token_spans"] = [
+            list((sample.metadata or {}).get("assistant_token_masks", []))
+            if isinstance(sample.metadata, dict)
+            else []
+            for sample in samples
+        ]
+        train_data["rejected_action_indices"] = [
+            list((sample.metadata or {}).get("rejected_action_indices", []))
+            if isinstance(sample.metadata, dict)
+            else []
+            for sample in samples
+        ]
 
         if self.args.advantage_estimator == "step_wise":
             (
@@ -808,6 +869,9 @@ class RolloutManager:
                 "step_wise_step_rewards",
                 "step_wise_step_token_spans",
                 "step_wise_step_indices",
+                "action_rewards",
+                "action_token_spans",
+                "rejected_action_indices",
             ]:
                 if key not in data:
                     continue
