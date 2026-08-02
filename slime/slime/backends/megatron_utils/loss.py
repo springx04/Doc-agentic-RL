@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
+from slime.utils.action_training import build_action_training_overrides
 
 logger = logging.getLogger(__name__)
 
@@ -608,6 +609,33 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         returns = get_grpo_returns(rewards, kl)
         # TODO: is the copy necessary?
         advantages = [r for r in returns]
+
+        # Consume rejected-action rewards independently from the sequence
+        # reward.  Their public assistant-token mask remains zero in rollout
+        # diagnostics, while these spans receive an explicit negative
+        # advantage and a trainer-side mask so they cannot inherit a positive
+        # terminal reward.
+        action_rewards = rollout_data.get("action_rewards", [])
+        action_token_spans = rollout_data.get("action_token_spans", [])
+        consumed_action_indices = []
+        for i in range(len(advantages)):
+            signal = build_action_training_overrides(
+                int(response_lengths[i]),
+                action_token_spans[i] if i < len(action_token_spans) else [],
+                action_rewards[i] if i < len(action_rewards) else [],
+            )
+            consumed_action_indices.append(signal["consumed_action_indices"])
+            if not signal["action_reward_consumed"]:
+                continue
+            advantages[i] = advantages[i].clone()
+            returns[i] = returns[i].clone()
+            loss_masks[i] = loss_masks[i].clone()
+            for position, enabled in enumerate(signal["action_token_mask"]):
+                if enabled and position < advantages[i].numel():
+                    advantages[i][position] = float(signal["action_advantages"][position])
+                    returns[i][position] = float(signal["action_advantages"][position])
+                    loss_masks[i][position] = 1
+        rollout_data["action_reward_consumed"] = consumed_action_indices
 
     elif args.advantage_estimator == "step_wise":
         # Step-wise rewards are pre-normalized in rollout.py; here we only

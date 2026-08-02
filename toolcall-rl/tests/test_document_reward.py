@@ -21,6 +21,14 @@ def test_missing_final_tag_gets_minimum_reward():
     assert result["format"] == 0.0
 
 
+def test_semantically_correct_final_span_inside_prose_keeps_positive_correctness():
+    result = compute_document_reward("Explanation: the answer is <final>Bengaluru</final>.", "Bengaluru")
+    assert result["answer_correctness"] == 1.0
+    assert result["format_validity"] == 0.0
+    assert result["answer_conciseness"] < 1.0
+    assert result["score"] > 0.0
+
+
 def test_exact_match_accepts_aliases_and_normalizes_punctuation():
     label = json.dumps({"answers": ["US$1.2 million", "$1.2m"], "metric": "exact_match"})
     result = compute_document_reward("<final>US$1.2 million.</final>", label)
@@ -63,8 +71,10 @@ def test_anls_gives_partial_credit_for_ocr_noise():
 
 
 def test_chinese_normalization_preserves_characters():
-    assert normalize_answer("文档理解！") == "文档理解"
-    result = compute_document_reward("<final>文档理解</final>", "文档理解")
+    source = "".join(chr(code) for code in (0x6587, 0x6863, 0x7406, 0x89e3)) + chr(0xff1a)
+    expected = "".join(chr(code) for code in (0x6587, 0x6863, 0x7406, 0x89e3))
+    assert normalize_answer(source) == expected
+    result = compute_document_reward(f"<final>{expected}</final>", expected)
     assert result["score"] == 1.0
 
 
@@ -78,3 +88,21 @@ def test_manifest_record_is_converted_to_document_task(tmp_path):
     assert "<final>" in item["prompt"]
     assert json.loads(item["label"])["answers"] == ["Annual report"]
     assert item["metadata"]["task_id"] == "q1"
+
+
+def test_answer_page_metadata_is_preserved(tmp_path):
+    item = transform_record(
+        {
+            "id": "q2",
+            "file_path": "report.pdf",
+            "question": "Who is the supplier?",
+            "answers": ["BURKE"],
+            "answer_page": 3,
+            "answer_bbox": [1, 2, 3, 4],
+            "num_pages": 4,
+        },
+        document_root=tmp_path,
+    )
+    assert item["metadata"]["answer_page"] == 3
+    assert item["metadata"]["answer_bbox"] == [1, 2, 3, 4]
+    assert item["metadata"]["page_count"] == 4

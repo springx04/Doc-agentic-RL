@@ -12,6 +12,7 @@ from transformers import AutoConfig
 
 from slime.ray.train_actor import TrainRayActor
 from slime.utils import logging_utils, train_dump_utils, train_metric_utils
+from slime.utils.action_training import build_action_training_overrides
 from slime.utils.data import get_minimum_num_micro_batch_size, process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.logging_utils import init_tracking
@@ -529,10 +530,37 @@ class FSDPTrainRayActor(TrainRayActor):
 
     def _train_core(self, rollout_id: int, rollout_data) -> None:
         if self.args.advantage_estimator in ["grpo", "gspo"]:
-            rollout_data["advantages"] = rollout_data["returns"] = [
-                torch.tensor([rollout_data["rewards"][i]] * rollout_data["response_lengths"][i])
-                for i in range(len(rollout_data["rewards"]))
-            ]
+            advantages = []
+            effective_loss_masks = []
+            consumed_action_indices = []
+            action_rewards = rollout_data.get("action_rewards", [])
+            action_token_spans = rollout_data.get("action_token_spans", [])
+            for i, reward in enumerate(rollout_data["rewards"]):
+                response_length = int(rollout_data["response_lengths"][i])
+                sequence_advantage = torch.tensor(
+                    [reward] * response_length,
+                    dtype=torch.float32,
+                )
+                loss_mask = list(rollout_data["loss_masks"][i])
+                signal = build_action_training_overrides(
+                    response_length,
+                    action_token_spans[i] if i < len(action_token_spans) else [],
+                    action_rewards[i] if i < len(action_rewards) else [],
+                )
+                action_advantages = signal["action_advantages"]
+                action_mask = signal["action_token_mask"]
+                for position, enabled in enumerate(action_mask):
+                    if enabled:
+                        # Rejected action tokens receive the negative action
+                        # advantage, never the positive terminal reward.
+                        sequence_advantage[position] = float(action_advantages[position])
+                        loss_mask[position] = 1
+                advantages.append(sequence_advantage)
+                effective_loss_masks.append(loss_mask)
+                consumed_action_indices.append(signal["consumed_action_indices"])
+            rollout_data["loss_masks"] = effective_loss_masks
+            rollout_data["advantages"] = rollout_data["returns"] = advantages
+            rollout_data["action_reward_consumed"] = consumed_action_indices
         else:
             raise NotImplementedError(f"Unsupported advantage_estimator {self.args.advantage_estimator}")
 

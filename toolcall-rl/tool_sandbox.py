@@ -15,8 +15,12 @@ else:
 
 
 TOOL_CONFIGS = {
-    "max_turns": 16,
-    "max_tool_calls": 16,
+    # A rollout may inspect several pages and then perform a final answer
+    # turn.  Keep the tool budget explicit so the navigation guard can tell
+    # the model when it must stop searching and answer with the evidence it
+    # has collected.
+    "max_turns": 10,
+    "max_tool_calls": 8,
     "max_obs_chars": 8192,
     "tool_concurrency": 32,
 }
