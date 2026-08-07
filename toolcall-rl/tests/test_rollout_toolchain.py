@@ -395,7 +395,7 @@ def test_bayestool_filter_and_q_checkpoints_load_into_rollout_worker(monkeypatch
     module, _ = _load_generator(monkeypatch)
     from bayestool.belief import ToolWorldFilterNetwork
     from bayestool.config import default_config
-    from bayestool.decision import BayesQHead
+    from bayestool.decision import BayesQHead, Q_FEATURE_SCHEMA_VERSION
 
     config = default_config(enabled=True)
     belief_path = tmp_path / "belief.pt"
@@ -407,7 +407,14 @@ def test_bayestool_filter_and_q_checkpoints_load_into_rollout_worker(monkeypatch
         },
         belief_path,
     )
-    torch.save({"model_state": BayesQHead().state_dict(), "model_version": "q-test"}, q_path)
+    torch.save(
+        {
+            "model_state": BayesQHead().state_dict(),
+            "model_version": "q-test",
+            "q_feature_schema_version": Q_FEATURE_SCHEMA_VERSION,
+        },
+        q_path,
+    )
 
     filter_model, filter_version, q_head, q_version = module._load_bayestool_models(
         SimpleNamespace(
@@ -578,6 +585,11 @@ def test_tool_and_generation_errors_are_excluded_from_rl(monkeypatch):
     assert reward["valid_for_rl"] is False
     assert reward["rollout_status"] == "generation_error"
     assert reward["score"] == 0.0
+
+    batched = asyncio.run(module.reward_func(SimpleNamespace(prm_enable=False), [result]))
+    assert isinstance(batched, list)
+    assert batched[0]["valid_for_rl"] is False
+    assert batched[0]["rollout_status"] == "generation_error"
 
 
 def test_evidence_sufficiency_turns_true_only_for_a_local_field_value(monkeypatch):

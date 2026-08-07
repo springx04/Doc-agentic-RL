@@ -51,6 +51,68 @@ def _sample_excluded_from_rl(sample: Sample) -> bool:
     return bool(metadata.get("exclude_from_group_statistics")) or metadata.get("valid_for_rl") is False or status in _RL_EXCLUDED_STATUSES
 
 
+def _clone_multimodal_train_inputs(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Copy processor tensors without changing the visual input contract.
+
+    FSDP data-parallel ranks must execute the same Qwen-VL visual/text module
+    path for a collective.  A padding sample therefore needs a real visual
+    processor payload when the retained rollout batch contains one.  Tensor
+    values are cloned so later packing cannot mutate the source sample; other
+    processor fields are shallow-copied because they are immutable metadata.
+    """
+    if not value:
+        return None
+    copied: dict[str, Any] = {}
+    for key, item in value.items():
+        if isinstance(item, torch.Tensor):
+            copied[key] = item.detach().clone()
+        else:
+            copied[key] = copy(item)
+    return copied or None
+
+
+def _make_zero_loss_dummy_samples(count: int, template: Sample | None = None) -> list[Sample]:
+    """Pad a rollout batch while preserving a homogeneous VLM input path.
+
+    The template is an actual retained rollout, never a synthetic answer.  A
+    dummy reuses its prompt/vision tokens and processor tensors, but all
+    response loss-mask entries are zero and it is explicitly marked removed.
+    Thus the padding keeps FSDP collectives aligned without contributing a
+    policy-gradient signal.
+    """
+    result: list[Sample] = []
+    for offset in range(count):
+        if template is None:
+            tokens = [0, 0]
+            response_length = 1
+            train_inputs = None
+            source_index = None
+        else:
+            tokens = list(template.tokens)
+            response_length = max(1, int(template.response_length))
+            train_inputs = _clone_multimodal_train_inputs(template.multimodal_train_inputs)
+            source_index = template.index
+        result.append(
+            Sample(
+                group_index=-(offset + 1),
+                index=-(offset + 1),
+                tokens=tokens,
+                response_length=response_length,
+                loss_mask=[0] * response_length,
+                rollout_log_probs=[0.0] * response_length,
+                multimodal_train_inputs=train_inputs,
+                reward={"score": 0.0},
+                remove_sample=True,
+                status=Sample.Status.FAILED,
+                metadata={
+                    "dummy_removed_sample": True,
+                    "dummy_visual_template_index": source_index,
+                },
+            )
+        )
+    return result
+
+
 def _bayestool_apply_meta_suffix_returns(
     samples: list[Sample],
     trajectory_rewards: list[float],
@@ -871,24 +933,6 @@ class RolloutManager:
             """
             return [sample for sample in samples if not sample.remove_sample]
 
-        def _make_dummy_samples(count: int) -> list[Sample]:
-            reward = {self.args.reward_key or "score": 0.0}
-            return [
-                Sample(
-                    group_index=-(i + 1),
-                    index=-(i + 1),
-                    tokens=[0, 0],
-                    response_length=1,
-                    loss_mask=[0],
-                    rollout_log_probs=[0.0],
-                    reward=reward,
-                    remove_sample=True,
-                    status=Sample.Status.FAILED,
-                    metadata={"dummy_removed_sample": True},
-                )
-                for i in range(count)
-            ]
-
         _mark_removed_samples(samples)
         samples = _drop_removed_samples(samples)
         samples = self._drop_constant_reward_groups(samples)
@@ -914,13 +958,23 @@ class RolloutManager:
         if len(samples) < effective_global_batch_size:
             dummy_count = effective_global_batch_size - len(samples)
         if dummy_count:
+            visual_template = next(
+                (
+                    sample
+                    for sample in samples
+                    if isinstance(sample.multimodal_train_inputs, dict)
+                    and sample.multimodal_train_inputs
+                ),
+                None,
+            )
             logger.warning(
-                "Injecting %d dummy samples to align %d samples with global_batch_size=%d.",
+                "Injecting %d zero-loss dummy samples to align %d samples with global_batch_size=%d (visual_template=%s).",
                 dummy_count,
                 len(samples),
                 effective_global_batch_size,
+                visual_template.index if visual_template is not None else None,
             )
-            samples.extend(_make_dummy_samples(dummy_count))
+            samples.extend(_make_zero_loss_dummy_samples(dummy_count, visual_template))
 
         raw_rewards, rewards = self._post_process_rewards(samples)
 

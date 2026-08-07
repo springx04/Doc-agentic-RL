@@ -34,6 +34,7 @@ try:
         AnswerRiskCalibrator,
         BayesQHead,
         DecisionController,
+        Q_FEATURE_SCHEMA_VERSION,
         canonical_action,
         canonical_action_key,
         q_feature_vectors,
@@ -48,6 +49,7 @@ except Exception:  # pragma: no cover - baseline rollout remains importable with
     AnswerRiskCalibrator = None  # type: ignore[assignment]
     BayesQHead = None  # type: ignore[assignment]
     DecisionController = None  # type: ignore[assignment]
+    Q_FEATURE_SCHEMA_VERSION = None  # type: ignore[assignment]
     canonical_action = None  # type: ignore[assignment]
     canonical_action_key = None  # type: ignore[assignment]
     q_feature_vectors = None  # type: ignore[assignment]
@@ -435,6 +437,12 @@ def _load_bayestool_models(args: Any, config: Any) -> tuple[Any, str, Any, str]:
                 import torch
 
                 payload = torch.load(q_path, map_location="cpu")
+                checkpoint_schema = str(payload.get("q_feature_schema_version") or "")
+                if checkpoint_schema != Q_FEATURE_SCHEMA_VERSION:
+                    raise RuntimeError(
+                        "BayesTool Q-head feature schema mismatch: "
+                        f"checkpoint={checkpoint_schema or 'missing'} expected={Q_FEATURE_SCHEMA_VERSION}"
+                    )
                 state, q_version = _checkpoint_state(payload)
                 q_head = BayesQHead()
                 incompatible = q_head.load_state_dict(state, strict=False)
@@ -6046,6 +6054,16 @@ def _reward_consistency_errors(result: dict[str, Any], metadata: dict[str, Any])
 
 async def reward_func(args, sample, **kwargs):
     """Reward a grounded document answer with optional step-wise PRM scores."""
+    if isinstance(sample, (list, tuple)):
+        # slime's batched_async_rm calls custom reward functions with the
+        # whole pending batch.  Keep the actual reward calculation below
+        # single-sample so utility, consistency, and exclusion metadata remain
+        # attached to the corresponding Sample, then return the same-order
+        # reward list expected by the rollout manager.
+        rewards = await asyncio.gather(
+            *(reward_func(args, item, **kwargs) for item in sample)
+        )
+        return list(rewards)
     if not isinstance(sample, Sample):
         raise TypeError("Sample must be an instance of Sample class.")
 

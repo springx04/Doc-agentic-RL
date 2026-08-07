@@ -7,6 +7,63 @@ import torch
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 
 
+def _get_multimodal_balanced_partitions(
+    seq_lengths: list[int],
+    multimodal_train_inputs: list[dict | None] | None,
+    k_partitions: int,
+) -> list[list[int]]:
+    """Create modality-homogeneous packs when a batch mixes VLM/text inputs."""
+
+    def _default_partitions() -> list[list[int]]:
+        return get_seqlen_balanced_partitions(
+            seq_lengths,
+            k_partitions=k_partitions,
+            equal_size=False,
+        )
+
+    if not multimodal_train_inputs:
+        return _default_partitions()
+
+    multimodal_indices = [
+        index for index, value in enumerate(multimodal_train_inputs) if value
+    ]
+    text_indices = [
+        index for index, value in enumerate(multimodal_train_inputs) if not value
+    ]
+    if not multimodal_indices or not text_indices:
+        return _default_partitions()
+    if k_partitions < 2:
+        raise RuntimeError("mixed FSDP batches require at least two modality-homogeneous packs")
+
+    lower_multimodal_packs = max(1, k_partitions - len(text_indices))
+    upper_multimodal_packs = min(len(multimodal_indices), k_partitions - 1)
+    if lower_multimodal_packs > upper_multimodal_packs:
+        raise RuntimeError(
+            "cannot create non-empty modality-homogeneous FSDP packs from the local batch"
+        )
+    ideal_multimodal_packs = round(
+        k_partitions * len(multimodal_indices) / len(seq_lengths)
+    )
+    multimodal_pack_count = min(
+        max(ideal_multimodal_packs, lower_multimodal_packs),
+        upper_multimodal_packs,
+    )
+    text_pack_count = k_partitions - multimodal_pack_count
+
+    def _partition_subset(indices: list[int], count: int) -> list[list[int]]:
+        relative_parts = get_seqlen_balanced_partitions(
+            [seq_lengths[index] for index in indices],
+            k_partitions=count,
+            equal_size=False,
+        )
+        return [[indices[index] for index in part] for part in relative_parts]
+
+    return _partition_subset(multimodal_indices, multimodal_pack_count) + _partition_subset(
+        text_indices,
+        text_pack_count,
+    )
+
+
 def pack_sequences(
     tokens: list[list[int]],
     loss_masks: list[list[int]],
@@ -54,8 +111,10 @@ def pack_sequences(
         k_partitions = 1
 
     # Use balanced partitioning for optimal load distribution
-    partitions = get_seqlen_balanced_partitions(
-        seq_lengths, k_partitions=k_partitions, equal_size=False  # Allow variable sizes for better balance
+    partitions = _get_multimodal_balanced_partitions(
+        seq_lengths,
+        multimodal_train_inputs,
+        k_partitions,
     )
 
     # Pack each partition
@@ -103,18 +162,27 @@ def pack_sequences(
         if multimodal_train_inputs:
             multimodal_data = {}  # key -> concatenated tensor
             multimodal_num_items = {}  # key -> list of item counts per sequence
-            for i in indices:
-                for key, mm_tensor in multimodal_train_inputs[i].items():
+            for sequence_offset, i in enumerate(indices):
+                # Keep one per-sequence count even when a zero-loss padding
+                # sample carries no visual payload.  This lets unpacking and
+                # FSDP model inputs remain aligned without calling .items() on
+                # None.
+                mm_inputs = multimodal_train_inputs[i] or {}
+                for item_counts in multimodal_num_items.values():
+                    item_counts.append(0)
+                for key, mm_tensor in mm_inputs.items():
                     if not isinstance(mm_tensor, torch.Tensor):
                         mm_tensor = torch.tensor(mm_tensor)
+                    item_count = mm_tensor.size(0)
                     if key not in multimodal_data:
                         multimodal_data[key] = mm_tensor
-                        multimodal_num_items[key] = [mm_tensor.size(0)]
+                        multimodal_num_items[key] = [0] * sequence_offset + [item_count]
                     else:
                         multimodal_data[key] = torch.cat([multimodal_data[key], mm_tensor], dim=0)
-                        multimodal_num_items[key].append(mm_tensor.size(0))
-            packed_batch["multimodal_train_inputs"] = multimodal_data
-            packed_batch["multimodal_num_items"] = multimodal_num_items
+                        multimodal_num_items[key][-1] = item_count
+            if multimodal_data:
+                packed_batch["multimodal_train_inputs"] = multimodal_data
+                packed_batch["multimodal_num_items"] = multimodal_num_items
 
         result.append(packed_batch)
 

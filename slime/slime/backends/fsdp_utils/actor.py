@@ -371,13 +371,10 @@ class FSDPTrainRayActor(TrainRayActor):
                 for batch in self.prof.iterate_train_log_probs(
                     tqdm(packed_batches, desc=f"{store_prefix}log_probs", disable=dist.get_rank() != 0)
                 ):
-                    model_args = self._get_model_inputs_args(batch)
-                    logits = active_model(**model_args).logits.squeeze(0).float()
-                    log_probs_result, entropy_result = get_logprob_and_entropy(
-                        logits=logits,
-                        target_tokens=batch["tokens"],
-                        allow_compile=not self.args.true_on_policy_mode,
-                        temperature=self.args.rollout_temperature,
+                    log_probs_result, entropy_result = self._forward_log_probs(
+                        active_model,
+                        batch,
+                        compute_entropy=self.args.entropy_coef != 0.0,
                     )
                     batch[f"{store_prefix}log_probs"] = log_probs_result
                     if store_prefix == "":
@@ -686,17 +683,14 @@ class FSDPTrainRayActor(TrainRayActor):
             self.ref_model.cpu()
 
     def _train_step(self, packed_batch, reported_accum, mbs_id, grad_accum):
-        # Prepare model inputs
-        model_args = self._get_model_inputs_args(packed_batch)
-        logits = self.model(**model_args).logits.squeeze(0).float()
-
-        # Compute log probs and entropy
+        # Compute log probs and entropy.  Qwen3-VL can return logits only for
+        # the response positions; keeping the multimodal prompt logits would
+        # allocate [sequence_length, vocab_size] even though every prompt
+        # token has a zero loss mask.
         need_entropy = self.args.entropy_coef != 0.0
-        log_probs, entropy_result = get_logprob_and_entropy(
-            logits=logits,
-            target_tokens=packed_batch["tokens"],
-            allow_compile=not self.args.true_on_policy_mode,
-            temperature=self.args.rollout_temperature,
+        log_probs, entropy_result = self._forward_log_probs(
+            self.model,
+            packed_batch,
             compute_entropy=need_entropy,
         )
         packed_batch["cur_log_probs"] = log_probs
@@ -940,7 +934,85 @@ class FSDPTrainRayActor(TrainRayActor):
         else:
             raise NotImplementedError(f"Loading from checkpoint file {ref_load_path} not yet implemented")
 
-    def _get_model_inputs_args(self, packed_sequence: dict) -> dict:
+    def _supports_selective_logits(self) -> bool:
+        """Whether the active VLM exposes arbitrary ``logits_to_keep`` indices."""
+
+        # Qwen3-VL's HF forward supports an index tensor, which is important
+        # for packed multimodal sequences.  Do not pass this model-specific
+        # kwarg to text-only/older models that may not accept it.
+        return hasattr(self.hf_config, "vision_config") and getattr(self.hf_config, "model_type", None) == "qwen3_vl"
+
+    @staticmethod
+    def _response_logit_positions(packed_sequence: dict, device: torch.device) -> torch.Tensor:
+        """Return flattened positions whose logits predict response tokens."""
+
+        cu_seqlens = packed_sequence["cu_seqlens"].tolist()
+        response_lengths = packed_sequence["response_lengths"]
+        positions: list[int] = []
+        for sequence_index, response_length in enumerate(response_lengths):
+            start = int(cu_seqlens[sequence_index])
+            end = int(cu_seqlens[sequence_index + 1])
+            response_length = int(response_length)
+            available = max(0, end - start - 1)
+            if response_length < 0 or response_length > available:
+                raise ValueError(
+                    f"response length {response_length} is incompatible with packed sequence "
+                    f"[{start}, {end})"
+                )
+            # Position p predicts input_ids[p + 1].  The response occupies
+            # the final response_length input tokens of this sequence.
+            positions.extend(range(end - response_length - 1, end - 1))
+        return torch.tensor(positions, dtype=torch.long, device=device)
+
+    def _forward_log_probs(
+        self,
+        model,
+        packed_sequence: dict,
+        *,
+        compute_entropy: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one packed forward while avoiding full VLM vocabulary logits."""
+
+        if self._supports_selective_logits():
+            # The model still processes the complete multimodal prefix so
+            # causal attention and MRoPE semantics are unchanged.  Only the
+            # final response-token projection is retained, which removes the
+            # otherwise dominant ``T * vocab_size`` allocation.
+            model_device = next(model.parameters()).device
+            positions = self._response_logit_positions(packed_sequence, model_device)
+            if positions.numel() > 0:
+                model_args = self._get_model_inputs_args(packed_sequence, logits_to_keep=positions)
+                logits = model(**model_args).logits.squeeze(0)
+                target_positions = positions + 1
+                target_tokens = packed_sequence["tokens"].to(device=model_device).index_select(0, target_positions)
+                selected_log_probs, selected_entropy = get_selected_logprob_and_entropy(
+                    logits=logits,
+                    target_tokens=target_tokens,
+                    allow_compile=not self.args.true_on_policy_mode,
+                    temperature=self.args.rollout_temperature,
+                    compute_entropy=compute_entropy,
+                )
+                # Preserve the existing packed/unpack interface: non-response
+                # positions are zero but never contribute because their masks
+                # are zero.  The vector is tiny compared with the logits.
+                packed_length = max(0, int(packed_sequence["tokens"].numel()) - 1)
+                log_probs = torch.zeros(packed_length, dtype=torch.float32, device=model_device)
+                entropy = torch.zeros_like(log_probs)
+                log_probs.index_copy_(0, positions, selected_log_probs.float())
+                entropy.index_copy_(0, positions, selected_entropy.float())
+                return log_probs, entropy
+
+        model_args = self._get_model_inputs_args(packed_sequence)
+        logits = model(**model_args).logits.squeeze(0)
+        return get_logprob_and_entropy(
+            logits=logits,
+            target_tokens=packed_sequence["tokens"],
+            allow_compile=not self.args.true_on_policy_mode,
+            temperature=self.args.rollout_temperature,
+            compute_entropy=compute_entropy,
+        )
+
+    def _get_model_inputs_args(self, packed_sequence: dict, logits_to_keep: torch.Tensor | None = None) -> dict:
         input_ids = packed_sequence["tokens"].unsqueeze(0)
         position_ids = packed_sequence["position_ids"].unsqueeze(0)
 
@@ -951,6 +1023,8 @@ class FSDPTrainRayActor(TrainRayActor):
         }
         if packed_sequence.get("multimodal_train_inputs"):
             model_args.update(packed_sequence["multimodal_train_inputs"])
+        if logits_to_keep is not None:
+            model_args["logits_to_keep"] = logits_to_keep
         return model_args
 
 
@@ -967,8 +1041,13 @@ def selective_log_softmax_raw(logits: torch.Tensor, input_ids: torch.Tensor) -> 
     Returns:
         Tensor of shape [...] containing the log-probabilities corresponding to `input_ids`.
     """
-    logprobs = logits.log_softmax(dim=-1)
-    return torch.gather(logprobs, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
+    # Computing the full ``log_softmax`` tensor is needlessly expensive for a
+    # policy-gradient batch: only one vocabulary entry per token is used.  The
+    # equivalent gather/log-normalizer formulation keeps the autograd graph
+    # over the original logits without materialising another [T, V] tensor.
+    target_logits = torch.gather(logits, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
+    log_normalizer = torch.logsumexp(logits, dim=-1)
+    return target_logits - log_normalizer
 
 
 selective_log_softmax_compiled = torch.compile(dynamic=True)(selective_log_softmax_raw)
@@ -1036,6 +1115,31 @@ def get_logprob_and_entropy(
     if compute_entropy:
         log_probs_full = torch.log_softmax(shifted_logits, dim=-1)
         probs = torch.softmax(shifted_logits, dim=-1)
+        entropy = -(probs * log_probs_full).sum(dim=-1)
+    else:
+        entropy = torch.zeros_like(log_probs)
+    return log_probs, entropy
+
+
+def get_selected_logprob_and_entropy(
+    logits: torch.Tensor,
+    target_tokens: torch.Tensor,
+    allow_compile: bool,
+    temperature: float | None = None,
+    compute_entropy: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute log-probs for a tensor of already-selected response positions."""
+
+    if logits.dim() == 3:
+        logits = logits.squeeze(0)
+    if temperature is not None:
+        logits = logits.div(temperature)
+
+    selective_log_softmax = selective_log_softmax_compiled if allow_compile else selective_log_softmax_raw
+    log_probs = selective_log_softmax(logits, target_tokens.to(device=logits.device))
+    if compute_entropy:
+        log_probs_full = torch.log_softmax(logits, dim=-1)
+        probs = torch.softmax(logits, dim=-1)
         entropy = -(probs * log_probs_full).sum(dim=-1)
     else:
         entropy = torch.zeros_like(log_probs)

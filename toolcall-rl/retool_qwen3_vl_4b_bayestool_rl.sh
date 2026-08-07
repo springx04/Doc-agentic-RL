@@ -94,6 +94,35 @@ case "${BAYESTOOL_STAGE}" in
     *) echo "BAYESTOOL_STAGE must be one of a, b, c, d" >&2; exit 1 ;;
 esac
 
+# Stage A is an executable replay/training stage, not a policy-RL run with
+# branching disabled.  It consumes a completed rollout artifact and produces
+# the canonical replay, belief/smoother checkpoint, and one capability
+# manifest that later stages can reference.  Refuse to continue without the
+# artifact so an accidental Stage-A launch cannot masquerade as training.
+if [[ "${BAYESTOOL_STAGE}" == "a" ]]; then
+    if [[ -z "${BAYESTOOL_STAGE_A_INPUT:-}" || ! -f "${BAYESTOOL_STAGE_A_INPUT}" ]]; then
+        echo "Stage A requires BAYESTOOL_STAGE_A_INPUT=.../rollout_interactions.json" >&2
+        exit 1
+    fi
+    STAGE_A_OUTPUT_DIR=${BAYESTOOL_STAGE_A_OUTPUT_DIR:-${SAVE_CKPT}/bayestool_stage_a}
+    STAGE_A_ARGS=(
+        --artifact "${BAYESTOOL_STAGE_A_INPUT}"
+        --output-dir "${STAGE_A_OUTPUT_DIR}"
+        --epochs "${BAYESTOOL_STAGE_A_EPOCHS:-1}"
+        --device "${BAYESTOOL_STAGE_A_DEVICE:-cpu}"
+    )
+    if [[ "${BAYESTOOL_STAGE_A_FIT_Q:-0}" == "1" ]]; then
+        STAGE_A_ARGS+=(--fit-q)
+    fi
+    if [[ "${BAYESTOOL_STAGE_A_FIT_RISK:-0}" == "1" ]]; then
+        STAGE_A_ARGS+=(--fit-risk)
+    fi
+    if [[ -n "${BAYESTOOL_STAGE_A_RISK_LABEL_KEY:-}" ]]; then
+        STAGE_A_ARGS+=(--risk-label-key "${BAYESTOOL_STAGE_A_RISK_LABEL_KEY}")
+    fi
+    exec "${PYTHON_BIN}" "${SCRIPT_DIR}/run_bayestool_stage_a.py" "${STAGE_A_ARGS[@]}"
+fi
+
 # The defaults below are the full training configuration.  The overrides are
 # intentionally environment-based so server smoke runs can bound work without
 # creating a second, simplified training implementation.

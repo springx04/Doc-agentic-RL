@@ -28,7 +28,12 @@ from bayestool.belief import (
     observation_prediction_loss,
 )
 from bayestool.config import TOOL_NAMES, BayesToolConfig, default_config
-from bayestool.decision import AnswerRiskCalibrator, BayesQHead
+from bayestool.decision import (
+    AnswerRiskCalibrator,
+    BayesQHead,
+    Q_FEATURE_SCHEMA_VERSION,
+    normalize_q_action_feature_vector,
+)
 from bayestool.schema import TaskStateView
 from bayestool.training import bayes_q_gaussian_nll
 from bayestool.replay import validate_canonical_replay
@@ -226,6 +231,7 @@ class BayesQReplayDataset(Dataset):
                 budget = _fixed_vector(raw.get("budget_features"), 8)
                 if task is None or particle is None or action is None or budget is None:
                     continue
+                action = normalize_q_action_feature_vector(action)
                 target = raw.get("utility", raw.get("policy_utility", raw.get("oracle_utility")))
                 try:
                     target_value = float(target)
@@ -926,6 +932,7 @@ def main(argv: list[str] | None = None) -> int:
                 "model_state": q_head.state_dict(),
                 "metrics": q_metrics,
                 "feature_dims": {"task": 32, "particle": 32, "action": 32, "budget": 8},
+                "q_feature_schema_version": Q_FEATURE_SCHEMA_VERSION,
             },
             q_output,
         )

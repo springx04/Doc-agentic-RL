@@ -34,8 +34,11 @@ from bayestool.config import (  # noqa: E402
 from bayestool.decision import (  # noqa: E402
     AnswerRiskCalibrator,
     DecisionController,
+    Q_FEATURE_SCHEMA_VERSION,
+    _action_feature_vector,
     canonical_action_key,
     js_divergence,
+    normalize_q_action_feature_vector,
 )
 from bayestool.meta_episode import build_meta_episode  # noqa: E402
 from bayestool.schema import TaskStateView, WorldEvent  # noqa: E402
@@ -149,6 +152,44 @@ def test_q_replay_dataset_accepts_particle_expanded_branch_records():
     dataset = BayesQReplayDataset([{"metadata": {"bayes_branch_records": [record]}}])
     assert len(dataset) == 1
     assert float(dataset[0]["target"]) == pytest.approx(0.75)
+
+
+def test_q_action_region_feature_is_bounded_for_rendered_pixel_boxes():
+    task = TaskStateView(
+        question_type="visual",
+        current_page=1,
+        visited_pages=(1,),
+        unvisited_page_count=2,
+        table_candidate_pages=(),
+        supporting_pages=(),
+        evidence_sufficient=False,
+        visual_input_required=True,
+        remaining_tool_budget=4,
+        last_tool=None,
+        last_result_status=None,
+    )
+    particle = SimpleNamespace(tool_quality={"crop_region": SimpleNamespace(relative_cost=1.0)})
+    features = _action_feature_vector(
+        {
+            "kind": "tool",
+            "tool": "crop_region",
+            "arguments": {"bbox": [0, 0, 1600, 1200]},
+        },
+        task,
+        particle,
+    )
+    assert Q_FEATURE_SCHEMA_VERSION == "bayestool-q-features-v2"
+    assert len(features) == 32
+    assert all(math.isfinite(value) for value in features)
+    assert max(features) <= 1.0
+
+
+def test_q_replay_normalizes_legacy_unbounded_region_area():
+    legacy = [0.0] * 32
+    legacy[13] = 241920.0
+    normalized = normalize_q_action_feature_vector(legacy)
+    assert normalized[13] == pytest.approx(math.log1p(241920.0) / math.log1p(1_000_000.0))
+    assert max(normalized) <= 1.0
 
 
 def test_world_slot_type_is_shared_by_replicas_and_extra_slots_are_weighted():

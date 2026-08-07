@@ -30,6 +30,11 @@ except ImportError:  # pragma: no cover
 
 
 ACTION_KINDS = ("tool", "final", "abstain")
+# Region coordinates come from rendered PDF pixels and can be much larger than
+# the rest of the fixed-width action feature vector. Keep the representation
+# monotone while bounding it so one large crop cannot dominate Q fitting.
+Q_FEATURE_SCHEMA_VERSION = "bayestool-q-features-v2"
+_REGION_AREA_LOG_SCALE = math.log1p(1_000_000.0)
 
 
 def _clip(value: float, low: float, high: float) -> float:
@@ -251,7 +256,9 @@ def _action_feature_vector(action: Any, task_state: TaskStateView, particle: Pos
     area = 0.0
     if isinstance(bbox, (list, tuple)) and len(bbox) == 4:
         try:
-            area = abs((float(bbox[2]) - float(bbox[0])) * (float(bbox[3]) - float(bbox[1])))
+            raw_area = abs((float(bbox[2]) - float(bbox[0])) * (float(bbox[3]) - float(bbox[1])))
+            if math.isfinite(raw_area):
+                area = min(1.0, math.log1p(max(0.0, raw_area)) / _REGION_AREA_LOG_SCALE)
         except (TypeError, ValueError):
             area = 0.0
     digest = hashlib.sha256(canonical_action_key(action).encode("utf-8")).digest()
@@ -270,6 +277,20 @@ def _action_feature_vector(action: Any, task_state: TaskStateView, particle: Pos
         + hash_features
         + [0.0] * 7
     )
+
+
+def normalize_q_action_feature_vector(values: Sequence[Any]) -> list[float]:
+    """Normalize legacy replay action features to the current Q contract."""
+
+    features = [float(value) for value in values]
+    area_index = len(ACTION_KINDS) + len(TOOL_NAMES) + 2
+    if len(features) > area_index:
+        area = features[area_index]
+        if not math.isfinite(area):
+            features[area_index] = 0.0
+        elif area > 1.0:
+            features[area_index] = min(1.0, math.log1p(max(0.0, area)) / _REGION_AREA_LOG_SCALE)
+    return features
 
 
 def _particle_feature_vector(particle: PosteriorParticle) -> list[float]:
@@ -896,8 +917,10 @@ __all__ = [
     "canonical_action_key",
     "action_kind",
     "action_is_diagnostic",
+    "normalize_q_action_feature_vector",
     "sample_posterior_particles",
     "BayesQHead",
+    "Q_FEATURE_SCHEMA_VERSION",
     "q_feature_vectors",
     "AnswerRiskCalibrator",
     "DecisionReport",
