@@ -3944,6 +3944,47 @@ def _compact_model_context(
                 )
         return token_ids, image_data
 
+    def fit_observation_to_budget(
+        observation_ids: list[int],
+        available: int,
+        suffix_token_count: int,
+    ) -> tuple[list[int], bool]:
+        """Trim an observation without destroying its next-turn boundary.
+
+        The previous implementation kept ``observation_ids[:available]``.
+        That is unsafe because the observation is encoded as a complete user
+        turn and its final ``<|im_end|>\n<|im_start|>assistant\n`` suffix is
+        what tells the backend to start a fresh assistant action.  If the
+        suffix is cut off, the next generation continues the middle of a
+        JSON/path observation, which is a model-input corruption rather than
+        a model protocol decision.
+        """
+
+        if len(observation_ids) <= available:
+            return list(observation_ids), True
+        available = max(0, int(available))
+        suffix_token_count = min(
+            max(0, int(suffix_token_count or 0)),
+            len(observation_ids),
+        )
+        if suffix_token_count <= 0:
+            # Synthetic/unit-test segments from older callers may not carry
+            # the boundary metadata.  Preserve their historical behavior;
+            # real encoded observations always provide the count below.
+            return list(observation_ids[:available]), True
+        if available < suffix_token_count:
+            # There is no valid assistant-turn context that fits.  Returning
+            # the complete observation keeps the boundary intact; the caller
+            # will observe the over-budget context and terminate explicitly
+            # as context_overflow instead of issuing a malformed request.
+            return list(observation_ids), False
+        body_count = available - suffix_token_count
+        return (
+            list(observation_ids[:body_count])
+            + list(observation_ids[-suffix_token_count:]),
+            True,
+        )
+
     token_ids, image_data = rebuild()
     target_length = max(1, int(max_context_length) - max(32, int(reserve_tokens)))
     while len(token_ids) > target_length and len(segments) > 1:
@@ -3979,8 +4020,22 @@ def _compact_model_context(
         available = max(0, target_length - len(prompt_token_ids) - len(action_ids))
         observation_ids = list(latest.get(observation_key, []))
         if len(observation_ids) > available:
-            latest[observation_key] = observation_ids[:available]
+            suffix_key = (
+                "text_observation_suffix_token_count"
+                if observation_key == "text_observation_token_ids"
+                else "observation_suffix_token_count"
+            )
+            fitted_observation, fits = fit_observation_to_budget(
+                observation_ids,
+                available,
+                int(latest.get(suffix_key, 0) or 0),
+            )
+            latest[observation_key] = fitted_observation
             token_ids, image_data = rebuild()
+            if not fits:
+                # Keep the full, well-formed turn so the next loop's explicit
+                # context limit check can fail closed before a backend call.
+                token_ids, image_data = rebuild()
     return token_ids, image_data
 
 
@@ -4023,12 +4078,14 @@ def _encode_tool_observation(
     state: GenerateState,
     observation: str,
     image_paths: list[str],
-) -> tuple[list[int], str, list[str], list[Any], dict[str, Any] | None, int]:
+) -> tuple[list[int], str, list[str], list[Any], dict[str, Any] | None, int, int]:
     """Encode an observation as a new user turn, including real image tokens."""
+    assistant_turn_suffix = "<|im_end|>\n<|im_start|>assistant\n"
     if not image_paths:
-        encoded_text = f"<|im_end|>\n<|im_start|>user\n{observation}<|im_end|>\n<|im_start|>assistant\n"
+        encoded_text = f"<|im_end|>\n<|im_start|>user\n{observation}{assistant_turn_suffix}"
         token_ids = state.tokenizer(encoded_text, add_special_tokens=False)["input_ids"]
-        return token_ids, encoded_text, [], [], None, 0
+        suffix_ids = state.tokenizer(assistant_turn_suffix, add_special_tokens=False)["input_ids"]
+        return token_ids, encoded_text, [], [], None, 0, len(suffix_ids)
 
     if state.processor is None:
         raise RuntimeError("tool returned an image but the multimodal processor is unavailable")
@@ -4048,7 +4105,7 @@ def _encode_tool_observation(
         vision_tokens = "\n".join(f"{vision_start}{image_token}{vision_end}" for _ in images)
         encoded_text = (
             f"<|im_end|>\n<|im_start|>user\n{vision_tokens}\n{observation}"
-            "<|im_end|>\n<|im_start|>assistant\n"
+            + assistant_turn_suffix
         )
         processor_output = state.processor(text=[encoded_text], images=images, return_tensors="pt")
         input_ids = processor_output["input_ids"][0]
@@ -4062,7 +4119,8 @@ def _encode_tool_observation(
         image_tokens_count = _image_token_count(state.tokenizer, state.processor, token_ids)
         if image_tokens_count <= 0:
             raise RuntimeError("multimodal processor produced no image token for a returned image")
-        return token_ids, encoded_text, image_data, images, train_inputs, image_tokens_count
+        suffix_ids = state.tokenizer(assistant_turn_suffix, add_special_tokens=False)["input_ids"]
+        return token_ids, encoded_text, image_data, images, train_inputs, image_tokens_count, len(suffix_ids)
     except Exception as exc:
         raise RuntimeError(f"image observation encoding failed: {exc}") from exc
 
@@ -5241,6 +5299,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                 obs_images,
                 obs_train_inputs,
                 _new_image_token_count,
+                observation_suffix_token_count,
             ) = _encode_tool_observation(state, next_obs, image_paths_for_next)
         except Exception as exc:
             step["generation_error"] = str(exc)
@@ -5260,6 +5319,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         if obs_train_inputs:
             multimodal_train_inputs_buffer.append(obs_train_inputs)
         text_observation_token_ids = list(obs_token_ids)
+        text_observation_suffix_token_count = int(observation_suffix_token_count)
         if obs_image_data:
             # Keep a text-only representation available for context recovery
             # when the vision-expanded observation cannot fit alongside a
@@ -5270,6 +5330,12 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
             )
             text_observation_token_ids = list(
                 state.tokenizer(text_only_encoded, add_special_tokens=False)["input_ids"]
+            )
+            text_observation_suffix_token_count = len(
+                state.tokenizer(
+                    "<|im_end|>\n<|im_start|>assistant\n",
+                    add_special_tokens=False,
+                )["input_ids"]
             )
         latest_tool["image_token_count"] = int(_new_image_token_count or 0)
         latest_tool["image_input_count"] = len(obs_image_data)
@@ -5295,6 +5361,8 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                 "action_token_ids": list(cur_response_token_ids),
                 "observation_token_ids": list(obs_token_ids),
                 "text_observation_token_ids": text_observation_token_ids,
+                "observation_suffix_token_count": int(observation_suffix_token_count),
+                "text_observation_suffix_token_count": int(text_observation_suffix_token_count),
                 "image_data": list(obs_image_data),
                 "image_token_count": int(_new_image_token_count or 0),
                 "image_paths": list(image_paths_for_next),

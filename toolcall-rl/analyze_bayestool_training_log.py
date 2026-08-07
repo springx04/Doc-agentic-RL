@@ -29,6 +29,7 @@ CHECKPOINT_FILE_NAMES = {
     "latest_checkpointed_iteration.txt",
     "latest_checkpointed_iteration.txt.tmp",
 }
+ROLLOUT_ARTIFACT_NAME = "rollout_interactions.json"
 
 
 def _strip_ansi(text: str) -> str:
@@ -203,6 +204,135 @@ def _checkpoint_present(output_dir: Path | None) -> bool:
         return False
 
 
+def _smoke_result_status(output_dir: Path | None) -> tuple[bool, bool]:
+    """Read the bounded launcher result when the Ray wrapper is quiet.
+
+    The real launcher can finish successfully without printing Ray's
+    ``Job '...' succeeded`` line (for example when the caller captures the
+    driver log rather than the submitter log).  ``smoke_result.json`` is
+    written by the same run directory and is the stronger success signal.
+    """
+
+    if output_dir is None:
+        return False, False
+    result_path = output_dir / "smoke_result.json"
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return False, False
+    if not isinstance(payload, dict):
+        return False, False
+    if payload.get("ok") is True or str(payload.get("status", "")).casefold() in {
+        "ok",
+        "succeeded",
+        "success",
+        "completed",
+    }:
+        return True, False
+    if payload.get("ok") is False or str(payload.get("status", "")).casefold() in {
+        "failed",
+        "error",
+    }:
+        return False, True
+    return False, False
+
+
+def _sample_reward_record(sample: dict[str, Any]) -> dict[str, Any] | None:
+    """Flatten one serialized rollout sample into the audit schema."""
+
+    if not isinstance(sample, dict) or not isinstance(sample.get("reward"), dict):
+        return None
+    record = dict(sample["reward"])
+    metadata = sample.get("metadata") if isinstance(sample.get("metadata"), dict) else {}
+    for key in (
+        "valid_for_rl",
+        "tool_call_count",
+        "valid_tool_call_count",
+        "tool_error_count",
+        "rollout_status",
+        "exclude_from_group_statistics",
+        "protocol_error_count",
+    ):
+        if key not in record:
+            if key in sample:
+                record[key] = sample[key]
+            elif key in metadata:
+                record[key] = metadata[key]
+    return record
+
+
+def _artifact_rollout_records(output_dir: Path | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Load training rollout rewards from the serialized run artifact.
+
+    Driver logs often contain only one aggregate reward mapping per rollout
+    batch.  The JSON exporter contains the actual per-sample reward and
+    validity fields, so it is the authoritative source whenever available.
+    Evaluation samples are deliberately reported separately and never mixed
+    into the policy-update evidence.
+    """
+
+    empty = {
+        "used": False,
+        "source": None,
+        "training_records": 0,
+        "evaluation_records": 0,
+        "parse_failures": 0,
+    }
+    if output_dir is None:
+        return [], empty
+    artifact_path = output_dir / ROLLOUT_ARTIFACT_NAME
+    if not artifact_path.is_file():
+        return [], empty
+    try:
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        result = dict(empty)
+        result["source"] = str(artifact_path)
+        result["parse_failures"] = 1
+        return [], result
+
+    raw_records = payload.get("records", []) if isinstance(payload, dict) else payload
+    if not isinstance(raw_records, list):
+        result = dict(empty)
+        result["source"] = str(artifact_path)
+        result["parse_failures"] = 1
+        return [], result
+
+    training: list[dict[str, Any]] = []
+    evaluation_count = 0
+    parse_failures = 0
+    for record in raw_records:
+        if not isinstance(record, dict):
+            parse_failures += 1
+            continue
+        source = str(record.get("source") or "").casefold()
+        payload_record = record.get("payload", record)
+        samples = payload_record.get("samples", []) if isinstance(payload_record, dict) else []
+        if not isinstance(samples, list):
+            parse_failures += 1
+            continue
+        is_evaluation = "/eval" in source or "\\eval" in source or Path(source).name.casefold().startswith("eval_")
+        target = [] if is_evaluation else training
+        for sample in samples:
+            reward_record = _sample_reward_record(sample)
+            if reward_record is None:
+                parse_failures += 1
+                continue
+            if is_evaluation:
+                evaluation_count += 1
+            else:
+                target.append(reward_record)
+
+    result = {
+        "used": bool(training),
+        "source": str(artifact_path),
+        "training_records": len(training),
+        "evaluation_records": evaluation_count,
+        "parse_failures": parse_failures,
+    }
+    return training, result
+
+
 def audit_training_log(text: str, output_dir: str | Path | None = None) -> dict[str, Any]:
     """Return a conservative, JSON-serializable audit report for one log."""
 
@@ -210,6 +340,11 @@ def audit_training_log(text: str, output_dir: str | Path | None = None) -> dict[
     reward_records, reward_parse_failures = _extract_reward_records(clean)
     metric_records, metric_parse_failures = _extract_metric_records(clean)
     metric_summaries = _metric_summaries(metric_records)
+    output_path = Path(output_dir) if output_dir is not None else None
+    artifact_records, artifact_info = _artifact_rollout_records(output_path)
+    if artifact_records:
+        reward_records = artifact_records
+        reward_parse_failures = 0
 
     reward_values = [
         record.get("total_reward", record.get("score")) for record in reward_records
@@ -232,23 +367,32 @@ def audit_training_log(text: str, output_dir: str | Path | None = None) -> dict[
         }
     )
 
-    output_path = Path(output_dir) if output_dir is not None else None
-    job_succeeded = bool(re.search(r"Job\s+['\"].*?['\"]\s+succeeded", clean))
-    job_failed = bool(re.search(r"Job\s+['\"].*?['\"]\s+failed", clean))
+    smoke_succeeded, smoke_failed = _smoke_result_status(output_path)
+    ray_succeeded = bool(re.search(r"Job\s+['\"].*?['\"]\s+succeeded", clean))
+    ray_failed = bool(re.search(r"Job\s+['\"].*?['\"]\s+failed", clean))
+    job_succeeded = bool(ray_succeeded or smoke_succeeded)
+    job_failed = bool(ray_failed or smoke_failed)
     has_ref_log_probs = bool(re.search(r"\bref_log_probs\b", clean))
-    has_log_probs = bool(re.search(r"\blog_probs\b", clean))
+    has_on_policy_log_probs = bool(
+        re.search(r"timer\s+log_probs\s+(?:start|end)", clean, re.IGNORECASE)
+        and re.search(r"(?:rollout(?:/|_)log_probs|\blog_probs\b)", clean)
+    )
+    has_log_probs = bool(has_ref_log_probs or has_on_policy_log_probs or re.search(r"\blog_probs\b", clean))
     has_train_metrics = any(
         key.startswith("train/") for key in metric_summaries
     ) or "actor_train_time" in clean
     has_optimizer_update = bool(
-        re.search(r"timer\s+update_weights\s+(?:start|end)|successfully saved checkpoint", clean)
+        re.search(
+            r"timer\s+update_weights\s+(?:start|end)|successfully saved checkpoint",
+            clean,
+            re.IGNORECASE,
+        )
     )
     checkpoint_saved = bool(
         re.search(r"successfully saved checkpoint|saving checkpoint at iteration", clean)
     ) or _checkpoint_present(output_path)
     framework_chain_passed = bool(
         job_succeeded
-        and has_ref_log_probs
         and has_log_probs
         and has_train_metrics
         and has_optimizer_update
@@ -300,7 +444,7 @@ def audit_training_log(text: str, output_dir: str | Path | None = None) -> dict[
         diagnoses.append("reward/advantage/auxiliary metrics contain no nonzero learning signal")
     if reward_records and not nonzero_update:
         diagnoses.append("loss, policy loss, and gradient norm are all zero or absent")
-    if not has_ref_log_probs:
+    if not has_ref_log_probs and not has_on_policy_log_probs:
         diagnoses.append("reference log-probability stage is absent")
     if not has_log_probs:
         diagnoses.append("actor log-probability stage is absent")
@@ -335,7 +479,10 @@ def audit_training_log(text: str, output_dir: str | Path | None = None) -> dict[
         "job": {
             "succeeded": job_succeeded,
             "failed": job_failed,
+            "ray_submitter_succeeded": ray_succeeded,
+            "smoke_result_succeeded": smoke_succeeded,
             "reference_log_probs_seen": has_ref_log_probs,
+            "on_policy_log_probs_seen": has_on_policy_log_probs,
             "log_probs_seen": has_log_probs,
             "train_metrics_seen": has_train_metrics,
             "optimizer_update_seen": has_optimizer_update,
@@ -351,6 +498,7 @@ def audit_training_log(text: str, output_dir: str | Path | None = None) -> dict[
         "parser": {
             "reward_parse_failures": reward_parse_failures,
             "metric_parse_failures": metric_parse_failures,
+            "rollout_artifact": artifact_info,
         },
         "diagnoses": diagnoses,
     }

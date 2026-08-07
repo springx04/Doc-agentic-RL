@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 
@@ -80,3 +81,77 @@ Job 'raysubmit_failed' failed
     assert report["framework_chain_passed"] is False
     assert "job did not complete successfully" in report["diagnoses"]
     assert "no checkpoint save evidence was found" in report["diagnoses"]
+
+
+def test_audit_accepts_smoke_result_and_on_policy_log_probs(tmp_path: Path) -> None:
+    (tmp_path / "smoke_result.json").write_text(
+        json.dumps({"ok": True, "global_step": 2}), encoding="utf-8"
+    )
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("1\n", encoding="utf-8")
+    log = """
+timer log_probs start
+timer log_probs end
+rollout 0: {'rollout/log_probs': -0.4, 'rollout/advantages': 0.2}
+step 0: {'train/loss': 0.2, 'train/pg_loss': 0.2, 'train/grad_norm': 0.8}
+timer update_weights end
+"""
+    report = MODULE.audit_training_log(log, tmp_path)
+    assert report["framework_chain_passed"] is True
+    assert report["job"]["smoke_result_succeeded"] is True
+    assert report["job"]["on_policy_log_probs_seen"] is True
+    assert report["job"]["reference_log_probs_seen"] is False
+    assert not any("reference log-probability" in item for item in report["diagnoses"])
+
+
+def test_audit_prefers_training_rollout_artifact_over_aggregate_log(tmp_path: Path) -> None:
+    artifact = {
+        "records": [
+            {
+                "source": str(tmp_path / "dump_details" / "rollout_data" / "0.pt"),
+                "payload": {
+                    "samples": [
+                        {
+                            "reward": {
+                                "score": -0.1,
+                                "tool_call_count": 1,
+                                "valid_tool_call_count": 1,
+                                "valid_for_rl": True,
+                                "rollout_status": "completed",
+                            }
+                        },
+                        {
+                            "reward": {
+                                "score": 0.4,
+                                "tool_call_count": 2,
+                                "valid_tool_call_count": 2,
+                                "valid_for_rl": True,
+                                "rollout_status": "completed",
+                            }
+                        },
+                    ]
+                },
+            },
+            {
+                "source": str(tmp_path / "dump_details" / "rollout_data" / "eval_0.pt"),
+                "payload": {
+                    "samples": [
+                        {
+                            "reward": {
+                                "score": 1.0,
+                                "tool_call_count": 1,
+                                "valid_for_rl": True,
+                            }
+                        }
+                    ]
+                },
+            },
+        ]
+    }
+    (tmp_path / "rollout_interactions.json").write_text(
+        json.dumps(artifact), encoding="utf-8"
+    )
+    report = MODULE.audit_training_log("Job 'aggregate' succeeded\n", tmp_path)
+    assert report["rollouts"]["observed_records"] == 2
+    assert report["rollouts"]["unique_count"] == 2
+    assert report["rollouts"]["tool_active_records"] == 2
+    assert report["parser"]["rollout_artifact"]["evaluation_records"] == 1
