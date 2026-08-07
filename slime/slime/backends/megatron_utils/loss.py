@@ -10,7 +10,7 @@ from torch.utils.checkpoint import checkpoint
 
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
-from slime.utils.action_training import build_action_training_overrides
+from slime.utils.action_training import apply_action_training_overrides
 
 logger = logging.getLogger(__name__)
 
@@ -585,9 +585,18 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     # loss_masks live on CPU (lazy-loading optimisation).  We need GPU copies
     # for the advantage / KL / normalisation math below.  The original CPU
     # tensors in rollout_data["loss_masks"] are NOT modified.
-    if loss_masks and isinstance(loss_masks[0], torch.Tensor) and not loss_masks[0].is_cuda:
+    original_loss_masks = rollout_data.get("loss_masks")
+    loss_masks_were_cpu = bool(
+        loss_masks and isinstance(loss_masks[0], torch.Tensor) and not loss_masks[0].is_cuda
+    )
+    if loss_masks_were_cpu:
         _gpu = torch.cuda.current_device()
         loss_masks = [m.to(device=_gpu) for m in loss_masks]
+
+    action_reward_consumed_count: list[int] = []
+    action_reward_token_counts: list[int] = []
+    action_reward_abs_sums: list[float] = []
+    action_masks_changed = False
 
     if args.kl_coef == 0 or not log_probs:
         # when kl_coef is 0, we won't compute ref_log_prob
@@ -603,7 +612,61 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             for i in range(len(log_probs))
         ]
 
-    if args.advantage_estimator in ["grpo", "gspo"]:
+    if args.advantage_estimator == "bayes_grpo":
+        # Bayes-ARPO uses the complete trajectory utility and a weighted
+        # sibling baseline.  No standard-deviation division is performed:
+        # small branch groups make that estimate unstable by construction.
+        raw_rewards = rollout_data.get("raw_reward", rewards)
+        group_ids = rollout_data.get("bayes_group_ids") or rollout_data.get("sibling_group_ids")
+        if group_ids is None:
+            group_ids = rollout_data.get("group_indices")
+        sibling_weights = rollout_data.get("bayes_sibling_weights") or [1.0] * len(raw_rewards)
+        grouped: dict[str, list[int]] = {}
+        for index, group_id in enumerate(group_ids):
+            grouped.setdefault(str(group_id), []).append(index)
+        sibling_advantages = [0.0] * len(raw_rewards)
+        baselines = [0.0] * len(raw_rewards)
+        for indices in grouped.values():
+            weights = [max(0.0, float(sibling_weights[index])) for index in indices]
+            denominator = sum(weights) or float(len(indices))
+            baseline = sum(weight * float(raw_rewards[index]) for index, weight in zip(indices, weights, strict=True)) / denominator
+            for index in indices:
+                sibling_advantages[index] = float(raw_rewards[index]) - baseline
+                baselines[index] = baseline
+        rewards = torch.tensor(sibling_advantages, dtype=torch.float32, device=kl[0].device)
+        returns = get_grpo_returns(rewards, kl)
+        advantages = [r for r in returns]
+        rollout_data["bayes_sibling_baselines"] = baselines
+        rollout_data["bayes_sibling_advantages"] = sibling_advantages
+
+        # Preserve the existing action-level rejected-token override for the
+        # Bayes trajectory loss as well; it is independent of the sequence
+        # utility and never lets a positive terminal reward leak backward.
+        action_rewards = rollout_data.get("action_rewards", [])
+        action_token_spans = rollout_data.get("action_token_spans", [])
+        consumed_action_indices = []
+        for i in range(len(advantages)):
+            signal = apply_action_training_overrides(
+                response_length=int(response_lengths[i]),
+                advantages=advantages[i],
+                returns=returns[i],
+                loss_mask=loss_masks[i],
+                assistant_token_masks=action_token_spans[i] if i < len(action_token_spans) else [],
+                action_rewards=action_rewards[i] if i < len(action_rewards) else [],
+            )
+            consumed_action_indices.append(signal["consumed_action_indices"])
+            action_reward_consumed_count.append(len(signal["consumed_action_indices"]))
+            action_reward_token_counts.append(int(signal["applied_action_token_count"]))
+            action_reward_abs_sums.append(float(signal["applied_action_reward_abs_sum"]))
+            if not signal["action_reward_consumed"]:
+                continue
+            advantages[i] = signal["advantages"]
+            returns[i] = signal["returns"]
+            loss_masks[i] = signal["loss_mask"]
+            action_masks_changed = True
+        rollout_data["action_reward_consumed"] = consumed_action_indices
+
+    elif args.advantage_estimator in ["grpo", "gspo"]:
         # Reward normalization is handled in rollout.py for clarity.
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
@@ -619,22 +682,24 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         action_token_spans = rollout_data.get("action_token_spans", [])
         consumed_action_indices = []
         for i in range(len(advantages)):
-            signal = build_action_training_overrides(
-                int(response_lengths[i]),
-                action_token_spans[i] if i < len(action_token_spans) else [],
-                action_rewards[i] if i < len(action_rewards) else [],
+            signal = apply_action_training_overrides(
+                response_length=int(response_lengths[i]),
+                advantages=advantages[i],
+                returns=returns[i],
+                loss_mask=loss_masks[i],
+                assistant_token_masks=action_token_spans[i] if i < len(action_token_spans) else [],
+                action_rewards=action_rewards[i] if i < len(action_rewards) else [],
             )
             consumed_action_indices.append(signal["consumed_action_indices"])
+            action_reward_consumed_count.append(len(signal["consumed_action_indices"]))
+            action_reward_token_counts.append(int(signal["applied_action_token_count"]))
+            action_reward_abs_sums.append(float(signal["applied_action_reward_abs_sum"]))
             if not signal["action_reward_consumed"]:
                 continue
-            advantages[i] = advantages[i].clone()
-            returns[i] = returns[i].clone()
-            loss_masks[i] = loss_masks[i].clone()
-            for position, enabled in enumerate(signal["action_token_mask"]):
-                if enabled and position < advantages[i].numel():
-                    advantages[i][position] = float(signal["action_advantages"][position])
-                    returns[i][position] = float(signal["action_advantages"][position])
-                    loss_masks[i][position] = 1
+            advantages[i] = signal["advantages"]
+            returns[i] = signal["returns"]
+            loss_masks[i] = signal["loss_mask"]
+            action_masks_changed = True
         rollout_data["action_reward_consumed"] = consumed_action_indices
 
     elif args.advantage_estimator == "step_wise":
@@ -760,6 +825,23 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     else:
         raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
 
+    if action_reward_consumed_count:
+        rollout_data["action_reward_consumed_count"] = action_reward_consumed_count
+        rollout_data["action_reward_token_count"] = action_reward_token_counts
+        rollout_data["action_reward_abs_sum"] = action_reward_abs_sums
+
+    # The advantage calculation uses GPU copies of CPU-resident masks.  Before
+    # this write-back, a rejected action could be assigned a negative
+    # advantage here and then silently discarded by get_batch(), which still
+    # read the original all-zero public mask.  Commit the effective mask to the
+    # rollout batch so the policy loss and its reducer see the same tokens that
+    # received the explicit action penalty.
+    if action_masks_changed:
+        if loss_masks_were_cpu:
+            rollout_data["loss_masks"] = [mask.detach().cpu() for mask in loss_masks]
+        elif original_loss_masks is not loss_masks:
+            rollout_data["loss_masks"] = loss_masks
+
     # TODO: OpenRLHF always does advantages normalization but veRL doesn't seem to do it.
     if args.normalize_advantages and args.advantage_estimator != "step_wise":
         all_advs = torch.cat(advantages)
@@ -868,6 +950,122 @@ def icepop_function(
     }
     pg_loss = pg_loss * ice_weight
     return pg_loss, loss_masks, metrics
+
+
+def bayestool_auxiliary_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    logits: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute true switch/pre-invariance action log-prob losses.
+
+    ``batch`` is produced by the dedicated Bayes auxiliary forward in
+    ``model.py``.  Its rows are already tokenized teacher-forced sequences;
+    the only tokens scored here are the action response spans.  The four
+    switch rows remain one bundle, and pre-invariance rows are grouped by
+    candidate index on each side of the pair.
+
+    The import is intentionally lazy so ordinary slime/GRPO runs do not
+    acquire a hard dependency on the local BayesTool package.
+    """
+
+    if not mpu.is_pipeline_last_stage():
+        return logits.sum() * 0.0, {
+            "bayes_aux_loss": logits.sum().detach() * 0.0,
+            "bayes_switch_loss": logits.sum().detach() * 0.0,
+            "bayes_preinv_loss": logits.sum().detach() * 0.0,
+        }
+
+    sequence_meta = batch.get("bayes_aux_sequence_meta") or []
+    if not sequence_meta:
+        zero = logits.sum() * 0.0
+        return zero, {
+            "bayes_aux_loss": zero.detach(),
+            "bayes_switch_loss": zero.detach(),
+            "bayes_preinv_loss": zero.detach(),
+        }
+
+    try:
+        from bayestool.training import pre_invariance_loss, sequence_logprob, switch_loss
+    except ImportError:
+        zero = logits.sum() * 0.0
+        return zero, {
+            "bayes_aux_loss": zero.detach(),
+            "bayes_switch_loss": zero.detach(),
+            "bayes_preinv_loss": zero.detach(),
+        }
+
+    _, log_probs_and_entropy = get_log_probs_and_entropy(
+        logits,
+        args=args,
+        unconcat_tokens=batch["unconcat_tokens"],
+        total_lengths=batch["total_lengths"],
+        response_lengths=batch["response_lengths"],
+        with_entropy=False,
+        max_seq_lens=batch.get("max_seq_lens", None),
+    )
+    log_probs = log_probs_and_entropy["log_probs"]
+
+    grouped: dict[str, dict[str, Any]] = {}
+    for index, (value, meta) in enumerate(zip(log_probs, sequence_meta, strict=False)):
+        if not isinstance(meta, dict) or bool(meta.get("dummy")):
+            continue
+        bundle_id = str(meta.get("bundle_id") or meta.get("switch_bundle_id") or meta.get("preinv_bundle_id") or index)
+        bundle = grouped.setdefault(
+            bundle_id,
+            {
+                "kind": str(meta.get("kind") or ""),
+                "loss_weight": float(meta.get("loss_weight", 1.0) or 1.0),
+                "entries": [],
+            },
+        )
+        bundle["entries"].append((meta, sequence_logprob(value)))
+
+    switch_losses: list[torch.Tensor] = []
+    preinv_losses: list[torch.Tensor] = []
+    for bundle in grouped.values():
+        entries = bundle["entries"]
+        kind = bundle["kind"]
+        if kind == "switch":
+            lookup = {
+                (str(meta.get("world")), bool(meta.get("preferred"))): score
+                for meta, score in entries
+            }
+            required = [("u", True), ("u", False), ("v", True), ("v", False)]
+            if all(key in lookup for key in required):
+                switch_losses.append(
+                    float(bundle["loss_weight"])
+                    * switch_loss(lookup[("u", True)], lookup[("u", False)], lookup[("v", True)], lookup[("v", False)])
+                )
+        elif kind == "pre_invariance":
+            by_world: dict[str, dict[int, torch.Tensor]] = {"u": {}, "v": {}}
+            for meta, score in entries:
+                world = str(meta.get("world") or "")
+                try:
+                    candidate_index = int(meta.get("candidate_index"))
+                except (TypeError, ValueError):
+                    continue
+                if world in by_world:
+                    by_world[world][candidate_index] = score
+            common = sorted(set(by_world["u"]) & set(by_world["v"]))
+            if common:
+                preinv_losses.append(
+                    float(bundle["loss_weight"])
+                    * pre_invariance_loss(
+                        [by_world["u"][index] for index in common],
+                        [by_world["v"][index] for index in common],
+                    )
+                )
+
+    switch_value = torch.stack(switch_losses).mean() if switch_losses else logits.sum() * 0.0
+    preinv_value = torch.stack(preinv_losses).mean() if preinv_losses else logits.sum() * 0.0
+    total = switch_value + preinv_value
+    return total, {
+        "bayes_aux_loss": total.detach(),
+        "bayes_switch_loss": switch_value.detach(),
+        "bayes_preinv_loss": preinv_value.detach(),
+    }
 
 
 def policy_loss_function(

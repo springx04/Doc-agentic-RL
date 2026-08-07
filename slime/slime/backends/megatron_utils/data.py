@@ -530,6 +530,10 @@ def log_rollout_data(
                 "step_wise_step_rewards",
                 "step_wise_step_token_spans",
                 "step_wise_step_indices",
+                "action_rewards",
+                "action_token_spans",
+                "rejected_action_indices",
+                "action_reward_consumed",
                 "teacher_topk_log_probs",
                 "teacher_topk_indices",
                 "prm_teacher_topk_log_probs",
@@ -586,7 +590,19 @@ def log_rollout_data(
                         flat_val = [item for sub in val for item in sub if isinstance(item, (int, float, np.number))]
                         val = (sum(flat_val) / len(flat_val)) if flat_val else 0.0
                     else:
-                        val = sum(val) / len(val)
+                        # Rollout metadata can contain strings (for example statuses or
+                        # textual predictions) alongside numeric fields.  Such metadata is
+                        # not an averageable scalar metric; keep numeric metrics intact and
+                        # omit non-numeric lists from scalar logging.
+                        numeric_values = [
+                            item
+                            for item in val
+                            if isinstance(item, (int, float, np.number))
+                            and not isinstance(item, (bool, np.bool_))
+                        ]
+                        if not numeric_values:
+                            continue
+                        val = sum(numeric_values) / len(numeric_values)
             elif isinstance(val, torch.Tensor):
                 val = val.float().mean()
             else:
