@@ -13,6 +13,11 @@ from slime.backends.sglang_utils.arguments import validate_args as sglang_valida
 from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 from slime.utils.logging_utils import configure_logger
 
+try:
+    from bayestool.config import validate_stage_capabilities
+except ImportError:  # pragma: no cover - BayesTool is optional for baseline runs
+    validate_stage_capabilities = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -908,6 +913,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 choices=[
                     "grpo",
+                    "bayes_grpo",
                     "gspo",
                     "step_wise",
                     "reinforce_plus_plus",
@@ -978,6 +984,54 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 dest="grpo_std_normalization",
                 help="from Dr.GRPO https://arxiv.org/pdf/2503.20783",
             )
+            parser.add_argument(
+                "--bayestool-enable",
+                action="store_true",
+                default=False,
+                help="Enable the BayesTool world, belief, and Bayes-ARPO rollout path.",
+            )
+            parser.add_argument("--bayestool-worlds-per-prompt", type=int, default=4)
+            parser.add_argument("--bayestool-replicas-per-world", type=int, default=2)
+            parser.add_argument("--bayestool-posterior-particles", type=int, default=8)
+            parser.add_argument("--bayestool-max-action-candidates", type=int, default=4)
+            parser.add_argument("--bayestool-max-siblings", type=int, default=4)
+            parser.add_argument("--bayestool-branch-horizon", type=int, default=3)
+            parser.add_argument("--bayestool-branch-probability", type=float, default=None)
+            parser.add_argument("--bayestool-consensus-threshold", type=float, default=0.75)
+            parser.add_argument("--bayestool-decision-regret-threshold", type=float, default=0.08)
+            parser.add_argument("--bayestool-max-observation-hypotheses", type=int, default=6)
+            parser.add_argument("--bayestool-dvoi-minimum", type=float, default=0.0)
+            parser.add_argument("--bayestool-cvar-alpha", type=float, default=0.20)
+            parser.add_argument("--bayestool-local-surprise-threshold", type=float, default=4.0)
+            parser.add_argument("--bayestool-family-surprise-threshold", type=float, default=6.0)
+            parser.add_argument("--bayestool-global-surprise-threshold", type=float, default=8.0)
+            parser.add_argument("--bayestool-change-probability-threshold", type=float, default=0.80)
+            parser.add_argument("--bayestool-max-belief-prompt-tokens", type=int, default=1200)
+            parser.add_argument("--bayestool-world-type-probabilities", type=str, default=None)
+            parser.add_argument("--bayestool-session-state-probabilities", type=str, default=None)
+            parser.add_argument("--bayestool-stage", choices=["a", "b", "c", "d"], default="c")
+            parser.add_argument("--bayestool-without-dvoi", action="store_true", default=False)
+            parser.add_argument("--bayestool-without-regret-branching", action="store_true", default=False)
+            parser.add_argument("--bayestool-without-reopen", action="store_true", default=False)
+            parser.add_argument("--bayestool-without-meta-episode", action="store_true", default=False)
+            parser.add_argument("--bayestool-without-persistent-session-belief", action="store_true", default=False)
+            parser.add_argument("--bayestool-without-switch-loss", action="store_true", default=False)
+            parser.add_argument("--bayestool-without-pre-invariance", action="store_true", default=False)
+            parser.add_argument("--bayestool-tool-budget", type=int, default=None)
+            parser.add_argument("--bayestool-meta-discount", type=float, default=0.95)
+            parser.add_argument("--bayestool-aux-interval", type=int, default=2)
+            parser.add_argument("--bayestool-max-switch-bundles-per-rank", type=int, default=8)
+            parser.add_argument("--bayestool-max-preinv-bundles-per-rank", type=int, default=8)
+            parser.add_argument("--bayestool-switch-loss-weight", type=float, default=0.20)
+            parser.add_argument("--bayestool-preinv-loss-weight", type=float, default=0.05)
+            parser.add_argument("--bayestool-aux-micro-batch-size", type=int, default=4)
+            parser.add_argument("--bayestool-belief-checkpoint", type=str, default=None)
+            parser.add_argument("--bayestool-q-checkpoint", type=str, default=None)
+            parser.add_argument("--bayestool-risk-checkpoint", type=str, default=None)
+            parser.add_argument("--bayestool-meta-manifest", type=str, default=None)
+            parser.add_argument("--bayestool-allow-heuristic-belief", action="store_true", default=False)
+            parser.add_argument("--bayestool-allow-heuristic-q", action="store_true", default=False)
+            parser.add_argument("--bayestool-allow-heuristic-risk", action="store_true", default=False)
             parser.add_argument(
                 "--disable-rewards-normalization",
                 action="store_false",
@@ -1843,6 +1897,35 @@ def slime_validate_args(args):
             "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
             "require advantage normalization. Please add `--normalize-advantages` to your command."
         )
+
+    if getattr(args, "bayestool_enable", False):
+        assert args.advantage_estimator == "bayes_grpo", (
+            "--bayestool-enable requires --advantage-estimator bayes_grpo so the full-trajectory "
+            "utility and sibling-relative baseline are used."
+        )
+        assert args.bayestool_worlds_per_prompt >= 1
+        assert args.bayestool_replicas_per_world >= 1
+        assert args.bayestool_posterior_particles >= 1
+        assert args.bayestool_max_observation_hypotheses >= 1
+        assert 0.0 < args.bayestool_cvar_alpha <= 1.0
+        assert args.bayestool_aux_micro_batch_size % 4 == 0, "Bayes auxiliary microbatch size must be a multiple of four"
+        expected_samples = args.bayestool_worlds_per_prompt * args.bayestool_replicas_per_world
+        actual_samples = int(getattr(args, "n_samples_per_prompt", expected_samples))
+        assert actual_samples == expected_samples, (
+            "BayesTool requires n_samples_per_prompt == worlds_per_prompt * replicas_per_world "
+            f"({expected_samples}), got {actual_samples}"
+        )
+        if validate_stage_capabilities is not None:
+            args.bayestool_capability_manifest = validate_stage_capabilities(
+                args.bayestool_stage,
+                belief_checkpoint=getattr(args, "bayestool_belief_checkpoint", None),
+                q_checkpoint=getattr(args, "bayestool_q_checkpoint", None),
+                risk_checkpoint=getattr(args, "bayestool_risk_checkpoint", None),
+                meta_manifest=getattr(args, "bayestool_meta_manifest", None),
+                allow_heuristic_belief=bool(getattr(args, "bayestool_allow_heuristic_belief", False)),
+                allow_heuristic_q=bool(getattr(args, "bayestool_allow_heuristic_q", False)),
+                allow_heuristic_risk=bool(getattr(args, "bayestool_allow_heuristic_risk", False)),
+            )
 
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."

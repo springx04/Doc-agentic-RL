@@ -12,7 +12,7 @@ from transformers import AutoConfig
 
 from slime.ray.train_actor import TrainRayActor
 from slime.utils import logging_utils, train_dump_utils, train_metric_utils
-from slime.utils.action_training import build_action_training_overrides
+from slime.utils.action_training import apply_action_training_overrides, build_action_training_overrides
 from slime.utils.data import get_minimum_num_micro_batch_size, process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.logging_utils import init_tracking
@@ -529,7 +529,81 @@ class FSDPTrainRayActor(TrainRayActor):
             )
 
     def _train_core(self, rollout_id: int, rollout_data) -> None:
-        if self.args.advantage_estimator in ["grpo", "gspo"]:
+        if self.args.advantage_estimator == "bayes_grpo":
+            # Bayes-ARPO uses the raw complete-trajectory utility and a
+            # weighted sibling baseline.  The FSDP path does not call the
+            # Megatron advantage helper, so compute the same estimator here
+            # before packing the response-space tensors.
+            raw_rewards = list(rollout_data.get("raw_reward", rollout_data["rewards"]))
+            local_count = len(rollout_data["response_lengths"])
+            partition = rollout_data.get("_partition")
+            if len(raw_rewards) != local_count:
+                if partition is not None and len(partition) == local_count:
+                    raw_rewards = [raw_rewards[int(index)] for index in partition]
+                else:
+                    raw_rewards = list(rollout_data["rewards"])
+            # _packed_data expects raw_reward to be aligned with the local
+            # partition, while the rollout splitter intentionally preserves
+            # the global raw-reward list for other backends.
+            rollout_data["raw_reward"] = raw_rewards
+            group_ids = (
+                rollout_data.get("bayes_group_ids")
+                or rollout_data.get("sibling_group_ids")
+                or rollout_data.get("group_indices")
+            )
+            if group_ids is None or len(group_ids) != len(raw_rewards):
+                group_ids = list(range(len(raw_rewards)))
+            sibling_weights = rollout_data.get("bayes_sibling_weights") or [1.0] * len(raw_rewards)
+            if len(sibling_weights) != len(raw_rewards):
+                sibling_weights = [1.0] * len(raw_rewards)
+
+            grouped: dict[str, list[int]] = {}
+            for index, group_id in enumerate(group_ids):
+                grouped.setdefault(str(group_id), []).append(index)
+
+            baselines = [0.0] * len(raw_rewards)
+            sibling_advantages = [0.0] * len(raw_rewards)
+            for indices in grouped.values():
+                weights = [max(0.0, float(sibling_weights[index])) for index in indices]
+                denominator = sum(weights) or float(len(indices))
+                baseline = sum(
+                    weight * float(raw_rewards[index])
+                    for index, weight in zip(indices, weights, strict=True)
+                ) / denominator
+                for index in indices:
+                    baselines[index] = baseline
+                    sibling_advantages[index] = float(raw_rewards[index]) - baseline
+
+            advantages = []
+            effective_loss_masks = []
+            consumed_action_indices = []
+            action_rewards = rollout_data.get("action_rewards", [])
+            action_token_spans = rollout_data.get("action_token_spans", [])
+            for i, sequence_advantage_value in enumerate(sibling_advantages):
+                response_length = int(rollout_data["response_lengths"][i])
+                sequence_advantage = torch.tensor(
+                    [sequence_advantage_value] * response_length,
+                    dtype=torch.float32,
+                )
+                loss_mask = list(rollout_data["loss_masks"][i])
+                signal = apply_action_training_overrides(
+                    response_length=response_length,
+                    advantages=sequence_advantage,
+                    returns=sequence_advantage,
+                    loss_mask=loss_mask,
+                    assistant_token_masks=action_token_spans[i] if i < len(action_token_spans) else [],
+                    action_rewards=action_rewards[i] if i < len(action_rewards) else [],
+                )
+                advantages.append(signal["advantages"])
+                effective_loss_masks.append(signal["loss_mask"])
+                consumed_action_indices.append(signal["consumed_action_indices"])
+
+            rollout_data["loss_masks"] = effective_loss_masks
+            rollout_data["advantages"] = rollout_data["returns"] = advantages
+            rollout_data["action_reward_consumed"] = consumed_action_indices
+            rollout_data["bayes_sibling_baselines"] = baselines
+            rollout_data["bayes_sibling_advantages"] = sibling_advantages
+        elif self.args.advantage_estimator in ["grpo", "gspo"]:
             advantages = []
             effective_loss_masks = []
             consumed_action_indices = []

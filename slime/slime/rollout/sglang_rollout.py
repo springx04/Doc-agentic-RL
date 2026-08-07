@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import inspect
+import json
 import logging
 from argparse import Namespace
 from collections.abc import Callable
@@ -247,6 +248,7 @@ async def generate_and_rm(
         rewards = await batched_async_rm(args, samples_need_reward)
         for sample, reward in zip(samples_need_reward, rewards, strict=False):
             sample.reward = reward
+        _apply_bayestool_meta_suffix_returns(args, samples)
         return samples
     else:
         if sample.status == Sample.Status.ABORTED:
@@ -256,6 +258,321 @@ async def generate_and_rm(
             sample.reward = await async_rm(args, sample)
 
     return sample
+
+
+def _apply_bayestool_meta_suffix_returns(args: Namespace, samples: list[Sample]) -> None:
+    """Replace each meta-question reward with its discounted suffix return."""
+
+    if not samples or not any(
+        isinstance(sample.metadata, dict) and sample.metadata.get("meta_episode_id")
+        for sample in samples
+    ):
+        return
+    try:
+        from bayestool.training import suffix_meta_returns
+    except ImportError:
+        return
+
+    grouped: dict[str, list[Sample]] = {}
+    for sample in samples:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        episode_id = metadata.get("meta_episode_id")
+        if episode_id:
+            grouped.setdefault(str(episode_id), []).append(sample)
+    discount = float(getattr(args, "bayestool_meta_discount", 0.95) or 0.95)
+    for episode_samples in grouped.values():
+        # A real shared-prefix branch can expand one meta question into a
+        # primary sample plus several branch children.  Collapse those rows
+        # to one utility per question before applying the cross-question
+        # suffix return; every branch of that question must receive the same
+        # suffix target.
+        by_question: dict[int, list[Sample]] = {}
+        for sample in episode_samples:
+            metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+            try:
+                question_index = int(metadata.get("meta_question_index", 0) or 0)
+            except (TypeError, ValueError):
+                question_index = 0
+            by_question.setdefault(question_index, []).append(sample)
+
+        question_rows: list[tuple[int, Sample]] = []
+        for question_index, question_samples in by_question.items():
+            primary = next(
+                (
+                    item
+                    for item in question_samples
+                    if not bool((item.metadata or {}).get("bayestool_branch_child"))
+                ),
+                question_samples[0],
+            )
+            question_rows.append((question_index, primary))
+        question_rows.sort(key=lambda item: item[0])
+
+        utilities: list[float] = []
+        for _, sample in question_rows:
+            metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+            bayes_utility = metadata.get("bayestool_utility", {})
+            if isinstance(bayes_utility, dict) and bayes_utility.get("utility") is not None:
+                utilities.append(float(bayes_utility["utility"]))
+            else:
+                try:
+                    utilities.append(float(sample.get_reward_value(args)))
+                except (TypeError, KeyError, ValueError):
+                    utilities.append(0.0)
+        suffixes = suffix_meta_returns(utilities, discount=discount)
+        for (question_index, _), utility, suffix in zip(question_rows, utilities, suffixes, strict=True):
+            for sample in by_question[question_index]:
+                metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+                metadata["meta_utility"] = float(utility)
+                metadata["meta_suffix_return"] = float(suffix)
+                if getattr(args, "advantage_estimator", "") != "bayes_grpo":
+                    continue
+                if isinstance(sample.reward, dict):
+                    reward = dict(sample.reward)
+                    reward_key = args.reward_key or "score"
+                    reward[reward_key] = float(suffix)
+                    reward["meta_utility"] = float(utility)
+                    sample.reward = reward
+                else:
+                    sample.reward = float(suffix)
+
+
+def _bayestool_aux_state(sample: Sample) -> dict[str, Any] | None:
+    """Expose the policy-side state needed to build a sibling pair.
+
+    The state is derived from the decision snapshot captured before a tool
+    result.  Hidden world labels and clean outputs are never copied into the
+    tokenized prompt; they remain in the ordinary supervision metadata.
+    """
+
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    nested = metadata.get("bayestool") if isinstance(metadata.get("bayestool"), dict) else {}
+    if not nested.get("enabled"):
+        return None
+    state = metadata.get("bayes_aux_state")
+    if not isinstance(state, dict):
+        state = {}
+    state = copy.deepcopy(state)
+    state.setdefault("coupling_id", metadata.get("coupling_id") or nested.get("coupling_id"))
+    state.setdefault("content_signature", metadata.get("bayes_content_signature") or nested.get("content_signature"))
+    state.setdefault("ood_score", nested.get("ood_score", 1.0))
+    state.setdefault("belief_snapshot", nested.get("belief_snapshot", {}))
+    state.setdefault("world_id", metadata.get("world_id") or nested.get("world_id"))
+    state.setdefault("latent_world_id", metadata.get("latent_world_id") or nested.get("latent_world_id"))
+    state.setdefault("replica_id", metadata.get("replica_id", nested.get("replica_id", 0)))
+    state.setdefault("prompt", metadata.get("bayes_aux_prompt") or str(sample.prompt))
+    state.setdefault("sibling_group_id", metadata.get("sibling_group_id") or nested.get("sibling_group_id"))
+    if not state.get("best_action"):
+        history = nested.get("decision_history", [])
+        if isinstance(history, list):
+            for item in reversed(history):
+                if isinstance(item, dict) and item.get("bayes_action"):
+                    state["best_action"] = item["bayes_action"]
+                    state["best_action_text"] = item.get("best_action_text", "")
+                    state["best_action_margin"] = item.get("best_action_margin", 0.0)
+                    state["candidate_actions"] = item.get("candidate_action_keys", [])
+                    state["candidate_action_texts"] = {
+                        str(candidate.get("key")): str(candidate.get("text") or "")
+                        for candidate in item.get("candidate_actions", [])
+                        if isinstance(candidate, dict) and candidate.get("key")
+                    }
+                    state["observed_prefix_js"] = item.get("observed_prefix_js", 1.0)
+                    state["first_distinguishing_event_step"] = item.get("observed_prefix_event_count")
+                    break
+    return state
+
+
+def _bayestool_aux_states(sample: Sample) -> list[dict[str, Any]]:
+    """Return one auxiliary state per policy decision prefix.
+
+    Pairing only the final decision loses the common prefix before two
+    coupled worlds first diverge.  The rollout records each decision's public
+    state; reconstructing these records here lets switch/pre-invariance
+    bundles use the exact matching prefix instead of a post-divergence suffix.
+    """
+
+    base = _bayestool_aux_state(sample)
+    if base is None:
+        return []
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    nested = metadata.get("bayestool") if isinstance(metadata.get("bayestool"), dict) else {}
+    history = metadata.get("bayes_decisions") or nested.get("decision_history") or []
+    if not isinstance(history, list):
+        return [base]
+    states: list[dict[str, Any]] = []
+    for decision in history:
+        if not isinstance(decision, dict):
+            continue
+        state = copy.deepcopy(base)
+        state.update(
+            {
+                "best_action": decision.get("bayes_action") or state.get("best_action"),
+                "best_action_text": decision.get("best_action_text", state.get("best_action_text", "")),
+                "best_action_margin": decision.get("best_action_margin", state.get("best_action_margin", 0.0)),
+                "candidate_actions": decision.get("candidate_action_keys", state.get("candidate_actions", [])),
+                "candidate_action_texts": {
+                    str(item.get("key")): str(item.get("text") or "")
+                    for item in decision.get("candidate_actions", [])
+                    if isinstance(item, dict) and item.get("key")
+                },
+                "belief_snapshot": decision.get("belief_snapshot", state.get("belief_snapshot", {})),
+                "observed_prefix_js": decision.get("observed_prefix_js", state.get("observed_prefix_js", 1.0)),
+                "first_distinguishing_event_step": decision.get(
+                    "observed_prefix_event_count", state.get("first_distinguishing_event_step")
+                ),
+                "prefix_observation_signature": decision.get(
+                    "prefix_observation_signature", state.get("prefix_observation_signature", "")
+                ),
+                "content_signature": decision.get("content_signature", state.get("content_signature", "")),
+                "prompt": decision.get("prompt", state.get("prompt", str(sample.prompt))),
+            }
+        )
+        states.append(state)
+    return states or [base]
+
+
+def _attach_bayestool_auxiliary_records(args: Namespace, samples: list[Sample], tokenizer: Any) -> None:
+    """Construct real tokenized switch/pre-invariance bundles from one rollout group."""
+
+    if getattr(args, "advantage_estimator", "") != "bayes_grpo":
+        return
+    try:
+        from bayestool.config import config_from_args
+        from bayestool.training import (
+            build_preinv_bundle,
+            build_switch_bundle,
+            build_switch_pair,
+        )
+    except ImportError:
+        return
+    config = config_from_args(args, enabled=True)
+    states: list[tuple[Sample, dict[str, Any]]] = []
+    for sample in samples:
+        sample_states = _bayestool_aux_states(sample)
+        if sample_states:
+            if not isinstance(sample.metadata, dict):
+                sample.metadata = {}
+            sample.metadata.setdefault("bayes_aux_records", [])
+            states.extend((sample, state) for state in sample_states)
+    if len(states) < 2:
+        return
+
+    seen_by_sample: dict[int, set[str]] = {id(sample): set() for sample, _ in states}
+    for left_index, (left_sample, left_state) in enumerate(states):
+        for right_sample, right_state in states[left_index + 1 :]:
+            # Replicas of the same world are useful for the sibling baseline,
+            # but they are not a support-valid belief-switch pair.
+            if left_sample is right_sample or (
+                left_state.get("latent_world_id")
+                and left_state.get("latent_world_id") == right_state.get("latent_world_id")
+            ):
+                continue
+            switch_pair = build_switch_pair(left_state, right_state, config=config)
+            if switch_pair is not None:
+                switch_bundle = build_switch_bundle(
+                    switch_pair,
+                    prompt_u=str(left_state.get("prompt") or left_sample.prompt),
+                    prompt_v=str(right_state.get("prompt") or right_sample.prompt),
+                    tokenizer=tokenizer,
+                )
+                switch_bundle["loss_weight"] = float(config.auxiliary.switch_loss_weight)
+                bundle_id = str(switch_bundle.get("switch_bundle_id"))
+                switch_bundle["content_signature"] = switch_pair.content_signature
+                switch_bundle["world_ids"] = [left_state.get("world_id"), right_state.get("world_id")]
+                switch_bundle["latent_world_ids"] = [left_state.get("latent_world_id"), right_state.get("latent_world_id")]
+                for sample in (left_sample, right_sample):
+                    if bundle_id not in seen_by_sample[id(sample)]:
+                        sample.metadata["bayes_aux_records"].append(copy.deepcopy(switch_bundle))
+                        seen_by_sample[id(sample)].add(bundle_id)
+
+            left_candidates = list(left_state.get("candidate_actions", []))
+            right_candidates = list(right_state.get("candidate_actions", []))
+            if left_candidates and left_candidates == right_candidates:
+                left_texts = left_state.get("candidate_action_texts", {})
+                right_texts = right_state.get("candidate_action_texts", {})
+                actions = [
+                    str(left_texts.get(str(key)) or right_texts.get(str(key)) or key)
+                    for key in left_candidates
+                ]
+                preinv_bundle = build_preinv_bundle(
+                    left_state,
+                    right_state,
+                    prompts=[str(left_state.get("prompt") or left_sample.prompt), str(right_state.get("prompt") or right_sample.prompt)],
+                    actions=actions,
+                    config=config,
+                    tokenizer=tokenizer,
+                )
+                if preinv_bundle is not None:
+                    bundle_id = str(preinv_bundle.get("preinv_bundle_id"))
+                    preinv_bundle["world_ids"] = [left_state.get("world_id"), right_state.get("world_id")]
+                    preinv_bundle["latent_world_ids"] = [left_state.get("latent_world_id"), right_state.get("latent_world_id")]
+                    for sample in (left_sample, right_sample):
+                        if bundle_id not in seen_by_sample[id(sample)]:
+                            sample.metadata["bayes_aux_records"].append(copy.deepcopy(preinv_bundle))
+                            seen_by_sample[id(sample)].add(bundle_id)
+
+
+def _attach_bayestool_branch_records(args: Namespace, samples: list[Sample]) -> None:
+    """Materialize finite branch utilities for Q-head replay and regret metrics."""
+
+    if getattr(args, "advantage_estimator", "") != "bayes_grpo":
+        return
+    records_by_world: dict[tuple[str, str, str], list[tuple[Sample, dict[str, Any]]]] = {}
+    for sample in samples:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        nested = metadata.get("bayestool") if isinstance(metadata.get("bayestool"), dict) else {}
+        prefix_hash = metadata.get("bayestool_branch_prefix_hash") or nested.get("branch_prefix_hash")
+        if not prefix_hash:
+            continue
+        world_id = str(metadata.get("world_id") or nested.get("world_id") or "")
+        latent_world_id = str(metadata.get("latent_world_id") or nested.get("latent_world_id") or "")
+        coupling_id = str(metadata.get("coupling_id") or nested.get("coupling_id") or "")
+        action_key = metadata.get("bayestool_branch_action_key") or nested.get("branch_action_key")
+        if not world_id or not coupling_id or not action_key:
+            continue
+        utility_meta = metadata.get("bayestool_utility", {})
+        utility = utility_meta.get("utility") if isinstance(utility_meta, dict) else None
+        if utility is None:
+            continue
+        record = {
+            "coupling_id": coupling_id,
+            "sibling_group_id": str(
+                metadata.get("bayestool_branch_sibling_group_id")
+                or metadata.get("sibling_group_id")
+                or nested.get("sibling_group_id")
+                or ""
+            ),
+            "prefix_hash": str(prefix_hash),
+            "world_id": world_id,
+            "latent_world_id": latent_world_id,
+            "belief_version": int(
+                (nested.get("belief_snapshot") or {}).get("version", 0)
+                if isinstance(nested.get("belief_snapshot"), dict)
+                else 0
+            ),
+            "action_key": str(action_key),
+            "utility": float(utility),
+            "horizon": int(nested.get("branch_horizon", 0) or metadata.get("bayestool_branch_horizon", 0) or 0),
+            "is_policy_parent": not bool(metadata.get("bayestool_branch_child")),
+        }
+        q_features = metadata.get("bayestool_branch_q_features") or nested.get("branch_q_features")
+        if isinstance(q_features, dict):
+            for key in ("task_features", "particle_features", "action_features", "budget_features"):
+                if isinstance(q_features.get(key), (list, tuple)):
+                    record[key] = [float(value) for value in q_features[key]]
+        records_by_world.setdefault((str(prefix_hash), world_id, latent_world_id), []).append((sample, record))
+
+    for world_records in records_by_world.values():
+        oracle = max(world_records, key=lambda item: (item[1]["utility"], item[1]["action_key"]))[1]
+        policy_records = [record for _, record in world_records if record.get("is_policy_parent")]
+        policy = policy_records[0] if policy_records else world_records[0][1]
+        for sample, record in world_records:
+            record["oracle_action"] = oracle["action_key"]
+            record["oracle_utility"] = float(oracle["utility"])
+            record["policy_utility"] = float(policy["utility"])
+            record["relative_regret"] = float(oracle["utility"] - policy["utility"])
+            record.pop("is_policy_parent", None)
+            sample.metadata.setdefault("bayes_branch_records", []).append(record)
 
 
 async def generate_and_rm_group(
@@ -276,13 +593,27 @@ async def generate_and_rm_group(
             asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
         )
 
-    group = await asyncio.gather(*tasks)
+    results = await asyncio.gather(*tasks)
+    # A custom generator may expand one input into a meta-episode or a real
+    # shared-prefix branch group.  Keep the rollout group flat so reward
+    # calculation and the trainer see Sample objects, never nested lists.
+    group: list[Sample] = []
+    for result in results:
+        if isinstance(result, list):
+            group.extend(result)
+        else:
+            group.append(result)
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
         rewards = await batched_async_rm(args, group)
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
+
+    if not state.aborted and getattr(args, "advantage_estimator", "") == "bayes_grpo":
+        _attach_bayestool_branch_records(args, group)
+        _attach_bayestool_auxiliary_records(args, group, state.tokenizer)
+        _apply_bayestool_meta_suffix_returns(args, group)
 
     return group
 
@@ -364,6 +695,14 @@ async def generate_rollout_async(
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
+            for group in samples:
+                for sample in group:
+                    if not isinstance(sample.metadata, dict):
+                        sample.metadata = {}
+                    # The rollout id is allocated by the coordinator and is
+                    # stable across retries/resume; it must not depend on
+                    # local sample ordering or Ray worker rank.
+                    sample.metadata["rollout_id"] = int(rollout_id)
             state.submit_generate_tasks(samples)
 
         # wait for the generation to finish
@@ -378,7 +717,10 @@ async def generate_rollout_async(
                 )
                 do_print = False
 
-            assert len(group) == args.n_samples_per_prompt
+            if not group:
+                state.remaining_batch_size -= 1
+                logger.warning("A rollout group expanded to zero samples; dropping it.")
+                continue
             all_data.append(group)
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
@@ -390,7 +732,7 @@ async def generate_rollout_async(
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size:
                 data.append(group)
-                pbar.update(args.n_samples_per_prompt)
+                pbar.update(len(group))
 
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
@@ -402,9 +744,9 @@ async def generate_rollout_async(
     aborted_samples = await abort(args, rollout_id)
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
-    data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
+    data = sorted(data, key=lambda group: group[0].index)
     all_samples = sorted(
-        all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index
+        all_data, key=lambda group: group[0].index
     )
 
     # reset the global state to prevent effects on the next rollout or eval.
@@ -492,6 +834,9 @@ async def eval_rollout_single_dataset(
             sample.index = sample_index
             sample_index += 1
             sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
+            if not isinstance(sample.metadata, dict):
+                sample.metadata = {}
+            sample.metadata["rollout_id"] = int(rollout_id)
             sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
             sampling_params = base_sampling_params
             if getattr(args, "sglang_enable_deterministic_inference", False):

@@ -6,7 +6,7 @@ import random
 import time
 from copy import copy
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import ray
@@ -49,6 +49,204 @@ def _sample_excluded_from_rl(sample: Sample) -> bool:
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
     status = str(metadata.get("rollout_status", ""))
     return bool(metadata.get("exclude_from_group_statistics")) or metadata.get("valid_for_rl") is False or status in _RL_EXCLUDED_STATUSES
+
+
+def _bayestool_apply_meta_suffix_returns(
+    samples: list[Sample],
+    trajectory_rewards: list[float],
+    args: Any,
+) -> list[float]:
+    """Replace per-question utility with the explicit meta-episode suffix return.
+
+    A generated meta episode has one primary trajectory per question and may
+    additionally contain shared-prefix branch siblings for that question.
+    The primary trajectory supplies the future-question suffix; each sibling
+    keeps its own current-question utility.  This is the finite-sample form of
+    ``G_i = U_i + gamma * sum_{j>i} gamma^(j-i-1) U_j`` and does not mix
+    questions from different documents or episodes.
+    """
+
+    adjusted = [float(value) for value in trajectory_rewards]
+    grouped: dict[str, dict[int, list[int]]] = {}
+    for index, sample in enumerate(samples):
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        episode_id = metadata.get("meta_episode_id")
+        question_index = metadata.get("meta_question_index")
+        if episode_id is None or question_index is None:
+            continue
+        try:
+            question = int(question_index)
+        except (TypeError, ValueError):
+            continue
+        grouped.setdefault(str(episode_id), {}).setdefault(question, []).append(index)
+
+    try:
+        discount = float(getattr(args, "bayestool_meta_discount", 0.95) or 0.95)
+    except (TypeError, ValueError):
+        discount = 0.95
+    discount = max(0.0, min(1.0, discount))
+
+    for episode_id, questions in grouped.items():
+        primary_utility: dict[int, float] = {}
+
+        def trajectory_utility(index: int) -> float:
+            metadata = samples[index].metadata if isinstance(samples[index].metadata, dict) else {}
+            utility = metadata.get("bayestool_utility")
+            if isinstance(utility, Mapping) and utility.get("utility") is not None:
+                try:
+                    return float(utility["utility"])
+                except (TypeError, ValueError):
+                    pass
+            return float(trajectory_rewards[index])
+
+        for question, indices in questions.items():
+            valid_indices = [index for index in indices if not _sample_excluded_from_rl(samples[index])]
+            if not valid_indices:
+                continue
+            primary = next(
+                (
+                    index
+                    for index in valid_indices
+                    if not bool((samples[index].metadata or {}).get("bayestool_branch_child"))
+                ),
+                valid_indices[0],
+            )
+            primary_utility[question] = trajectory_utility(primary)
+        running_suffix = 0.0
+        future_suffix: dict[int, float] = {}
+        for question in sorted(primary_utility, reverse=True):
+            future_suffix[question] = running_suffix
+            running_suffix = primary_utility[question] + discount * running_suffix
+        for question, indices in questions.items():
+            if question not in future_suffix:
+                continue
+            suffix = discount * future_suffix[question]
+            for index in indices:
+                if _sample_excluded_from_rl(samples[index]):
+                    continue
+                adjusted[index] = trajectory_utility(index) + suffix
+                metadata = samples[index].metadata if isinstance(samples[index].metadata, dict) else {}
+                metadata["bayestool_meta_utility"] = trajectory_utility(index)
+                metadata["bayestool_meta_suffix_return"] = float(adjusted[index])
+                metadata["meta_utility"] = trajectory_utility(index)
+                metadata["meta_suffix_return"] = float(adjusted[index])
+                metadata["bayestool_meta_discount"] = discount
+                metadata["meta_episode_id"] = episode_id
+                samples[index].metadata = metadata
+    return adjusted
+
+
+def _bayestool_feature_rows(value: Any) -> list[dict[str, Any]]:
+    """Expand one branch feature payload into one row per posterior particle."""
+
+    if not isinstance(value, Mapping):
+        return []
+    particle_rows = value.get("particle_records")
+    base = {
+        key: value.get(key)
+        for key in ("task_features", "particle_features", "action_features", "budget_features")
+    }
+    if isinstance(particle_rows, (list, tuple)) and particle_rows:
+        rows: list[dict[str, Any]] = []
+        for particle in particle_rows:
+            if not isinstance(particle, Mapping):
+                continue
+            row = dict(base)
+            row.update({key: particle.get(key, row.get(key)) for key in row})
+            if particle.get("particle_id") is not None:
+                row["particle_id"] = particle.get("particle_id")
+            rows.append(row)
+        return rows
+    return [base]
+
+
+def _bayestool_attach_branch_records(
+    samples: list[Sample],
+    trajectory_rewards: list[float],
+) -> None:
+    """Materialize completed sibling utilities as BayesQ replay records."""
+
+    records_by_sample: dict[int, list[dict[str, Any]]] = {}
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for index, sample in enumerate(samples):
+        if _sample_excluded_from_rl(sample):
+            continue
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        nested = metadata.get("bayestool") if isinstance(metadata.get("bayestool"), Mapping) else {}
+        feature_payload = metadata.get("bayestool_branch_q_features")
+        if not isinstance(feature_payload, Mapping):
+            feature_payload = nested.get("branch_q_features")
+        rows = _bayestool_feature_rows(feature_payload)
+        prefix_hash = metadata.get("bayestool_branch_prefix_hash") or nested.get("branch_prefix_hash")
+        sibling_group_id = (
+            metadata.get("bayestool_branch_sibling_group_id")
+            or metadata.get("sibling_group_id")
+            or nested.get("sibling_group_id")
+        )
+        if not rows or not prefix_hash or not sibling_group_id:
+            continue
+        action_key = metadata.get("bayestool_branch_action_key") or nested.get("branch_action_key")
+        base_record = {
+            "coupling_id": str(metadata.get("coupling_id") or nested.get("coupling_id") or ""),
+            "sibling_group_id": str(sibling_group_id),
+            "prefix_hash": str(prefix_hash),
+            "world_id": str(metadata.get("world_id") or nested.get("world_id") or ""),
+            "belief_version": int(
+                (metadata.get("belief_snapshot") or nested.get("belief_snapshot") or {}).get("version", 0)
+                if isinstance(metadata.get("belief_snapshot", nested.get("belief_snapshot", {})), Mapping)
+                else 0
+            ),
+            "action_key": str(action_key or ""),
+            "utility": float(
+                (metadata.get("bayestool_utility") or {}).get("utility", trajectory_rewards[index])
+                if isinstance(metadata.get("bayestool_utility"), Mapping)
+                else trajectory_rewards[index]
+            ),
+            "horizon": int(metadata.get("bayestool_branch_horizon") or nested.get("branch_horizon") or 0),
+            "is_policy_action": not bool(metadata.get("bayestool_branch_child")),
+        }
+        sample_records: list[dict[str, Any]] = []
+        for row in rows:
+            if any(row.get(key) is None for key in ("task_features", "particle_features", "action_features", "budget_features")):
+                continue
+            record = dict(base_record)
+            record.update(
+                {
+                    "task_features": list(row["task_features"]),
+                    "particle_features": list(row["particle_features"]),
+                    "action_features": list(row["action_features"]),
+                    "budget_features": list(row["budget_features"]),
+                }
+            )
+            if row.get("particle_id") is not None:
+                record["particle_id"] = int(row["particle_id"])
+            sample_records.append(record)
+            grouped.setdefault((str(sibling_group_id), str(prefix_hash)), []).append(record)
+        if sample_records:
+            records_by_sample[index] = sample_records
+
+    for records in grouped.values():
+        if not records:
+            continue
+        oracle = max(records, key=lambda item: (float(item["utility"]), str(item.get("action_key", ""))))
+        policy_records = [item for item in records if bool(item.get("is_policy_action"))]
+        policy_utility = float(policy_records[0]["utility"]) if policy_records else None
+        for record in records:
+            record["oracle_action"] = str(oracle.get("action_key", ""))
+            record["oracle_utility"] = float(oracle["utility"])
+            record["policy_utility"] = policy_utility
+            record["relative_regret"] = (
+                float(oracle["utility"]) - policy_utility if policy_utility is not None else None
+            )
+            record.pop("is_policy_action", None)
+
+    for index, sample in enumerate(samples):
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        if index in records_by_sample:
+            metadata["bayes_branch_records"] = records_by_sample[index]
+        else:
+            metadata.setdefault("bayes_branch_records", [])
+        sample.metadata = metadata
 
 
 @ray.remote
@@ -363,6 +561,15 @@ class RolloutManager:
         for index, is_excluded in enumerate(excluded):
             if is_excluded:
                 rewards[index] = 0.0
+        if self.args.advantage_estimator == "bayes_grpo":
+            trajectory_rewards = [float(value) for value in raw_rewards]
+            raw_rewards = _bayestool_apply_meta_suffix_returns(samples, trajectory_rewards, self.args)
+            _bayestool_attach_branch_records(samples, trajectory_rewards)
+            # Bayes-ARPO computes the weighted sibling baseline exactly once
+            # in the actor loss from raw trajectory utilities.  Keep the
+            # public reward tensor raw as well; otherwise downstream code can
+            # accidentally consume a second, already-normalized baseline.
+            return raw_rewards, raw_rewards
         if not self.args.rewards_normalization:
             return raw_rewards, rewards
 
@@ -686,12 +893,34 @@ class RolloutManager:
         samples = _drop_removed_samples(samples)
         samples = self._drop_constant_reward_groups(samples)
         dp_size = self.train_parallel_config["dp_size"]
-        if len(samples) < dp_size:
-            logger.warning(
-                "Injecting %d dummy samples.",
-                dp_size - len(samples),
+        # FSDP receives one partition per data-parallel rank and assumes that
+        # every rank has the same number of samples in each global batch.  A
+        # rollout can lose infrastructure-invalid samples after the pre-trim
+        # in ``_get_rollout_data``; padding only up to ``dp_size`` then leaves
+        # a tail such as 15 samples for a global batch of 8.  That produces
+        # uneven rank partitions and can make dynamic microbatch packing ask a
+        # one-sample rank for two packs.  Pad to the effective global batch
+        # size so the existing zero-loss dummy semantics remain explicit and
+        # all FSDP ranks execute identical collective schedules.
+        effective_global_batch_size = int(
+            getattr(
+                self,
+                "_dynamic_global_batch_size",
+                getattr(self.args, "global_batch_size", dp_size),
             )
-            samples.extend(_make_dummy_samples(dp_size - len(samples)))
+        )
+        effective_global_batch_size = max(dp_size, effective_global_batch_size)
+        dummy_count = (-len(samples)) % effective_global_batch_size
+        if len(samples) < effective_global_batch_size:
+            dummy_count = effective_global_batch_size - len(samples)
+        if dummy_count:
+            logger.warning(
+                "Injecting %d dummy samples to align %d samples with global_batch_size=%d.",
+                dummy_count,
+                len(samples),
+                effective_global_batch_size,
+            )
+            samples.extend(_make_dummy_samples(dummy_count))
 
         raw_rewards, rewards = self._post_process_rewards(samples)
 
@@ -709,6 +938,48 @@ class RolloutManager:
             "group_indices": [sample.group_index for sample in samples],
             "sample_indices": [sample.index for sample in samples],
         }
+
+        if self.args.advantage_estimator == "bayes_grpo":
+            def bayes_group_id(sample: Sample) -> str:
+                metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+                value = metadata.get("sibling_group_id")
+                nested = metadata.get("bayestool")
+                if not value and isinstance(nested, dict):
+                    value = nested.get("sibling_group_id")
+                if not value:
+                    coupling_id = metadata.get("coupling_id")
+                    world_id = metadata.get("world_id")
+                    value = f"{coupling_id}:{world_id}" if coupling_id and world_id else sample.group_index
+                return str(value)
+
+            train_data["bayes_group_ids"] = [
+                bayes_group_id(sample)
+                for sample in samples
+            ]
+            train_data["bayes_sibling_weights"] = [
+                float(
+                    ((sample.metadata if isinstance(sample.metadata, dict) else {}).get("bayestool") or {}).get(
+                        "sibling_weight",
+                        (sample.metadata if isinstance(sample.metadata, dict) else {}).get("sibling_weight", 1.0),
+                    )
+                )
+                for sample in samples
+            ]
+            train_data["coupling_ids"] = [str((sample.metadata or {}).get("coupling_id", "")) for sample in samples]
+            train_data["world_ids"] = [str((sample.metadata or {}).get("world_id", "")) for sample in samples]
+            train_data["sibling_group_ids"] = list(train_data["bayes_group_ids"])
+            train_data["bayes_aux_records"] = [
+                list((sample.metadata or {}).get("bayes_aux_records", []))
+                if isinstance(sample.metadata, dict)
+                else []
+                for sample in samples
+            ]
+            train_data["bayes_branch_records"] = [
+                list((sample.metadata or {}).get("bayes_branch_records", []))
+                if isinstance(sample.metadata, dict)
+                else []
+                for sample in samples
+            ]
 
         # Carry action-level diagnostics into the trainer.  The ordinary
         # sample loss mask remains the rollout's public/diagnostic mask; the
@@ -872,6 +1143,13 @@ class RolloutManager:
                 "action_rewards",
                 "action_token_spans",
                 "rejected_action_indices",
+                "bayes_group_ids",
+                "bayes_sibling_weights",
+                "coupling_ids",
+                "world_ids",
+                "sibling_group_ids",
+                "bayes_aux_records",
+                "bayes_branch_records",
             ]:
                 if key not in data:
                     continue
