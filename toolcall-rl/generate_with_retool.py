@@ -4466,6 +4466,19 @@ _INFRA_STATUSES = {
 }
 
 
+def _is_world_injected_observation(trace_item: Mapping[str, Any] | None) -> bool:
+    """Return whether a failed tool call still delivered a valid world observation."""
+
+    if not isinstance(trace_item, Mapping):
+        return False
+    if str(trace_item.get("failure_origin") or "") == "world_injected":
+        return True
+    world_event = trace_item.get("world_event")
+    return isinstance(world_event, Mapping) and str(
+        world_event.get("failure_origin") or ""
+    ) == "world_injected"
+
+
 def _set_rollout_status(sample: Sample, status: str, *, reason: str | None = None) -> None:
     """Persist the rollout state in both runtime fields and serialized metadata."""
     valid_for_rl = status not in _INFRA_STATUSES
@@ -5274,8 +5287,15 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
 
         latest_tool = execution_trace[-1] if execution_trace else {}
         recovery_observation = bool(latest_tool.get("recovery_observation"))
-        if not recovery_observation and (
-            not latest_tool.get("executed") or not latest_tool.get("success")
+        # World-injected failures intentionally return success=False, but the
+        # returned error is a valid POMDP observation and must remain in RL data.
+        if (
+            not recovery_observation
+            and not _is_world_injected_observation(latest_tool)
+            and (
+                not latest_tool.get("executed")
+                or not latest_tool.get("success")
+            )
         ):
             terminal_status = "infra_error"
             terminal_reason = "successful tool execution did not produce a sendable observation"

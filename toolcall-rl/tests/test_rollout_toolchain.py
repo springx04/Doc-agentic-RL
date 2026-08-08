@@ -60,6 +60,24 @@ def _load_generator(monkeypatch):
     return module, FakeSample
 
 
+def test_world_injected_failure_is_a_valid_sendable_observation(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+
+    assert module._is_world_injected_observation(
+        {"failure_origin": "world_injected", "success": False}
+    )
+    assert module._is_world_injected_observation(
+        {
+            "success": False,
+            "world_event": {"failure_origin": "world_injected"},
+        }
+    )
+    assert not module._is_world_injected_observation(
+        {"failure_origin": "real_infrastructure", "success": False}
+    )
+    assert not module._is_world_injected_observation({"success": False})
+
+
 def test_image_context_compaction_keeps_follow_up_generation_possible(monkeypatch):
     module, _ = _load_generator(monkeypatch)
     segments = [
