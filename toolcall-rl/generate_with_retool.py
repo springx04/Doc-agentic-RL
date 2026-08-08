@@ -43,7 +43,13 @@ try:
     from bayestool.replay import export_canonical_replay
     from bayestool.schema import TaskStateView
     from bayestool.training import attach_bayestool_utility, content_signature
-    from bayestool.world import CleanResultCache, WorldRuntime, document_hash, stable_seed
+    from bayestool.world import (
+        DEFAULT_TOOL_ARGUMENT_CAPABILITIES,
+        CleanResultCache,
+        WorldRuntime,
+        document_hash,
+        stable_seed,
+    )
 except Exception:  # pragma: no cover - baseline rollout remains importable without the optional package
     BeliefRuntime = None  # type: ignore[assignment]
     AnswerRiskCalibrator = None  # type: ignore[assignment]
@@ -57,6 +63,7 @@ except Exception:  # pragma: no cover - baseline rollout remains importable with
     export_canonical_replay = None  # type: ignore[assignment]
     TaskStateView = None  # type: ignore[assignment]
     WorldRuntime = None  # type: ignore[assignment]
+    DEFAULT_TOOL_ARGUMENT_CAPABILITIES = {}  # type: ignore[assignment]
     config_from_args = None  # type: ignore[assignment]
     stage_definition = None  # type: ignore[assignment]
     validate_stage_capabilities = None  # type: ignore[assignment]
@@ -4689,6 +4696,25 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         if meta_world_key and str(meta_world_key) in _BAYES_META_WORLD_RUNTIMES:
             world_runtime = _BAYES_META_WORLD_RUNTIMES[str(meta_world_key)]
         else:
+            raw_sampling_context = diagnostic_metadata.get("world_sampling_context")
+            if isinstance(raw_sampling_context, dict):
+                world_sampling_context = dict(raw_sampling_context)
+            else:
+                world_sampling_context = {}
+            # ``page_count`` and the argument capabilities are public task
+            # metadata.  Carry them into the sampler even for the ordinary
+            # preprocessed document-qa dataset, which does not have a
+            # pre-built BayesTool manifest.
+            if world_sampling_context.get("page_count") is None:
+                world_sampling_context["page_count"] = diagnostic_metadata.get(
+                    "page_count", diagnostic_metadata.get("num_pages")
+                )
+            if not world_sampling_context.get("tool_argument_capabilities"):
+                world_sampling_context["tool_argument_capabilities"] = {
+                    str(name): sorted(str(argument) for argument in arguments)
+                    for name, arguments in DEFAULT_TOOL_ARGUMENT_CAPABILITIES.items()
+                }
+            world_sampling_context["tool_budget"] = bayestool_tool_budget
             world_runtime = WorldRuntime.for_sample(
                 coupling_id=bayes_coupling_id,
                 sample_index=world_sample_index,
@@ -4698,11 +4724,8 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                 world_type=diagnostic_metadata.get("world_type"),
                 document_digest=bayes_document_digest,
                 clean_cache=_BAYES_CLEAN_RESULT_CACHE,
-                sampling_context=(
-                    diagnostic_metadata.get("world_sampling_context")
-                    if isinstance(diagnostic_metadata.get("world_sampling_context"), dict)
-                    else None
-                ),
+                sampling_context=world_sampling_context,
+                tool_budget=bayestool_tool_budget,
                 fixed_world_specs=(
                     diagnostic_metadata.get("fixed_world_specs")
                     if isinstance(diagnostic_metadata.get("fixed_world_specs"), list)

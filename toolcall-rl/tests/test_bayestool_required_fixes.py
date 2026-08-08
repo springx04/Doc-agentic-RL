@@ -49,6 +49,33 @@ def test_context_rules_match_multi_page_public_arguments():
     assert not rule.matches("parse_document", page_numbers=(1, 2))
 
 
+def test_context_sampling_uses_public_page_count_and_reports_activation():
+    context = WorldSamplingContext(page_count=4, tool_budget=6)
+    spec = sample_tool_world(
+        "context-coupling",
+        world_slot=0,
+        replica_id=0,
+        rollout_id=3,
+        world_type="context_degradation",
+        sampling_context=context,
+    )
+    rule = spec.context_rules[0]
+    assert rule.page_numbers and 1 <= rule.page_numbers[0] <= 4
+    runtime = WorldRuntime(spec, sampling_context=context)
+    page = rule.page_numbers[0]
+    _, event, _ = runtime.transform_result(
+        rule.tool_names[0],
+        {"page_numbers": [page]},
+        json.dumps({"status": "ok", "text": "public observation"}),
+    )
+    assert event.page_numbers == (page,)
+    report = runtime.context_metadata()
+    assert report["context_rule_match_count"] == 1
+    assert report["first_context_match_call"] == 0
+    assert report["affected_call_count"] == 1
+    assert report["context_rule_not_exercised"] is False
+
+
 def test_sampling_schedules_stay_inside_public_budget():
     context = WorldSamplingContext(page_count=2, tool_budget=3)
     for slot in range(4):
@@ -57,6 +84,45 @@ def test_sampling_schedules_stay_inside_public_budget():
             assert 1 <= segment.start_call <= context.tool_budget
             if segment.end_call is not None:
                 assert segment.start_call <= segment.end_call <= context.tool_budget
+
+
+def test_schedule_metadata_tracks_target_effective_calls():
+    context = WorldSamplingContext(page_count=2, tool_budget=6)
+    spec = sample_tool_world(
+        "schedule-coupling",
+        world_slot=0,
+        replica_id=0,
+        rollout_id=13,
+        world_type="abrupt_change",
+        sampling_context=context,
+    )
+    segment = spec.regime_schedule[0]
+    target = next(iter(segment.tool_overrides))
+    runtime = WorldRuntime(spec, sampling_context=context)
+    clean = json.dumps({"status": "ok", "text": "stable observation"})
+    for _ in range(int(segment.start_call) + 2):
+        runtime.transform_result(target, {}, clean)
+    report = runtime.schedule_metadata()[0]
+    assert report["first_effective_call"] == segment.start_call
+    assert report["last_effective_call"] >= segment.start_call
+    assert report["affected_call_count"] >= 1
+    assert report["schedule_not_exercised"] is False
+
+
+def test_for_sample_preserves_explicit_public_tool_budget():
+    runtime = WorldRuntime.for_sample(
+        coupling_id="budget-coupling",
+        sample_index=0,
+        rollout_id=1,
+        tool_budget=3,
+        sampling_context={"page_count": 4},
+    )
+    assert runtime.tool_budget == 3
+    assert runtime.sampling_context.page_count == 4
+    for segment in runtime.spec.regime_schedule:
+        assert segment.start_call <= 3
+        if segment.end_call is not None:
+            assert segment.end_call <= 3
 
 
 def test_schema_aware_corruption_keeps_json_valid():

@@ -554,7 +554,11 @@ def sample_tool_world(
         severity = _uniform(rng, 0.35, 0.75)
         shared[family] = SharedFactorSpec(family, "degraded" if severity < 0.65 else "down", severity)
     elif selected_type == "abrupt_change":
-        call = rng.randint(1, public_context.tool_budget)
+        # Keep one post-change decision opportunity in the normal budgeted
+        # rollout.  Call ids are zero-based, so starting at budget-2 leaves a
+        # later call available for the policy to react to the change.
+        latest_start = max(1, public_context.tool_budget - 2)
+        call = rng.randint(1, latest_start)
         target = TOOL_NAMES[rng.randrange(len(TOOL_NAMES))]
         schedule.append(
             RegimeSegment(
@@ -572,8 +576,10 @@ def sample_tool_world(
             )
         )
     elif selected_type == "gradual_change":
-        start = rng.randint(1, max(1, public_context.tool_budget - 1))
-        end = rng.randint(start, public_context.tool_budget)
+        latest_start = max(1, public_context.tool_budget - 2)
+        start = rng.randint(1, latest_start)
+        latest_end = max(start, public_context.tool_budget - 1)
+        end = rng.randint(start, latest_end)
         family = tuple(TOOL_FAMILIES)[rng.randrange(len(TOOL_FAMILIES))]
         schedule.append(
             RegimeSegment(
@@ -1103,7 +1109,18 @@ class WorldRuntime:
         self.events: list[WorldEvent] = []
         self.supervision: list[ToolStateLabel] = []
         self.context_rule_match_count = 0
+        self.first_context_match_call: int | None = None
+        self.context_affected_call_count = 0
         self.schedule_call_counts: dict[int, int] = {index: 0 for index, _ in enumerate(spec.regime_schedule)}
+        self.schedule_affected_call_counts: dict[int, int] = {
+            index: 0 for index, _ in enumerate(spec.regime_schedule)
+        }
+        self.schedule_first_effective_call: dict[int, int | None] = {
+            index: None for index, _ in enumerate(spec.regime_schedule)
+        }
+        self.schedule_last_effective_call: dict[int, int | None] = {
+            index: None for index, _ in enumerate(spec.regime_schedule)
+        }
 
     @classmethod
     def for_sample(
@@ -1122,6 +1139,29 @@ class WorldRuntime:
         tool_budget: int | None = None,
     ) -> "WorldRuntime":
         config = config or default_config(enabled=True)
+        # Use the same public context for sampling and runtime accounting.  An
+        # explicit budget must not be lost when the caller supplied a mapping
+        # (or no context at all), otherwise schedules are sampled with one
+        # budget and executed/reported with the default budget of eight.
+        if isinstance(sampling_context, WorldSamplingContext):
+            runtime_context = sampling_context
+            if tool_budget is not None and int(tool_budget) != runtime_context.tool_budget:
+                runtime_context = WorldSamplingContext(
+                    page_count=runtime_context.page_count,
+                    tool_argument_capabilities=runtime_context.tool_argument_capabilities,
+                    tool_budget=tool_budget,
+                )
+        else:
+            runtime_context = WorldSamplingContext.from_mapping(
+                sampling_context,
+                tool_budget=tool_budget or 8,
+            )
+            if tool_budget is not None:
+                runtime_context = WorldSamplingContext(
+                    page_count=runtime_context.page_count,
+                    tool_argument_capabilities=runtime_context.tool_argument_capabilities,
+                    tool_budget=tool_budget,
+                )
         world_slot = int(sample_index) % max(1, int(config.worlds_per_prompt))
         replica_id = (int(sample_index) // max(1, int(config.worlds_per_prompt))) % max(
             1, int(config.replicas_per_world)
@@ -1151,7 +1191,7 @@ class WorldRuntime:
                 rollout_id=rollout_id,
                 config=config,
                 world_type=world_type,
-                sampling_context=sampling_context,
+                sampling_context=runtime_context,
                 tool_budget=tool_budget,
             )
         return cls(
@@ -1160,7 +1200,7 @@ class WorldRuntime:
             output_root=output_root,
             document_digest=document_digest,
             clean_cache=clean_cache,
-            sampling_context=sampling_context,
+            sampling_context=runtime_context,
         )
 
     def _shared_multiplier(self, tool_name: str, call_index: int) -> float:
@@ -1358,11 +1398,28 @@ class WorldRuntime:
             )
         ]
         self.context_rule_match_count += len(matched_rules)
+        if matched_rules:
+            if self.first_context_match_call is None:
+                self.first_context_match_call = int(call_id)
+            self.context_affected_call_count += 1
         for index, segment in enumerate(self.spec.regime_schedule):
             if call_id >= int(segment.start_call) and (
                 segment.end_call is None or call_id <= int(segment.end_call)
             ):
                 self.schedule_call_counts[index] = self.schedule_call_counts.get(index, 0) + 1
+                affected = tool_name in segment.tool_overrides
+                if not affected and segment.shared_overrides:
+                    affected = any(
+                        tool_name in TOOL_FAMILIES.get(family, ())
+                        for family in segment.shared_overrides
+                    )
+                if affected:
+                    self.schedule_affected_call_counts[index] = (
+                        self.schedule_affected_call_counts.get(index, 0) + 1
+                    )
+                    if self.schedule_first_effective_call.get(index) is None:
+                        self.schedule_first_effective_call[index] = int(call_id)
+                    self.schedule_last_effective_call[index] = int(call_id)
         change_detected = any(
             int(call_id) == int(segment.start_call)
             for segment in self.spec.regime_schedule
@@ -1539,11 +1596,14 @@ class WorldRuntime:
                     "end_call": int(end),
                     "transition": segment.transition,
                     "calls_observed": int(self.schedule_call_counts.get(index, 0)),
+                    "first_effective_call": self.schedule_first_effective_call.get(index),
+                    "last_effective_call": self.schedule_last_effective_call.get(index),
+                    "affected_call_count": int(self.schedule_affected_call_counts.get(index, 0)),
                     "effective_within_budget": bool(
                         int(segment.start_call) <= self.tool_budget
                         and int(end) >= int(segment.start_call)
                     ),
-                    "schedule_not_exercised": self.schedule_call_counts.get(index, 0) <= 0,
+                    "schedule_not_exercised": self.schedule_affected_call_counts.get(index, 0) <= 0,
                 }
             )
         return values
@@ -1554,6 +1614,8 @@ class WorldRuntime:
             "tool_budget": self.tool_budget,
             "context_rule_count": len(self.spec.context_rules),
             "context_rule_match_count": int(self.context_rule_match_count),
+            "first_context_match_call": self.first_context_match_call,
+            "affected_call_count": int(self.context_affected_call_count),
             "context_rule_not_exercised": bool(
                 self.spec.context_rules and self.context_rule_match_count <= 0
             ),
