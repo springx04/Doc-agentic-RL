@@ -75,6 +75,18 @@ def _write_checkpoint_metadata(path: Path, metadata: dict[str, Any]) -> None:
     tmp_path.replace(path)
 
 
+def _is_dcp_checkpoint(path: Path) -> bool:
+    """Return whether ``path`` contains a complete torch DCP checkpoint.
+
+    ``save()`` creates optimizer and scheduler directories before saving the
+    model.  With ``--no-save-optim`` those directories remain empty, so an
+    ``exists()`` check alone incorrectly attempts a distributed load and fails
+    before training can resume from the model weights.
+    """
+
+    return path.is_dir() and (path / ".metadata").is_file()
+
+
 def load(actor: Any) -> dict[str, Any] | None:
     """Load checkpoint from disk.
 
@@ -134,7 +146,7 @@ def load(actor: Any) -> dict[str, Any] | None:
 
     # Load optimizer state (optional)
     load_optimizer = not getattr(actor.args, "no_load_optim", False) and hasattr(actor, "optimizer")
-    if load_optimizer and optimizer_dir.exists():
+    if load_optimizer and _is_dcp_checkpoint(optimizer_dir):
         optimizer_state = OptimizerState(actor.model, actor.optimizer)
         optim_state_dict = {"optim_state": optimizer_state}
         try:
@@ -143,10 +155,13 @@ def load(actor: Any) -> dict[str, Any] | None:
         except Exception as e:
             logger.warning(f"[FSDP] Failed to load optimizer from {optimizer_dir}: {e}")
     elif load_optimizer:
-        logger.info(f"[FSDP] Optimizer checkpoint not found at {optimizer_dir}, skipping optimizer load.")
+        logger.info(
+            f"[FSDP] Optimizer checkpoint not found or incomplete at {optimizer_dir}, "
+            "skipping optimizer load."
+        )
 
     # Load LR scheduler state (optional)
-    load_lr_scheduler = hasattr(actor, "lr_scheduler") and lr_scheduler_dir.exists()
+    load_lr_scheduler = hasattr(actor, "lr_scheduler") and _is_dcp_checkpoint(lr_scheduler_dir)
     if load_lr_scheduler:
         lr_scheduler_state = LRSchedulerState(actor.lr_scheduler)
         lr_scheduler_state_dict = {"lr_scheduler_state": lr_scheduler_state}
@@ -156,7 +171,10 @@ def load(actor: Any) -> dict[str, Any] | None:
         except Exception as e:
             logger.warning(f"[FSDP] Failed to load LR scheduler from {lr_scheduler_dir}: {e}")
     elif hasattr(actor, "lr_scheduler"):
-        logger.info(f"[FSDP] LR scheduler checkpoint not found at {lr_scheduler_dir}, skipping LR scheduler load.")
+        logger.info(
+            f"[FSDP] LR scheduler checkpoint not found or incomplete at {lr_scheduler_dir}, "
+            "skipping LR scheduler load."
+        )
 
     rng_state = None
     rng_path = checkpoint_dir / "rng.pt"
