@@ -148,6 +148,33 @@ def test_schema_aware_corruption_keeps_json_valid():
     assert isinstance(json.loads(observed), dict)
 
 
+def test_observation_corruption_preserves_artifact_paths():
+    from bayestool.schema import ToolQualitySpec
+
+    observed, corruption, schema_valid, applied = ObservationCorruptionAdapter.corrupt(
+        "ocr_region",
+        json.dumps(
+            {
+                "status": "partial",
+                "text": "amount 42 is shown here",
+                "image_path": "/workspace/output/crop.png",
+                "document_path": "/workspace/docs/example.pdf",
+            }
+        ),
+        ToolQualitySpec(
+            availability=1.0,
+            semantic_accuracy=0.40,
+            structure_fidelity=0.40,
+            relative_cost=1.0,
+        ),
+        __import__("random").Random(7),
+    )
+    payload = json.loads(observed)
+    assert corruption is not None and applied and schema_valid
+    assert payload["image_path"] == "/workspace/output/crop.png"
+    assert payload["document_path"] == "/workspace/docs/example.pdf"
+
+
 def test_canonical_replay_is_ordered_and_contains_next_tool():
     metadata = {
         "rollout_id": 17,

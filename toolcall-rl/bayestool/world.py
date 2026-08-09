@@ -861,18 +861,43 @@ def _mutate_structured_observation(value: Any, corruption: str, severity: float,
     return value
 
 
-def _mutate_observation_text(value: Any, rng: random.Random, corruption: str, severity: float) -> Any:
-    """Mutate evidence fields without changing the surrounding JSON schema."""
+def _mutate_observation_text(
+    value: Any,
+    rng: random.Random,
+    corruption: str,
+    severity: float,
+    *,
+    key: str = "",
+) -> Any:
+    """Mutate evidence fields without changing operational artifact handles."""
+
+    key_name = str(key).casefold()
+    # Paths and URLs are transport handles, not evidence.  Mutating them can
+    # turn an intentional world corruption into an unrecoverable media error
+    # before the policy ever receives the observation.
+    if (
+        key_name.endswith("_path")
+        or key_name.endswith("_paths")
+        or key_name in {"path", "uri", "url", "href", "document", "file"}
+    ):
+        return value
 
     if isinstance(value, dict):
         return {
-            name: _mutate_observation_text(item, rng, corruption, severity)
-            if str(name).casefold() in {"text", "markdown", "value", "content", "label", "name"}
-            else _mutate_observation_text(item, rng, corruption, severity)
+            name: _mutate_observation_text(
+                item,
+                rng,
+                corruption,
+                severity,
+                key=str(name),
+            )
             for name, item in value.items()
         }
     if isinstance(value, list):
-        items = [_mutate_observation_text(item, rng, corruption, severity) for item in value]
+        items = [
+            _mutate_observation_text(item, rng, corruption, severity, key=key_name)
+            for item in value
+        ]
         if corruption in {"page_order_jitter", "line_order", "row_column_swap", "category_swap"} and len(items) > 1:
             rng.shuffle(items)
         return items
