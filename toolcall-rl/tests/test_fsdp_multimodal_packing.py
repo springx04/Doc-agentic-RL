@@ -18,6 +18,14 @@ _SPEC.loader.exec_module(_DATA_PACKING)
 _get_multimodal_balanced_partitions = _DATA_PACKING._get_multimodal_balanced_partitions
 pack_sequences = _DATA_PACKING.pack_sequences
 
+_SEQ_BALANCING_PATH = SLIME_ROOT / "slime" / "utils" / "seqlen_balancing.py"
+_SEQ_SPEC = importlib.util.spec_from_file_location("openclaw_seqlen_balancing", _SEQ_BALANCING_PATH)
+assert _SEQ_SPEC is not None and _SEQ_SPEC.loader is not None
+_SEQ_BALANCING = importlib.util.module_from_spec(_SEQ_SPEC)
+_SEQ_SPEC.loader.exec_module(_SEQ_BALANCING)
+build_fsdp_modality_aligned_order = _SEQ_BALANCING.build_fsdp_modality_aligned_order
+get_fsdp_modality_aligned_partitions = _SEQ_BALANCING.get_fsdp_modality_aligned_partitions
+
 
 def test_mixed_modalities_are_partitioned_into_homogeneous_packs():
     partitions = _get_multimodal_balanced_partitions(
@@ -63,3 +71,32 @@ def test_pack_sequences_keeps_text_only_samples_in_mixed_batch():
     assert len(packed) == 2
     assert sum(int(batch["tokens"].numel()) for batch in packed) == 5
     assert any("multimodal_train_inputs" in batch for batch in packed)
+
+
+def test_mixed_modalities_are_aligned_across_fsdp_ranks_without_dropping_real_samples():
+    flags = [True, False, True, False, False, False]
+    order = build_fsdp_modality_aligned_order(flags, dp_size=4, global_batch_size=8)
+
+    assert len(order) == 8
+    assert sum(index >= 0 and flags[index] for index in order) == 2
+    assert order.count(-1) == 2
+    assert order.count(-2) == 0
+
+    partitions = get_fsdp_modality_aligned_partitions(len(order), dp_size=4, global_batch_size=8)
+    assert [len(partition) for partition in partitions] == [2, 2, 2, 2]
+    ordered_modalities = [index == -1 or (index >= 0 and flags[index]) for index in order]
+    rank_modalities = [
+        [ordered_modalities[index] for index in partition]
+        for partition in partitions
+    ]
+    assert rank_modalities == [[True, False]] * 4
+
+
+def test_modality_alignment_keeps_all_real_samples_when_multiple_batches_are_needed():
+    flags = [True, False, False, False, False, False, False, False, False, False]
+    order = build_fsdp_modality_aligned_order(flags, dp_size=4, global_batch_size=8)
+
+    assert len(order) == 16
+    assert sum(index >= 0 for index in order) == len(flags)
+    assert order.count(-1) == 3
+    assert order.count(-2) == 3

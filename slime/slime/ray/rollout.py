@@ -28,7 +28,11 @@ from slime.utils.metric_utils import (
     dict_add_prefix,
 )
 from slime.utils.misc import Box, group_by, load_function
-from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
+from slime.utils.seqlen_balancing import (
+    build_fsdp_modality_aligned_order,
+    get_fsdp_modality_aligned_partitions,
+    get_seqlen_balanced_partitions,
+)
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
@@ -930,6 +934,70 @@ class RolloutManager:
         samples = _drop_removed_samples(samples)
         samples = self._drop_constant_reward_groups(samples)
         dp_size = self.train_parallel_config["dp_size"]
+        effective_global_batch_size = int(
+            getattr(
+                self,
+                "_dynamic_global_batch_size",
+                getattr(self.args, "global_batch_size", dp_size),
+            )
+        )
+        effective_global_batch_size = max(dp_size, effective_global_batch_size)
+        fsdp_modality_aligned = False
+
+        # Qwen-VL's visual and text-only forwards do not execute the same
+        # FSDP-wrapped submodules.  Keep both real modalities, but arrange
+        # every global batch so each rank sees the same modality sequence.
+        # Missing lanes are filled by zero-loss dummies, not by fabricated RL
+        # rewards or extra policy-gradient signal.
+        is_fsdp = getattr(self.args, "train_backend", None) == "fsdp"
+        modality_flags = [
+            isinstance(sample.multimodal_train_inputs, dict) and bool(sample.multimodal_train_inputs)
+            for sample in samples
+        ]
+        modality_order = (
+            build_fsdp_modality_aligned_order(
+                modality_flags,
+                dp_size=dp_size,
+                global_batch_size=effective_global_batch_size,
+            )
+            if is_fsdp
+            else list(range(len(samples)))
+        )
+        if modality_order != list(range(len(samples))):
+            visual_template = next(
+                (
+                    sample
+                    for sample in samples
+                    if isinstance(sample.multimodal_train_inputs, dict)
+                    and sample.multimodal_train_inputs
+                ),
+                None,
+            )
+            visual_dummies = iter(_make_zero_loss_dummy_samples(modality_order.count(-1), visual_template))
+            text_dummies = iter(_make_zero_loss_dummy_samples(modality_order.count(-2), None))
+            aligned_samples: list[Sample] = []
+            for index in modality_order:
+                if index == -1:
+                    aligned_samples.append(next(visual_dummies))
+                elif index == -2:
+                    aligned_samples.append(next(text_dummies))
+                else:
+                    aligned_samples.append(samples[index])
+            logger.warning(
+                "Aligning mixed FSDP modalities: real_samples=%d visual=%d text=%d aligned_samples=%d "
+                "visual_dummies=%d text_dummies=%d global_batch_size=%d dp_size=%d",
+                len(samples),
+                sum(modality_flags),
+                len(samples) - sum(modality_flags),
+                len(aligned_samples),
+                modality_order.count(-1),
+                modality_order.count(-2),
+                effective_global_batch_size,
+                dp_size,
+            )
+            samples = aligned_samples
+            fsdp_modality_aligned = True
+
         # FSDP receives one partition per data-parallel rank and assumes that
         # every rank has the same number of samples in each global batch.  A
         # rollout can lose infrastructure-invalid samples after the pre-trim
@@ -939,18 +1007,12 @@ class RolloutManager:
         # one-sample rank for two packs.  Pad to the effective global batch
         # size so the existing zero-loss dummy semantics remain explicit and
         # all FSDP ranks execute identical collective schedules.
-        effective_global_batch_size = int(
-            getattr(
-                self,
-                "_dynamic_global_batch_size",
-                getattr(self.args, "global_batch_size", dp_size),
-            )
-        )
-        effective_global_batch_size = max(dp_size, effective_global_batch_size)
+        # In the modality-aligned path the sample order and padding are
+        # already complete global batches; do not add a second padding pass.
         dummy_count = (-len(samples)) % effective_global_batch_size
         if len(samples) < effective_global_batch_size:
             dummy_count = effective_global_batch_size - len(samples)
-        if dummy_count:
+        if dummy_count and not fsdp_modality_aligned:
             visual_template = next(
                 (
                     sample
@@ -985,6 +1047,9 @@ class RolloutManager:
             "group_indices": [sample.group_index for sample in samples],
             "sample_indices": [sample.index for sample in samples],
         }
+        if fsdp_modality_aligned:
+            train_data["_fsdp_modality_aligned"] = True
+            train_data["_fsdp_global_batch_size"] = effective_global_batch_size
 
         if self.args.advantage_estimator == "bayes_grpo":
             def bayes_group_id(sample: Sample) -> str:
@@ -1143,7 +1208,14 @@ class RolloutManager:
         total_lengths = [len(t) for t in data["tokens"]]
         data["total_lengths"] = total_lengths
 
-        if self.args.balance_data:
+        if data.get("_fsdp_modality_aligned"):
+            global_batch_size = int(data["_fsdp_global_batch_size"])
+            partitions = get_fsdp_modality_aligned_partitions(
+                len(total_lengths),
+                dp_size=dp_size,
+                global_batch_size=global_batch_size,
+            )
+        elif self.args.balance_data:
             # Equal-size partitioning requires divisibility by dp_size.
             # Dynamic rollout/history can produce tail batches that violate this.
             use_equal_size = (len(total_lengths) % dp_size) == 0
