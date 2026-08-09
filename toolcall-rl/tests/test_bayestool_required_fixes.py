@@ -1,4 +1,6 @@
 import json
+import hashlib
+import random
 import sys
 from pathlib import Path
 
@@ -123,6 +125,30 @@ def test_for_sample_preserves_explicit_public_tool_budget():
         assert segment.start_call <= 3
         if segment.end_call is not None:
             assert segment.end_call <= 3
+
+
+def test_bayestool_image_output_accepts_same_source_and_target(tmp_path):
+    runtime = WorldRuntime.for_sample(
+        coupling_id="same-image-coupling",
+        sample_index=0,
+        rollout_id=1,
+        output_root=tmp_path,
+    )
+    coupling_key = hashlib.sha256(runtime.spec.coupling_id.encode("utf-8")).hexdigest()[:16]
+    world_key = hashlib.sha256(runtime.spec.world_id.encode("utf-8")).hexdigest()[:16]
+    target_dir = tmp_path / "tool_outputs" / "bayestool" / coupling_key / world_key / "0"
+    target_dir.mkdir(parents=True)
+    source = target_dir / "image_0.png"
+    source.write_bytes(b"already-emitted")
+
+    replacements = runtime._make_image_outputs(
+        [str(source)],
+        call_id=0,
+        corruption=None,
+        rng=random.Random(0),
+    )
+
+    assert replacements[str(source)] == str(source)
 
 
 def test_schema_aware_corruption_keeps_json_valid():

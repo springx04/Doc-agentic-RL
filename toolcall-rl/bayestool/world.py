@@ -1312,6 +1312,14 @@ class WorldRuntime:
                 continue
             target_suffix = ".jpg" if corruption == "compression_noise" else (source.suffix or ".png")
             target = target_dir / f"image_{image_index}{target_suffix}"
+
+            def _copy_if_needed() -> None:
+                # A tool may already have emitted an image directly into the
+                # BayesTool target directory.  shutil.copy2 raises
+                # SameFileError for that valid no-op case.
+                if source.resolve() != target.resolve():
+                    shutil.copy2(source, target)
+
             try:
                 if corruption and corruption in {
                     "blur",
@@ -1366,9 +1374,9 @@ class WorldRuntime:
                         continue
                     image.save(target)
                 else:
-                    shutil.copy2(source, target)
+                    _copy_if_needed()
             except Exception:
-                shutil.copy2(source, target)
+                _copy_if_needed()
             replacements[str(source)] = str(target)
         return replacements
 
