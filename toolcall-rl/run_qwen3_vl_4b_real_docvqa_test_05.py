@@ -61,7 +61,12 @@ def _training_argv() -> list[str]:
     response_len = os.environ.get("OPENCLAW_BAYESTOOL_RESPONSE_LEN", "512")
     _replace_value(argv, "--rollout-max-response-len", response_len)
     _replace_value(argv, "--eval-max-response-len", response_len)
-    context_len = os.environ.get("OPENCLAW_BAYESTOOL_CONTEXT_LEN", "4096")
+    # Real DocVQA tool observations can span several turns/pages.  4096
+    # leaves too little room for the configured 512-token response and causes
+    # otherwise valid degraded-world rollouts to be discarded as
+    # ``context_overflow``.  Keep the setting overrideable, but make the
+    # real-data default large enough for the full tool trace.
+    context_len = os.environ.get("OPENCLAW_BAYESTOOL_CONTEXT_LEN", "8192")
     _replace_value(argv, "--rollout-max-context-len", context_len)
     _replace_value(argv, "--eval-max-context-len", context_len)
     _replace_value(argv, "--max-tokens-per-gpu", os.environ.get("OPENCLAW_BAYESTOOL_MAX_TOKENS_PER_GPU", "2048"))
