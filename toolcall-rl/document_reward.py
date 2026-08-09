@@ -37,6 +37,7 @@ _RELAXED_FINAL_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _ACTION_MARKER_RE = re.compile(r"</?\s*(?:tool_call|final)\b", re.IGNORECASE)
+ACCURACY_REWARD_SCALE = 2.2
 
 
 def extract_final_answer(response: str, metadata: dict[str, Any] | None = None) -> tuple[str, bool]:
@@ -418,7 +419,7 @@ def compute_document_reward(
     strict_acc = max((exact_match(prediction, answer) for answer in answers), default=0.0) if prediction else 0.0
     raw_anls = max((anls(prediction, answer) for answer in answers), default=0.0) if prediction else 0.0
     conciseness = _answer_conciseness(prediction, answers, quality, format_ok)
-    score = 2.0 * quality - 1.0
+    score = ACCURACY_REWARD_SCALE * quality - 1.0
     if quality > 0.0 and not format_ok:
         # Keep a correct but non-conforming answer positive while making the
         # protocol violation visible to both evaluation and training logs.
