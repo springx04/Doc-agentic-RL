@@ -82,6 +82,9 @@ def _training_argv() -> list[str]:
     _replace_value(argv, "--rollout-max-context-len", context_len)
     _replace_value(argv, "--eval-max-context-len", context_len)
     _replace_value(argv, "--max-tokens-per-gpu", os.environ.get("OPENCLAW_BAYESTOOL_MAX_TOKENS_PER_GPU", "2048"))
+    load_checkpoint = os.environ.get("OPENCLAW_BAYESTOOL_LOAD")
+    if load_checkpoint:
+        argv.extend(["--load", str(Path(load_checkpoint).expanduser().resolve())])
     stage = os.environ.get("OPENCLAW_BAYESTOOL_STAGE", "c")
     argv.extend(
         [
@@ -156,11 +159,23 @@ def _validate() -> dict[str, Any]:
             f"real-data run requires exactly {expected_train_rows} train rows and "
             f"{expected_eval_rows} evaluation rows"
         )
+    load_checkpoint = os.environ.get("OPENCLAW_BAYESTOOL_LOAD")
+    load_path = Path(load_checkpoint).expanduser().resolve() if load_checkpoint else None
+    if load_path is not None:
+        if not load_path.is_dir():
+            raise FileNotFoundError(f"requested checkpoint directory does not exist: {load_path}")
+        has_checkpoint_marker = (load_path / "latest_checkpointed_iteration.txt").is_file()
+        has_checkpoint_metadata = any(load_path.glob("iter_*/meta.json"))
+        if not (has_checkpoint_marker or has_checkpoint_metadata):
+            raise FileNotFoundError(
+                f"requested checkpoint directory has no loadable checkpoint metadata: {load_path}"
+            )
     selection_manifest = os.environ.get("OPENCLAW_BAYESTOOL_SELECTION_MANIFEST")
     report.update(
         {
             "profile": os.environ.get("OPENCLAW_BAYESTOOL_PROFILE", "real_docvqa_full_20260807-13"),
             "output_dir": str(REAL_OUTPUT_DIR),
+            "load_checkpoint": str(load_path) if load_path is not None else None,
             "source_dataset": "nielsr/docvqa_1200_examples",
             "selection_manifest": selection_manifest,
             "train_data": str(REAL_TRAIN_DATA),
