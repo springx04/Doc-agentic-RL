@@ -62,6 +62,7 @@ def _training_argv() -> list[str]:
     _replace_value(argv, "--n-samples-per-eval-prompt", eval_samples_per_prompt)
     _replace_value(argv, "--global-batch-size", os.environ.get("OPENCLAW_BAYESTOOL_GLOBAL_BATCH_SIZE", "8"))
     _replace_value(argv, "--num-rollout", os.environ.get("OPENCLAW_BAYESTOOL_NUM_ROLLOUT", "1"))
+    _replace_value(argv, "--eval-interval", os.environ.get("OPENCLAW_BAYESTOOL_EVAL_INTERVAL", "1"))
     # A Qwen3-VL FSDP checkpoint is large enough that saving after every
     # rollout exhausts the remote volume during a long run.  Keep the
     # cadence configurable, but make the real-data default a rollout-level
@@ -174,6 +175,7 @@ def _validate() -> dict[str, Any]:
             "eval_samples_per_prompt": int(os.environ.get("OPENCLAW_BAYESTOOL_EVAL_SAMPLES_PER_PROMPT", "1")),
             "global_batch_size": int(os.environ.get("OPENCLAW_BAYESTOOL_GLOBAL_BATCH_SIZE", "8")),
             "num_rollout": int(os.environ.get("OPENCLAW_BAYESTOOL_NUM_ROLLOUT", "1")),
+            "eval_interval": int(os.environ.get("OPENCLAW_BAYESTOOL_EVAL_INTERVAL", "1")),
             "save_interval": int(os.environ.get("OPENCLAW_BAYESTOOL_SAVE_INTERVAL", "20")),
             "max_train_sequence_length": int(
                 os.environ.get("OPENCLAW_BAYESTOOL_MAX_TRAIN_SEQUENCE_LENGTH", "8192")
