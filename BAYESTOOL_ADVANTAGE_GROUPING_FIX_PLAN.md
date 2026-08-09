@@ -1,124 +1,54 @@
-# BayesTool-RL 同 World 统一分支优势与采样预算方案
+# BayesTool-RL 统一分支与动态多题批处理实现方案
 
-> 状态：仅规划，不修改代码
+> 状态：仅实现规划，不修改代码
 > 日期：2026-08-09
-> 目标：把根部采样和中途分支统一为同一种 shared-prefix sibling rollout；保证策略优势只在同一题目、同一 latent world、同一决策节点内计算，同时合理利用 4 类 world、belief/Q/risk 和分支预算。
 
-## 1. 最终结论
+## 1. 最终配置边界
 
-本方案采用一个统一原则：
+| 配置项 | 约束 |
+|---|---|
+| 优势与权重原子 | 1 道原始问题；不同题不共用 advantage baseline |
+| `global_step` | 一个动态多题 global batch，对应 1 次 `optimizer.step()` |
+| 每 step 题数 | 按 token/cost 动态决定；初始目标 2～4，允许 1 个超长题，第一阶段上限 8 |
+| global batch 边界 | 目标训练 token/cost、题目原子性、policy version 和题数上限共同决定 |
+| 默认 world slots | 4 个：healthy、local degradation、shared-family fault、change |
+| 额外异常 world realizations | 0～2 个 |
+| 每题基础轨迹数 `R` | 4～6 条 |
+| 每个 realization 的 policy group | 恰好选择 1 个决策节点；根节点或中途节点 |
+| 每个 group 的轨迹数 `K` | 4 或 8，包含 primary |
+| 每题 policy records | 最少 `4×4=16`，最多 `6×8=48` |
+| 每题进入训练次数 | 1 次；整题放入一个 global step，但一个 step 可包含多题 |
+| 递归分支 | 第一阶段禁止 branch child 再分支 |
 
-```text
-一个策略 advantage group
-    = 同一题目与文档
-    + 同一 latent world 实例
-    + 同一初始输入
-    + 同一决策前缀与 runtime 状态
-    + 多个不同的 on-policy action/continuation
-```
+这里的 `K=8` 表示 `1 primary + 7 children`，不是额外再加 8 条。固定两个 replicas 的旧机制删除；初始节点 branch 已覆盖完整轨迹 replicas 的功能。
 
-因此：
+## 2. 数据结构
 
-1. `replica` 不再作为独立的策略训练概念；
-2. 第一次策略动作之前的初始节点也是一个 branch node；
-3. 在初始节点生成 `1 primary + K-1 siblings`，就等价于过去所谓的 `K replicas`；
-4. 在工具调用后的节点生成 siblings，则是局部、共享前缀的分支比较；
-5. 两者统一使用 `decision_group_id` 和同一套优势计算；
-6. `trajectory_id` 仍保留用于追踪一条实际执行路径，但不决定谁与谁计算优势；
-7. 默认 group size 为 4；高信息节点可使用 8，例如 `1 primary + 7 children`；
-8. 不同 world、不同 world realization、不同分支位置的记录绝不能为了凑数量放进同一个优势组。
+### 2.1 World Realizations
 
-这在结构上与 shared-prefix、ARPO-like 的局部 rollout 思路相近。branch child 可以视为该决策节点下的一次 GRPO rollout，但不是一个新的原始题目。
-
-当前观测到的每题 36～52 条最终记录不必直接判定为异常。它可能由多个有效 branch events 产生；真正要检查的是这些记录是否组成了足够多的、严格同节点同 world、continuation 有真实差异且回报有信息的 sibling groups，以及它们消耗了多少生成 token。
-
-## 2. 为什么不再保留独立 Replica 概念
-
-### 2.1 过去两条 Replicas 能做什么
-
-同一 world 下的两条完整 replicas 并不是字面复制，而是从初始 prompt 独立采样两次完整策略路径。它们可以：
-
-- 提供完整 episode return 的两个样本；
-- 覆盖不同工具路径；
-- 在没有中途 branch 时产生一个非常小的相对 baseline；
-- 增加可供后续分支的父轨迹节点。
-
-但固定 `2 replicas/world` 有三个问题：
-
-1. 两条不足以满足本项目已验证的“至少 4 条才有稳定相对优势”要求；
-2. 两条从根部开始的完整轨迹会同时混入很多不同决策，credit assignment 较粗；
-3. 初始节点 branch 本身已经可以生成 4 或 8 条完整路径，再额外定义 replicas 是重复机制。
-
-### 2.2 统一后的等价关系
+每题固定创建四个默认 realizations：
 
 ```text
-旧表示：同一 world × 4 replicas
-
-新表示：同一 world 的初始 decision node
-        ├─ primary continuation
-        ├─ sibling 1
-        ├─ sibling 2
-        └─ sibling 3
+H: healthy
+L: local degradation
+F: shared-family fault
+C: abrupt/gradual change
 ```
 
-两者都从相同题目、输入和 world 状态开始。新表示的好处是：根节点和中间节点使用完全相同的分组、日志、预算与损失规则，不需要维护两套概念。
-
-如果一个 world root 没有任何节点被选中扩展为至少 4 个 siblings，则该根轨迹可以用于 reward、belief、Q、risk、world coverage 和评估，但不强行产生相对策略优势。不能用另一个 world 的轨迹补齐。
-
-## 3. 四类 World 与 Latent World Realization
-
-每道题默认保留 4 个 world slots，已经包含 healthy：
+三个异常 slots 合计最多再选择两个具体变体，而不是每个 slot 各加两个。例如 OCR 退化和 table parser 退化属于两个不同 `latent_world_id`，各自新增一条基础轨迹。
 
 ```text
-同一道题
-├─ H: healthy
-├─ L: local degradation
-│     └─ single-tool degradation 或 context degradation
-├─ F: shared-family fault
-└─ C: change world
-      └─ abrupt change 或 gradual change
+R = 1 + m_local + m_shared + m_change
+m_local, m_shared, m_change >= 1
+m_local + m_shared + m_change <= 5
+4 <= R <= 6
 ```
 
-每个 slot 默认选择 1 个具体 `latent_world_id`，所以最初只有 4 条 primary root trajectories，而不是 `4 worlds × 2 replicas = 8` 条。
+四类 world 固定不变；新增的是某一类别内的具体 realization，不是新增 world 类别。
 
-必须区分：
+### 2.2 统一 Decision Group
 
-- `world_slot`：H/L/F/C 这一大类；
-- `latent_world_id`：本次实际环境实例，包括目标工具/工具族、退化参数、context rule、变化时刻、schedule、session state 和环境随机状态；
-- `trajectory_id`：在该环境实例中执行的一条路径。
-
-例如，“降低 OCR 工具可用性”和“降低表格解析工具可用性”即使都属于 local degradation，也应是两个不同的 `latent_world_id`，各自新增一条 root，分别产生自己的 branch groups。它们不能互相计算优势。
-
-## 4. 统一的决策分组身份
-
-### 4.1 必须保存的身份层级
-
-```text
-episode_content_id
-  └─ question_id
-      └─ world_slot
-          └─ latent_world_id
-              └─ trajectory_id
-                  └─ decision_event_id
-                      └─ decision_prefix_hash / runtime_state_digest
-```
-
-字段含义：
-
-- `episode_content_id`：文档/图像、题目集合、prompt 与 tool schema 版本的稳定摘要；
-- `question_id`：当前问题的稳定 ID；
-- `latent_world_id`：完整的实际 world realization；
-- `trajectory_id`：一条实际执行路径的唯一 ID；
-- `decision_event_id`：一次明确的 sibling expansion；初始节点也有自己的 event ID；
-- `decision_prefix_hash`：动作发生前模型全部可见 token、图像和历史的摘要；
-- `runtime_state_digest`：工具调用序号、world schedule 进度、navigation state、预算和可见工具历史的摘要；
-- `rng_coupling_id`：保证 siblings 的环境随机性以可比方式耦合。
-
-`world_type` 或 `world_slot` 不能替代 `latent_world_id`。两个同为 abrupt change 的环境，如果目标工具或变化时刻不同，就不是同一个优势组。
-
-### 4.2 唯一的策略分组键
-
-根部和中途节点统一使用：
+根节点和中途节点统一为 `decision_event`：
 
 ```text
 decision_group_id = hash(
@@ -130,456 +60,426 @@ decision_group_id = hash(
     decision_event_id,
     decision_prefix_hash,
     runtime_state_digest,
+    rng_coupling_id,
     return_definition_version,
 )
 ```
 
-这个键不包含采样出的 action，也不包含 child trajectory ID，因此同一节点的不同 action 可以进入同一组。
+同一个 group 必须满足：
 
-初始节点的 `decision_prefix_hash` 就是实际初始多模态输入和 tool schema；中间节点则覆盖此前全部可见历史。不同节点即使来自同一题、同一 world，也必须有不同 group ID。
+- 同一题目、文档和初始多模态输入；
+- 同一 `latent_world_id`；
+- 同一决策前缀、工具历史、world schedule、剩余预算和 runtime 状态；
+- 4 或 8 次独立 on-policy continuations；
+- 相同 reward/utility、horizon 和 bootstrap 定义；
+- 没有 infra error 或 context overflow；模型自身协议失败可作为真实负样本；
+- 不允许从其他 world、其他节点或复制记录补齐。
 
-## 5. 策略优势如何计算
+初始节点 event 生成多条完整轨迹；中途节点 event 只训练分叉动作及后续 suffix，共享 prefix 必须 mask。
 
-### 5.1 Branch Event 是唯一的 Policy Advantage 单元
+## 3. 多题动态组成一个 Global Step
 
-对一个有效 sibling group：
+### 3.1 先完成题目级数据与权重
+
+每道题先独立完成：
+
+```text
+1. 使用同一 pi_old 选择并生成 4～6 个 world realizations
+2. 每个 realization 运行 primary trajectory 并保存候选节点
+3. 每个 realization 选择且只选择一个 decision node
+4. 从该节点补采 K-1 条 siblings，使 K=4 或 K=8
+5. 每个 decision group 内独立计算 advantage
+6. 预计算 group→variant→slot→question 的 loss weights
+7. 将整题放入对应 policy_version 的 ready-question queue
+```
+
+题目是优势和权重归一化原子，不再是 optimizer step 边界。不同题可以进入同一个 global step，但不能共用 advantage baseline。
+
+ready item 至少携带：
+
+```text
+question_id / policy_version
+16～48 条 records
+每条实际 text tokens、visual tokens、有效 loss tokens
+预估训练 cost
+每条 group/slot/question loss weight
+old_log_probs
+```
+
+### 3.2 Token/Cost-Aware Global Batch
+
+从同一 `policy_version` 的 ready queue 中选择多个完整问题，直到达到目标训练成本：
+
+```text
+target_global_train_cost
+questions_per_step_target = 2～4
+questions_per_step_max = 8
+```
+
+题目不能跨 global steps 拆开；单个超长题超过 target 时允许独占一个 step。固定 `global_batch_size=8` 不再决定更新边界，应拆成 `micro_batch_size_per_rank`、`max_tokens_per_microbatch` 和 `target_global_train_cost`。
+
+一个 global step 的流程为：
+
+```text
+1. 动态装入 Q 道完整问题
+2. 按实际训练 cost 将所有 records 分配到各数据并行 ranks
+3. 完成若干同步 microbatch rounds 和 gradient accumulation
+4. 对整个动态 global batch 只调用一次 optimizer.step()
+5. scheduler.step(); global_step += 1
+```
+
+一次遍历 1000 道有效题时：
+
+```text
+global_steps ≈ ceil(1000 / average_questions_per_step)
+```
+
+若平均每 step 为 2～4 题，则约 250～500 个 global steps。被跳过的无效题不进入 ready queue。
+
+### 3.3 避免某张卡成为 Straggler
+
+训练记录生成完成后长度已知，因此不用按样本条数平均分卡，而按校准后的实际 cost 分配：
+
+```text
+train_cost
+  = text_loss_tokens
+  + alpha * visual_tokens
+  + beta * sequence_overhead
+```
+
+执行以下调度：
+
+1. 将 records 或可打包 microbatches 按 cost 从大到小排序；
+2. 使用 longest-processing-time-first，把下一个任务分给当前累计 cost 最低的 rank；
+3. 相近长度/视觉 token 的序列优先做 sequence packing，减少 padding；
+4. 所有 ranks 必须执行相同数量的 backward collective rounds；负载较轻的 rank 在同一 round 放更多短序列；
+5. zero-loss dummy 只用于无法完全对齐的最后一个 round，并设置严格比例告警；
+6. 用实际 rank step time 和 collective wait 迭代校准 `alpha/beta`，不能长期只按 token 数静态估算；
+7. 极端长序列按长度 bucket 与其他长序列同轮分布，避免只让一个 rank 独占长样本。
+
+FSDP/Megatron 的 batch planner 必须生成全局一致的 round manifest，保证 collective 次序相同；每个 rank 可以处理不同题目的 records，但所有 loss weights 必须来自打包前已经验证的题目/group metadata。
+
+### 3.4 Rollout 侧并发
+
+- primary、candidate 和 branch continuation 放入连续批处理队列，不按整题串行等待；
+- 某条轨迹等待 OCR、解析或其他工具 I/O 时，推理 GPU 继续执行其他题/trajectory；
+- branch children 使用 batched shared-prefix generation；
+- ready-question queue 设置高低水位；调度同时考虑预计完成成本和等待年龄，禁止长题长期饥饿；
+- 不混用超出允许 policy lag 的数据；保留 `old_log_probs`、ratio、clip 和 KL 监控。
+
+### 3.5 吞吐自动调节顺序
+
+1. 先用短 profile 标定每 rank 的 `max_tokens_per_microbatch`，保留约 10% 显存余量；
+2. OOM 时降低单 microbatch token cap、增加 accumulation rounds，不先删 world/branch 数据；
+3. rank 时间差过大时，扩大可装箱的 ready-question 候选池、重新拟合 cost model，再调整长度 buckets；
+4. padding/dummy 比例高时优先改善 packing 和 round manifest；
+5. GPU 利用率低且显存有余量时，提高 per-rank token cap 或每 step 目标题数；
+6. policy lag、KL 或 clip fraction 超限时，降低 ready queue 年龄和每次 rollout 预生成题数，而不是降低同题 sibling 质量；
+7. 每次只调整一个维度并记录 GPU-hour、reward/ANLS 与负载指标，避免吞吐提升掩盖 RL 退化。
+
+## 4. 优势与分层 Loss
+
+### 4.1 Group 内优势
+
+每个 decision group 独立计算：
 
 ```text
 baseline_g = sum(weight_i * utility_i) / sum(weight_i)
 advantage_i = utility_i - baseline_g
 ```
 
-一个 group 必须同时满足：
+不同题目、world realizations、branch nodes 永不共用 baseline。
 
-- group size 至少为 4；
-- 默认 `K=4`，高价值节点可用 `K=8`；
-- 只有一个 question、document、initial input 和 latent world；
-- 只有一个 decision prefix 和 runtime state；
-- primary 与 children 使用相同的 return 定义、branch horizon 和 reward 版本；
-- 分支前的环境随机状态一致，分支后的随机性采用可复现的 coupled seeds；
-- 至少有 4 个有效 on-policy continuations；
-- K 条记录必须来自 K 次独立 on-policy sampling，不能直接复制 token/reward；
-- 优先获得不同 canonical actions；若首个 action 相同但后续 continuation 独立分化，仍是有效策略样本；
-- 若所有记录的 token、动作路径和 utility 都完全相同，则标记为 `degenerate_no_signal`，不靠复制数量制造更新；
-- infra error、context overflow 等基础设施无效样本先剔除；模型自身的真实协议失败可以作为负样本保留。
+### 4.2 分层权重
 
-`1 primary + 7 children = 8` 是有效的 GRPO sibling group，前提是这 8 条都从同一个决策节点出发。来自两个不同工具调用节点的 4+4 条轨迹是两个 group，不是一个 8 条 group。
-
-### 5.2 根部与中途 Branch 的区别
-
-- 根部 branch：从第一次策略动作前展开，得到多条完整 episode trajectories；它完全覆盖旧 replicas 的用途；
-- 中途 branch：共享已经发生的工具观察，只比较当前动作及后续 continuation，credit assignment 更精确；
-- 一个 primary trajectory 可以在多个不同节点产生 branch events，但每个 event 单独计算优势；
-- 初期不建议让 branch children 再递归产生 children，以免形成指数增长；后续只有在消融证明有收益时再开放受限递归。
-
-### 5.3 Policy Loss 应作用在哪些 Token
-
-中途 branch 的共享前缀不能因被复制多次而重复贡献策略梯度。每个 event 的 advantage 应绑定到：
-
-1. 该 event 选择的 action token；以及
-2. 需要训练时，该 action 后续的有效 continuation suffix。
-
-共享前缀必须 mask。若同一 primary trajectory 上有多个 branch events，应按各自 token span 写入 event-level advantage，不能复制一整条 parent sequence 并给它多个互相冲突的全序列 advantage。
-
-根部 branch 没有策略生成的共享前缀，因此可以把每条完整 continuation 作为该根部 event 的 rollout。
-
-### 5.4 明确禁止
-
-- 不同 latent world 放进同一 advantage group；
-- 不同题目、文档或初始输入放进同一 group；
-- 不同 branch locations 仅因题目相同而合并；
-- 用 optimizer batch 边界定义 advantage group；
-- 用旧的宽泛 `sibling_group_id`、`coupling_id` 或 batch index 静默 fallback；
-- 小于 4 条时用其他 world、其他节点或复制记录凑数；
-- 把 teacher/corrected trajectory 混入 on-policy GRPO baseline。
-
-optimizer batch 可以同时打包多个已经独立算好 advantage 的 groups。混合打包只影响吞吐，不改变优势比较对象。
-
-## 6. 36～52 条记录为什么可能合理
-
-设四个 slots 中实际选择的 latent world realizations 数分别为：
+增加 world variants 或把 `K=4` 升为 `K=8`，用于提高估计质量和动作覆盖，不能自动增加该 world 对模型的总权重。
 
 ```text
-m_H, m_L, m_F, m_C
+L_group(s,v) = mean(loss_i over K siblings)
+L_slot(s)    = mean(L_group(s,v) over variants in slot s)
+L_question   = sum(slot_weight_s * L_slot(s))
+L_step       = mean(L_question over Q packed questions)
 ```
 
-通常 `m_H=1`，三个异常 slot 默认也各为 1；如果 local world 同时选择 OCR 和 table 两种退化目标，则 `m_L=2`。
+默认四个 slots 的 `slot_weight_s=0.25`。如果 curriculum 改变权重，必须显式配置并记录，不能由某类 world 生成更多记录而隐式改变。
 
-总 root 数为：
+分布式 ranks 可以承担不同数量的 records，但禁止每个 rank 先求 `local mean loss` 再 all-reduce。每条记录必须在装箱前得到全局 group/slot/question 权重；各 rank 只累计 weighted loss sum，并使用同一个 global normalizer。若后端默认对 rank gradients 求平均，需要补偿 data-parallel world size，确保结果与单进程计算同一 `L_step` 数值等价。
 
-```text
-R = m_H + m_L + m_F + m_C
-```
+该结构保证：
 
-对第 `e` 个 branch event，令 `K_e` 是该 event 的 sibling group size，已经包含 primary。每个 event 只新增 `K_e-1` 条 continuation records，因此：
+- `K=8` 不会天然获得 `K=4` 的两倍梯度权重；
+- 一个 slot 增加多个 fault targets 不会挤占其他 slot；
+- 一题有更多 records、另一题更短时，两题在 `L_step` 中仍然等权；
+- 多个题和 microbatches 累计后，一个 global batch 只更新一次；
+- world 改变动作相对优劣的信号保留，world 整体不可控难度偏移不会污染 baseline。
 
-```text
-N_final = R + Σ_e (K_e - 1)
-```
+## 5. 多基础轨迹如何选择
 
-这比 `n1 + w1*n2 + ...` 更精确，因为它把“新增 world realization”和“同一 world 内新增 branch siblings”分开了。
+### 5.1 四条必选轨迹
 
-例子：
+每题必须包含 healthy、local、shared-family、change 各一个 realization。异常参数必须在 rollout 前确定，禁止依据当题答案、答案页面、最终 reward 或失败结果事后选择。
 
-```text
-4 个默认 world roots
-+ 每个 root 在初始节点形成 8-sibling group
-= 4 + 4 × (8 - 1)
-= 32 条最终记录
-```
+### 5.2 额外 0～2 条轨迹
 
-再给一个异常 slot 增加 1 个 world variant，并在它上面形成 4-sibling group：
-
-```text
-32 + 1 root + 3 children = 36 条
-```
-
-52 条也可以由合法的多个 4/8-sibling events 组成。例如 6 个 world realizations、4 个 8-sibling events 和 6 个 4-sibling events：
-
-```text
-6 + 4 × 7 + 6 × 3 = 52
-```
-
-所以 36～52 不是仅凭数量就能判定错误。不过 52 条意味着该题获得了很多 branch 预算，必须证明这些 event 都有信息价值；它不应在 `branch_probability=1.0`、负 regret threshold 下无差别成为每题默认值。
-
-还必须把最终 records 与真实 inference cost 分开统计。为了得到 4/8 个不重复 action，模型可能生成并丢弃额外候选；这些请求不出现在 `.pt` 的最终记录数里，却仍消耗 GPU 时间和 token。
-
-## 7. 异常 World Realization 如何选择
-
-### 7.1 选择原则
-
-world 必须在策略执行前确定，不能根据正确答案、答案页面、最终 reward 或某条轨迹失败后再事后挑选。候选只使用公开任务输入、tool schema、历史覆盖统计和过去 rollout 的聚合学习信号。
-
-每个候选 world variant 可使用下列分数：
+从异常候选中按以下分数选择：
 
 ```text
 world_score
-  = α × task/tool relevance
-  + β × rolling coverage deficit
-  + γ × historical learning progress
-  + δ × model/belief uncertainty on this fault family
-  + η × recoverability and diagnostic value
-  + ε × seeded exploration bonus
-  - λ × duplicate similarity
-  - μ × estimated generation/tool cost
+  = task/tool relevance
+  + rolling coverage deficit
+  + historical learning progress
+  + historical uncertainty/calibration gap
+  + recoverability and diagnostic value
+  + seeded exploration bonus
+  - duplicate similarity
+  - estimated tool/generation cost
 ```
 
-推荐流程：
+选择要求：
 
-1. healthy 固定 1 个 realization；
-2. local slot 先从当前任务可能使用的工具或 context route 中选择 1 个目标；
-3. shared-family slot 选择与任务相关、且 rolling coverage 不足的工具族；
-4. change slot 预先选择目标与 change schedule，保证轨迹中有机会看到 change 前后的动作；
-5. 每个异常 slot 默认只选 1 个 realization；
-6. 只有当另一个目标同时具有较高相关性、覆盖缺口和可学习性，并且仍有 token 预算时，才增加第二个 realization；
-7. 初始实现建议每题最多增加 2 个额外异常 realizations，之后根据消融结果调整；
-8. 保留一小部分固定种子的探索配额，防止 Q/belief 只选择当前已经熟悉的 fault；
-9. 记录候选集合、选择分数、采样概率和原因，便于审计 curriculum 偏差。
+- 目标工具或工具族与题目可能的解题路线相关；
+- 优先补足近期欠采样的 tool/fault family；
+- 优先仍有可学习改善、而不是长期不可解的 fault；
+- 至少保留一部分固定种子随机探索，避免被当前 Q/belief 错误锁死；
+- OCR 后端缺失、工具服务崩溃等 infra 问题不得作为训练 fault；
+- 记录候选集合、得分、采样概率和最终选择原因。
 
-不同 degraded tool、family 或 schedule 是不同 worlds，只能各自在自己的分支节点内计算优势。它们之间的同题对照用于 robustness、belief、switch 和评估，而不是普通 GRPO baseline。
+`R` 的最终平均值不预先写死。只允许在 4～6 内通过消融调参；不能为了增加 RL 数据默认总取 6，也不能长期只取 4 而使重要 fault targets 覆盖不足。
 
-### 7.2 防止无效 World 堆叠
+## 6. 每条基础轨迹如何选择分支节点
 
-以下情况不应继续增加 realization：
+### 6.1 候选节点
 
-- 目标工具与题目路线明显无关；
-- 该 fault 使任务几乎必然不可解，长期没有学习进展；
-- 失败来自 OCR 后端缺失、服务崩溃、协议适配错误等基础设施问题；
-- 新 variant 与已选 variant 的可见效果几乎相同；
-- 只是因为该 world reward 低就持续过采样；
-- 已达到题目级 generated-token 或 walltime 预算。
+每个 world realization 先运行 primary trajectory，并保存：
 
-## 8. Branch 节点与 Group Size 如何选择
+- 初始策略动作前的根节点；
+- 有效工具观察后的动作节点；
+- retry、换工具、probe、answer、reopen、abstain 等关键决策节点；
+- change world 中疑似状态变化前后的节点。
 
-### 8.1 先运行 Primary，再选择值得展开的节点
+每个 realization 最终只选择一个节点。没有合格中途节点时回退根节点，因此 replicas 不需要独立实现。
 
-对每个 world realization 先执行 1 条 primary path，同时保存可恢复 checkpoint。初始节点天然也是候选 checkpoint。沿途节点只保存允许在策略时可见的信息，不能使用 ground-truth answer 参与选择。
+### 6.2 节点评分
 
-候选节点至少满足：
+节点只能使用策略在线可见的信息评分：
 
-- 有可恢复的完整模型、工具、navigation、world schedule 和 RNG 状态；
+```text
+branch_score
+  = policy/Bayes action disagreement
+  + belief entropy or change probability
+  + Q uncertainty or small top-Q gap
+  + expected decision regret
+  + positive DVOI
+  + answer/tool risk
+  + action/state coverage novelty
+  + remaining recoverable reward
+  - continuation token cost
+  - repeated-prefix penalty
+```
+
+选择得分最高且满足以下条件的节点：
+
+- runtime checkpoint 可完整恢复；
 - 剩余工具预算和 continuation horizon 足够；
-- 没有 infra error、context overflow 或不可恢复协议错误；
-- 能从当前策略得到至少 4 个有效 on-policy continuations；
-- 优先存在多个不同 canonical actions，或至少能在后续 continuation 中形成真实策略分化；
-- 不会因已知确定性约束导致所有 siblings 完全相同。
+- 至少可以获得 4 条独立有效 continuations；
+- 不使用 hidden world label、ground-truth answer 或事后真实 reward 选节点；
+- 分支后所有 siblings 继承相同的分支前 world/runtime 状态。
 
-### 8.2 节点信息分数
+## 7. K=4 与 K=8 的选择和调参
 
-```text
-branch_priority
-  = α × policy/Bayes action disagreement
-  + β × belief posterior entropy or change probability
-  + γ × Q predictive uncertainty
-  + δ × expected decision regret
-  + η × positive DVOI
-  + κ × state/action coverage novelty
-  + ρ × remaining recoverable reward
-  - λ × estimated continuation token cost
-  - μ × duplicate-prefix overrepresentation
-```
+### 7.1 基本规则
 
-从候选节点中按题目级预算选择 top events，而不是对每个 turn 独立使用 `probability=1.0`。初始节点可在以下情况优先：
+- `K=4` 是每个 realization 的硬下限；
+- `K=8` 用于高不确定、高动作价值差异或高诊断价值节点；
+- K 条记录必须是独立 on-policy samples，不能复制 token/reward；
+- 不强制首个 canonical action 有 K 种，但必须监控完整轨迹去重率、动作多样性和 utility 方差；
+- 完全相同且零方差的 siblings 标记为 `degenerate_no_signal`；在固定重采样上限后仍退化时，该 group 贡献零 policy loss，但其他有效 groups 仍可完成该题更新；
+- 更多有效、独立且有回报差异的 siblings 通常降低优势方差并改善探索；重复、低质量或错误 bootstrap 的 siblings 只增加成本，不能假定越多越好。
 
-- 希望比较完整的不同工具路线；
-- 当前 world 在近期缺少有效 policy groups；
-- 中途没有任何合格节点；
-- 历史上该题型的首个工具选择不稳定。
+### 7.2 防止 K=8 太少
 
-中途节点可在以下情况优先：
-
-- 已有真实工具观察后，模型对工具可靠性判断不确定；
-- 是否重试、换工具、探测、停止或作答是关键决策；
-- Q top actions 接近或 policy 与 Bayes action 不一致；
-- change world 中出现疑似状态变化。
-
-### 8.3 K=4 与 K=8
-
-- `K=4`：默认最低成本配置，满足至少 4 条的有效优势要求；
-- `K=8`：只给最高信息节点、动作空间确实丰富或不确定性很高的 event；
-- 候选应由当前策略以可记录 log-prob 的方式采样，使用不同可复现 seeds；
-- 合法 schema 约束可以过滤无效格式，但不能把 teacher action 冒充 on-policy sibling；
-- 若一次有上限的 batched sampling 后仍不足 4 个有效 continuations，该 event 只用于 Q/risk 诊断，不进入 policy advantage；
-- 优先给 continuation 足够工具预算，以获得完整证据链，而不是只生成大量极短、同质化 children。
-
-“至少 4 条”指至少 4 次独立的 on-policy continuation，并不要求第一个 canonical action 必须恰好有 4 种。强行凑 4 种首动作可能把人工候选变成 off-policy 数据。相同首动作但后续采样路径不同的轨迹仍可用于 suffix-level GRPO；只是 action diversity、完整轨迹去重率和 utility 方差必须单独监控。完全复制的记录不提供新信息。
-
-### 8.4 Return 的可比性
-
-最理想的 branch sibling utility 是运行到自然终止后的真实 task/evidence/tool utility。
-
-如果为了成本只运行固定短 horizon，则所有 siblings 必须使用相同 horizon，并可用一个冻结或慢更新的 target-Q 做一致 bootstrap。此类 `bootstrapped_branch_advantage` 必须单独标记和报告，不能与 terminal-return group 混在一起；在可承受时，策略优势优先使用 realized terminal return，减少 Q 估计偏差自我强化。
-
-## 9. Belief、置信度、Q、DVOI 与 Risk 分别做什么
-
-它们不是用来把不同 world 的 reward 强行拉到同一尺度，而是帮助 agent 在看不到真实 world 标签时做决策，并把分支预算放在最有信息的位置。
+第一轮调参使用以下约束：
 
 ```text
-可见工具观察
-    ↓
-belief：推断当前可能处于什么工具/world 状态
-    ↓
-Q：估计在这些可能状态下，各候选动作的未来效用
-    ↓
-confidence / DVOI / risk：判断是否可信、是否值得再探测、是否该继续或作答
-    ↓
-选择 primary action 与值得展开的 branch node
-    ↓
-siblings 的真实回报
-    ├─ 形成同节点 GRPO advantage
-    └─ 反过来监督 Q、belief calibration 与 risk
+K8 target ratio: 50% of eligible decision groups
+K8 rolling floor: 25% over the latest 100 valid groups
+K8 hard ceiling: 100%
 ```
 
-| 量 | 含义 | 直接用途 | 不应该做什么 |
-|---|---|---|---|
-| Belief posterior | 根据可见历史，对 hidden tool availability、semantic accuracy、structure fidelity、family fault、regime/change state 的概率分布 | 判断哪个工具可能失效、是否发生共享故障或状态变化 | 不能把模拟器真实 world 标签直接暴露给策略 |
-| Posterior entropy | 对当前 world/tool 状态有多不确定 | 高熵节点优先探测或分支 | 不是最终 reward |
-| Action consensus | 在多个 posterior world particles 下，有多少比例选择同一动作 | 判断动作是否稳健；低 consensus 时增加 branch 价值 | 不能替代真实 sibling return |
-| OOD score | 当前 belief/state 是否超出训练支持范围 | 降低盲目信心、触发保守策略或额外探测 | 不能把所有低奖励都解释为 OOD |
-| Bayes Q(b,a) | 给定 belief、候选动作和剩余预算时的期望未来 utility，并可输出方差 | 动作排序、branch 节点选择、短 horizon bootstrap、Q auxiliary training | 不作为跨 world GRPO baseline；也不等同于 PPO critic |
-| DVOI | 再调用一次诊断工具带来的期望决策收益减去成本 | 决定是否值得 probe/retry/换工具 | DVOI≤0 时不应无限调用工具 |
-| Answer risk | 当前答案缺证据或错误的校准概率 | answer、continue、reopen、abstain 的门控 | 不能只看语言模型口头自信 |
-| Realized utility | siblings 实际得到的任务、证据、工具纪律与成本综合回报 | 计算同节点策略 advantage，并监督 Q/risk | 不能跨 latent world 直接求简单均值 baseline |
+低于 rolling floor 时，提高高分候选获得 K=8 的优先级，但不能用复制或明显退化的 group 强行补配额。最终比例通过消融确定，不以 25% 或 50% 作为不可修改常数。
 
-### 9.1 Q 的训练与防止自我强化
+### 7.3 分阶段调参
 
-Q 主要回答：“在当前 belief 和预算下，选这个工具动作后，预计最终能得到多少 utility？”branch siblings 提供同一状态下多个动作的 realized targets，因此是很好的 Q 监督。
+在相同原始题目和尽可能相近的 generation-token 预算下进行：
 
-但如果永远只在 Q 认为有价值的节点分支，Q 的早期错误可能让系统看不到其他动作。为此需要：
+1. 固定 `R=4`，比较 K8 比例约 25%、50%、75%；
+2. 采用最佳 K8 策略，比较 `R=4/5/6`；
+3. 在最佳区域微调 world/branch score threshold；
+4. 固定数据生成配置，比较每 global step 目标 2/4/8 题及不同 token-cost budgets；
+5. 用独立验证集选择配置，不使用训练 reward 直接定最终参数。
 
-- 固定比例的 seeded random exploration events；
-- 记录 selection propensity；
-- 使用慢更新/target Q 做 bootstrap；
-- 分别报告 Q calibration、ranking accuracy 和真实 return；
-- 定期在固定节点集上做不依赖 Q 的 4/8-way branch audit；
-- policy advantage 以 realized sibling utility 为主，不直接把 Q 预测当作真值。
-
-hidden world label 可以离线监督 belief/Q auxiliary heads，但不能进入模型 prompt、在线 action 选择输入或策略 advantage group key 之外的可见特征。
-
-## 10. 样本量与计算预算判断
-
-### 10.1 哪部分合理，哪部分应削减
-
-结论调整为：
-
-- 每题固定 4 个 world roots（healthy + 3 abnormal slots）具有明确的对照与覆盖价值，数量合理；
-- 固定 `2 replicas/world` 应删除，因为根部 branch 已经覆盖它，且 2 条本身不足以形成可靠的四样本优势；
-- 每题 36～52 条最终 records 可能合理，但只能是由高价值 branch events 产生的结果，不能把它当成固定目标；
-- 当前 `branch_probability=1.0`、`decision_regret_threshold=-1.0` 容易让低价值节点也展开，需要改为 score + token budget；
-- 最重要的成本指标不是 records 数，而是“每个有效、非退化 advantage group 消耗的 generated tokens/GPU 秒”。
-
-### 10.2 推荐的初始预算形态
-
-不先把平均记录数写死为 5 或 6。先以统一分支结构做小规模消融：
-
-1. 每题固定 4 个 primary world roots；
-2. 每个 branch event `K=4` 起步；
-3. 只对最高信息节点自适应升到 `K=8`；
-4. 每题默认不超过 2 个额外 world realizations；
-5. 分支一直扩展到题目级 generation-token budget 用尽，或下一 event 的预计边际信息收益低于阈值；
-6. 初期禁止 branch-child 递归分支；
-7. 36～52 条可作为难题/高信息题的允许区间或软上限，但不要求每题达到；
-8. 简单题、动作已经一致或 reward 无方差的题应明显低于该数量。
-
-建议对相同总 generation-token 预算比较：
+选择目标按优先级为：
 
 ```text
-A. 4 roots + 只在根部做 K=4
-B. 4 roots + top-node K=4，少量 K=8
-C. 4 roots + 自适应额外 world variants + top-node K=4/8
-D. 当前 4 worlds × 2 replicas + aggressive branch（诊断基线）
+RL有效性：nonzero advantage、reward、ANLS、完成率、恢复能力
+估计质量：utility variance、Q ranking/calibration、risk calibration
+样本质量：独立轨迹率、动作多样性、协议正确率
+效率：reward/ANLS gain per GPU-hour、generated tokens per valid group
 ```
 
-最终选择每 GPU 小时 reward/ANLS 提升最高、有效 advantage 最多且 Q calibration 改善的配置，而不是 records 最多的配置。
+最终配置必须同时满足最低信号和计算预算；不能只追求最少记录，也不能只追求最多 records。
 
-### 10.3 必须监控的边际价值
+## 8. Belief、Q、DVOI 与 Risk 的实现职责
+
+| 模块 | 在线职责 | 训练职责 |
+|---|---|---|
+| Belief posterior | 根据可见工具观察推断工具质量、family fault 和 change state | 用合法 world/event supervision 做 filtering/calibration |
+| Confidence/entropy/consensus/OOD | 判断状态与动作有多不确定 | 选择 branch 强度并报告校准 |
+| Bayes Q | 估计 belief、动作和预算条件下的未来 utility | 排序动作、选择节点；用 sibling realized returns 监督 |
+| DVOI | 判断额外 probe/retry 的预期收益是否超过成本 | 监督信息获取决策 |
+| Risk | 决定 answer、continue、reopen 或 abstain | 用答案正确性与证据充分性校准 |
+
+这些量既参与 world/branch 选择，也服务 agent 在线决策和辅助训练。它们不能替代 realized utility 计算普通 GRPO advantage；hidden world label 不能进入模型可见输入。
+
+## 9. 失败与回退
+
+1. 中途节点无法得到 4 条有效 siblings：回退根节点并有界重采样；
+2. 同一 world 的 infra-invalid 轨迹：只允许在同一 `latent_world_id` 下重试；
+3. 任一 realization 在根节点有界重试后仍不足 4 条有效记录：整题标记 `question_skipped`，不进入 ready queue；
+4. 模型自身协议错误：保留为负样本，除非整组都无法形成可训练 token；
+5. 不允许其他 world、其他题目、zero-loss dummy 或复制轨迹补足 policy group；
+6. dummy 只用于分布式 shape 对齐，必须保持 zero loss 且不计入 K。
+7. 如果所有 groups 都是 `degenerate_no_signal` 或题目总梯度为零，则该题不进入 global batch。
+
+## 10. 必须记录的指标
+
+每题输出：
 
 ```text
-valid_decision_group_rate
-decision_group_size_histogram
-distinct_canonical_action_count
-nonzero_return_variance_group_rate
-nonzero_advantage_group_rate
-generated_tokens_per_valid_group
-generated_tokens_per_nonzero_advantage
-walltime_per_valid_group
-reward_gain_per_1k_generated_tokens
-ANLS_gain_per_GPU_hour
-Q_ranking_gain_per_1k_generated_tokens
+question_id
+policy_version
+world_realization_count
+world_variant_count_by_slot
+decision_group_count
+root_vs_mid_branch_count
+group_size_histogram_4_8
+k8_ratio_rolling
+candidate_generation_count
+valid_independent_trajectory_count
+trajectory_dedup_rate
+canonical_action_diversity
+utility_variance_by_group
+nonzero_advantage_group_count
+generated_tokens_by_group
+question_policy_loss
+kl / clip_fraction
+tool_error / infra_error / protocol_error / context_overflow
+belief / Q / risk losses and calibration
+ready_queue_wait_ms
 ```
 
-如果新增 branch 主要产生重复动作、相同 reward、协议错误或无效短轨迹，即使最终记录数看似很多，也应削减。
+每个 global step 输出：
 
-## 11. 计划中的代码修改步骤
+```text
+global_step_before / global_step_after
+optimizer_step_call_count
+questions_in_step
+question_ids_hash
+policy_version / policy_lag
+records_in_step
+train_tokens_in_step
+microbatch_round_count
+records / tokens / estimated_cost per rank
+rank_forward_backward_time_ms
+rank_collective_wait_ms
+rank_cost_imbalance_ratio
+padding_token_ratio
+zero_loss_dummy_ratio
+GPU utilization / peak memory per rank
+step_policy_loss / grad_norm
+weight_sync_status
+```
 
-本节仅规划，当前不执行代码改动。
+强制 invariant：
 
-### M1：统一身份与分组
+```text
+4 <= world_realization_count <= 6
+decision_group_count == world_realization_count
+all policy group sizes in {4, 8}
+total policy records <= 48
+each valid question appears in exactly one global step
+1 <= questions_in_step <= configured_questions_per_step_max
+records_in_step <= 48 * questions_in_step <= 384
+all questions in a step share one policy_version
+step policy_lag <= configured maximum
+optimizer_step_call_count == 1
+global_step_after - global_step_before == 1
+all ranks execute identical backward collective round count
+cross_question_advantage_group_count == 0
+cross_latent_world_advantage_group_count == 0
+cross_prefix_advantage_group_count == 0
+```
 
-1. 增加规范化的 `decision_group_id` 构造器；
-2. 初始节点与中途节点使用同一 namespace；
-3. 移除 replica 对 policy grouping 的语义，旧 `replica_id` 只保留为兼容/诊断字段；
-4. rollout、FSDP、Megatron 只消费已验证的 canonical group ID；
-5. 缺少关键身份字段时 hard fail，不允许 fallback 到 batch index。
+第一阶段效率目标：`max_rank_step_time / mean_rank_step_time <= 1.10`、`zero_loss_dummy_ratio <= 2%`、`padding_token_ratio <= 15%`、collective wait 不超过 step walltime 的 10%。若未达到，先调整 cost model、长度 buckets、装箱和每 step 题数，不通过减少有效 world/branch 数据掩盖调度问题。
 
-### M2：四 World Root 与 Variant Sampler
+## 11. 实现与测试清单
 
-1. 每题建立 H/L/F/C 四个默认 roots；
-2. 每 slot 默认选择一个 latent world realization；
-3. 按相关性、覆盖缺口、学习进展、探索与成本选择异常目标；
-4. extra variants 各自建立新 root 和新 latent world ID；
-5. 记录候选、得分、采样概率和固定 seed；
-6. 禁止使用答案或当次最终 reward 选择 world。
+### M1：数据生成
 
-### M3：统一 Checkpoint 与 Branch Sampler
+- 删除固定 replicas 调度；
+- 固定四个 world roots，增加 0～2 个可审计 variants；
+- 每个 realization 保存根节点和中途 checkpoint；
+- 每个 realization 只选择一个 branch event；
+- 生成 K=4/8 并执行全部身份校验；
+- 保证每题记录总数不超过 48。
 
-1. 初始节点也创建可恢复 checkpoint；
-2. primary path 中保存合格中间节点的完整 runtime digest；
-3. 用允许的 online features 计算 branch priority；
-4. 在题目级 token budget 下选择 top events；
-5. 一次 batched sampling 生成 4 个或 8 个有效 on-policy continuations；
-6. children 继承相同 latent world 和分支前 runtime；
-7. 初期禁止递归 branch expansion。
+### M2：优势与训练
 
-### M4：Event-Level Advantage 与 Loss Mask
+- 每个 decision group 独立计算 advantage；
+- 实现 group→variant→slot→question→global-step 分层平均；
+- 支持可变数量 sequence microbatches；
+- 实现按 policy version 分区的 ready-question queue；
+- 实现 token/cost-aware 多题 global-batch planner；
+- 实现 LPT rank 分配、长度 buckets、packing 和全局一致 round manifest；
+- 同一 global step 可以跨题分配 records，但 advantage group identity 不变；
+- 使用预计算全局 loss weights/sum 和 global normalizer，禁止 rank-local mean 改变目标；
+- 一个动态 global batch 全部 backward 后只调用一次 `optimizer.step()`、scheduler step 和 global-step increment；
+- K4/K8、extra variants 不改变题目总 loss scale；
+- 保留 old log-probs、ratio、clip 和 KL 监控。
 
-1. 只在 group size≥4 且 invariant 全部通过时计算 advantage；
-2. 每个 branch event 独立求 baseline；
-3. 中途分支只给 action/suffix token span 写 policy advantage；
-4. 共享 prefix mask，不因 siblings 数量重复训练；
-5. 多 event parent 使用各自 span，不复制全序列冲突 advantage；
-6. optimizer packing 在 advantage 计算后进行，与分组彻底解耦。
+### M3：自动选择与调参
 
-### M5：隔离 Auxiliary Objectives
+- 实现 world score、branch score 和固定种子探索；
+- 实现 K8 rolling target/floor；
+- 实现题目级 token/walltime budget；
+- 运行 R、K8 比例和动态 global-batch cost 的分阶段消融；
+- 自动标定 per-rank microbatch token cap 和 text/vision cost model；
+- 比较每 step 目标 2/4/8 题及 token-cost budgets，选择每 GPU 小时收益最高且 policy lag 合格的配置；
+- 将最终参数写入唯一配置入口和 run manifest。
 
-1. belief、Q、DVOI、risk、switch 和 pre-invariance 使用各自数据键；
-2. 小于 4 条的 event 可用于 Q/risk 诊断，但不进入策略 advantage；
-3. cross-world pairs 只进入明确建模 world 差异的 auxiliary loss；
-4. Q bootstrap 与 terminal-return advantage 分开标记；
-5. 分别报告 policy 与 auxiliary 的样本数、loss 和梯度贡献。
+### M4：单元与集成测试
 
-### M6：预算与日志
+- `R=4,K=4` 的单题得到 16 条，`R=6,K=8` 得到 48 条；
+- 一个 global step 可同时包含多个不同题目，但每个 advantage group 的 `question_id` 唯一；
+- 同一组题以完整 batch 与多 rank/microbatch 累计执行时，最终梯度在容差内一致；
+- ranks 记录数不等时，分布式 weighted-sum 梯度仍与单进程 `L_step` 一致；
+- 任意 rank 的 backward collective round 数不一致时 hard fail；
+- LPT/token-cost planner 相比按记录数 round-robin 显著降低 rank step-time imbalance；
+- K4/K8、长短题混合和不同题数都只触发一次 optimizer update；
+- 同一题不会跨两个 global steps 重复训练；
+- K8 group 与 K4 group 的总权重相同；
+- 同 slot 增加 variant 不改变该 slot 总权重；
+- 每题在 global-step loss 中等权，不因 records/token 更多而自然增权；
+- 不同 world、prefix、题目无法混组；
+- 不足 4 条时执行根节点回退，仍失败则该题不进入 ready queue；
+- FSDP/Megatron 的 loss、global step 和权重同步一致。
 
-1. 记录 roots、world variants、candidate attempts、branch events、children 和 generated tokens；
-2. 题目级预算在生成前检查，超限即停止扩展；
-3. 不采用“先生成再丢弃”控制成本；
-4. 记录 branch/world selection propensity；
-5. 输出每种 world、每类 branch location 和 K=4/K=8 的独立收益。
+## 12. 训练运行约束
 
-## 12. 必须增加的测试
-
-### 12.1 身份与分组测试
-
-- 初始节点的 4 条 continuations 得到同一个 decision group ID；
-- 同题同 world、不同中间 prefix 得到不同 group ID；
-- 同一 `world_slot`、不同 `latent_world_id` 得到不同 group ID；
-- 同 prefix、不同 runtime schedule state 得到不同 group ID；
-- 同 event 的 primary/children 继承完全相同的分支前 runtime digest；
-- 不同题目、文档、tool schema 或 reward version 不可同组；
-- 缺失关键 ID 明确拒绝，不触发旧 fallback。
-
-### 12.2 数值与 Loss 测试
-
-- 4/8-way group 的 advantage 加权和接近 0；
-- 向另一个 world 增加样本不改变原 group advantage；
-- 改变 optimizer batch size 或样本顺序不改变逐 event advantage；
-- FSDP 与 Megatron 输出一致；
-- 小于 4 条的 event 不产生 policy loss；
-- 中途 branch 的共享 prefix loss mask 全为 0；
-- 多 branch-event parent 的各 token span 只消费所属 event advantage；
-- root branch 的结果与等价旧 4-replica 数值构造一致。
-
-### 12.3 World 与 Branch Sampler 测试
-
-- 每题默认正好建立 H/L/F/C 四个 roots；
-- extra abnormal target 产生新的 latent world/root，不加入旧组；
-- world selection 不读取 answer、answer page 或当次最终 reward；
-- branch selection 不读取模拟器 hidden world label；
-- K=4/K=8 candidates 都来自独立采样，并报告 canonical action diversity、完整轨迹去重率和 utility 方差；
-- fixed seed 可复现 world、node 和 action selection；
-- token budget 在生成前生效；
-- 记录数满足 `N_final = R + Σ(K_e-1)`；
-- candidate attempts 和 generated tokens 单独统计，不被最终记录数掩盖。
-
-### 12.4 真实 Rollout 验收
-
-对固定题目集同时运行 4 类 world：
-
-- `cross_content_group_count == 0`；
-- `cross_question_group_count == 0`；
-- `cross_latent_world_group_count == 0`；
-- `cross_prefix_group_count == 0`；
-- `undersized_policy_group_count == 0`；
-- 所有 policy groups 至少有 4 条独立有效 continuations，且不存在人工复制记录；
-- terminal 与 bootstrapped groups 分开；
-- branch 事件、belief/Q/reward 事件持续产生；
-- policy loss、非零梯度与权重同步正常；
-- 四类 world 的 reward、ANLS、completion、tool success 和恢复能力分别报告。
-
-## 13. 旧 Rollout 与当前训练的处理
-
-已观察的 rollout 3 有 72 条有效记录、2 道原始题和 7 个宽泛 advantage groups，部分大组混入多个 `world_id`。因此旧 run 可以证明生成、loss、梯度和权重同步链路在工作，但不能证明策略优势已经满足严格同 world/same-node 要求。
-
-处理原则：
-
-1. 当前运行中的训练进程不在本规划阶段停止、覆盖或重启；
-2. 保留现有日志、rollout 和 checkpoint，标记为 grouping diagnostic baseline；
-3. 旧 rollout 不进入修复后的严格策略 replay；
-4. 实现修复后从未受错误跨 world policy gradient 污染的基础/Stage-A checkpoint 启动；
-5. 先做固定种子小规模消融，再决定完整训练的 K、extra-world 和 token budgets；
-6. 最终 200 题评估使用固定 world 分布和最终 checkpoint，不让 eval 数据进入 optimizer。
-
-## 14. 完成定义
-
-只有同时满足以下条件，方案实施后才算完成：
-
-1. replica 不再是独立 policy grouping 机制，根部与中途节点统一为 decision events；
-2. 任一 policy advantage group 只含一个 question、latent world、prefix 和 runtime state；
-3. 所有 policy groups 至少有 4 个有效 on-policy siblings；
-4. 不同 branch locations、world variants 和题目无法静默混组；
-5. 中途分支只训练对应 action/suffix，共享 prefix 不重复贡献 loss；
-6. 四个 world slots 正常覆盖并分别发挥 healthy 对照、local fault、shared fault 和 change adaptation 的作用；
-7. belief/Q/DVOI/risk 的输入不泄露 hidden world/答案，并有独立校准指标；
-8. 36～52 条等较大展开只在高信息题上出现，且 generated-token 边际收益可解释；
-9. 与当前 aggressive baseline 相比，在相同 generation-token/GPU-hour 下 reward、ANLS 或恢复能力有稳定提升；
-10. FSDP/Megatron、checkpoint、权重同步和最终评估全链路通过。
+- 同时记录 `global_step`、`questions_seen` 和 `train_tokens_seen`；optimizer/scheduler 按 global step，数据覆盖与 epoch 按 questions seen；
+- checkpoint 不按每题保存；默认每处理 100 道有效题保存一次，不受动态每-step题数改变；
+- 只保留最近 2 个 checkpoint 和最佳验证 checkpoint，保留策略必须在删除前验证目标路径；
+- eval 与 checkpoint interval 分开配置；
+- 完整训练前先运行固定种子的短测试，验证单题 16～48 条上限、多题动态 global batch、四类 world、branch、belief/Q/risk、负载均衡、loss、梯度和权重同步；
+- 完整训练和最终 200 题评估使用固定 manifest，评估数据不进入 optimizer；
+- 当前正在运行的旧训练不在本规划阶段停止或覆盖，修复后的新训练从干净 checkpoint 启动。
