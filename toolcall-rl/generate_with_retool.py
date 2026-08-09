@@ -3927,6 +3927,181 @@ def _merge_multimodal_train_inputs(chunks: list[dict[str, Any]]) -> dict[str, An
     return merged or None
 
 
+def _resolve_training_sequence_limit(args: Any) -> int:
+    """Return the hard sequence limit used by the VLM actor during training.
+
+    The generation context is compacted independently from the training
+    trajectory.  Without an explicit training limit, a successful multi-turn
+    tool rollout can retain every observation and grow well beyond the
+    inference context, making one dynamic microbatch require more memory than
+    an 80-GiB GPU has.  Keep the real-data default conservative and allow an
+    explicit override for experiments that have a larger memory budget.
+    """
+
+    configured = os.environ.get("OPENCLAW_BAYESTOOL_MAX_TRAIN_SEQUENCE_LENGTH")
+    if configured:
+        try:
+            value = int(configured)
+        except ValueError as exc:
+            raise ValueError(
+                "OPENCLAW_BAYESTOOL_MAX_TRAIN_SEQUENCE_LENGTH must be an integer"
+            ) from exc
+        if value <= 0:
+            raise ValueError("OPENCLAW_BAYESTOOL_MAX_TRAIN_SEQUENCE_LENGTH must be positive")
+        return value
+
+    rollout_context = getattr(args, "rollout_max_context_len", None)
+    if rollout_context is not None:
+        try:
+            return max(1024, min(8192, int(rollout_context)))
+        except (TypeError, ValueError):
+            pass
+    return 8192
+
+
+def _cap_training_trajectory(
+    prompt_token_ids: list[int],
+    response_token_ids: list[int],
+    loss_masks: list[int],
+    rollout_log_probs: list[float] | None,
+    context_segments: list[dict[str, Any]],
+    multimodal_train_inputs_buffer: list[dict[str, Any]],
+    step_action_spans: list[dict[str, int]],
+    *,
+    max_sequence_length: int,
+) -> tuple[list[int], list[int], list[float] | None, list[dict[str, Any]], dict[str, Any]]:
+    """Bound the sequence sent to the actor while preserving RL alignment.
+
+    The reward and diagnostic response remain complete.  Only the actor input
+    is shortened, at an assistant-action boundary whenever possible, so
+    tokens, loss masks, rollout log-probabilities, and visual tensors continue
+    to refer to the same suffix.  The final assistant action is always
+    preferred; dropping it would turn a successful rollout into an
+    untrainable prefix-only sample.
+    """
+
+    original_response_length = len(response_token_ids)
+    original_total_length = len(prompt_token_ids) + original_response_length
+    limit = max(1, int(max_sequence_length))
+    response_budget = max(1, limit - len(prompt_token_ids))
+
+    def _valid_span(value: Any) -> tuple[int, int] | None:
+        if not isinstance(value, dict):
+            return None
+        try:
+            start = int(value.get("action_token_start", value.get("token_start", -1)))
+            end = int(value.get("response_token_end", value.get("token_end", -1)))
+        except (TypeError, ValueError):
+            return None
+        if start < 0 or end <= start or end > original_response_length:
+            return None
+        return start, end
+
+    # A complete suffix beginning at one of the retained action boundaries is
+    # the least destructive compaction.  ``context_segments`` is the bounded
+    # inference history, so it also prevents re-attaching images belonging to
+    # observations that were already removed from the model context.
+    candidate_starts: set[int] = set()
+    for segment in context_segments:
+        span = _valid_span(segment)
+        if span is not None:
+            candidate_starts.add(span[0])
+    # The last action may be a terminal answer and therefore has no following
+    # observation segment.  Add only that final boundary; older action spans
+    # can belong to inference-compacted segments whose visual tensors are no
+    # longer present in ``context_segments``.
+    if step_action_spans and isinstance(step_action_spans[-1], dict):
+        try:
+            final_action_start = int(step_action_spans[-1].get("token_start", -1))
+        except (TypeError, ValueError):
+            final_action_start = -1
+        if 0 <= final_action_start < original_response_length:
+            candidate_starts.add(final_action_start)
+
+    selected_start = 0
+    if original_total_length > limit:
+        # Walk from the oldest available boundary to the newest and keep the
+        # longest suffix that fits.  This retains more useful history than
+        # always keeping only the final action.
+        fitting = [
+            start
+            for start in sorted(candidate_starts)
+            if original_response_length - start <= response_budget
+        ]
+        if fitting:
+            selected_start = fitting[0]
+        else:
+            selected_start = max(0, original_response_length - response_budget)
+
+    selected_buffer: list[dict[str, Any]] = []
+    retained_segment_count = 0
+    retained_visual_segment_count = 0
+    indexed_segments = any(
+        isinstance(segment, dict) and "multimodal_train_input_index" in segment
+        for segment in context_segments
+    )
+    selected_segment_indices: set[int] = set()
+    for segment in context_segments:
+        span = _valid_span(segment)
+        if span is None or span[0] < selected_start:
+            continue
+        retained_segment_count += 1
+        if segment.get("image_data"):
+            retained_visual_segment_count += 1
+        raw_index = segment.get("multimodal_train_input_index")
+        if raw_index is None:
+            continue
+        try:
+            buffer_index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= buffer_index < len(multimodal_train_inputs_buffer):
+            selected_segment_indices.add(buffer_index)
+
+    if original_total_length <= limit:
+        # The actor sequence is unchanged, so retain every visual chunk even
+        # if inference-only context compaction has already removed an older
+        # segment from ``context_segments``.
+        selected_buffer = list(multimodal_train_inputs_buffer)
+    elif indexed_segments:
+        selected_buffer = [
+            multimodal_train_inputs_buffer[index]
+            for index in range(len(multimodal_train_inputs_buffer))
+            if index in selected_segment_indices
+        ]
+    else:
+        # Backward-compatible path for a checkpoint created before segment
+        # indices were added.  A truncated legacy trajectory cannot safely
+        # remap image tensors, so keep the chunks and let the existing
+        # multimodal alignment audit fail closed rather than silently train on
+        # mismatched visual inputs.
+        selected_buffer = list(multimodal_train_inputs_buffer)
+
+    trimmed_response = list(response_token_ids[selected_start:])
+    trimmed_masks = list(loss_masks[selected_start:])
+    trimmed_log_probs = (
+        list(rollout_log_probs[selected_start:]) if rollout_log_probs is not None else None
+    )
+    metadata = {
+        "applied": bool(selected_start),
+        "max_sequence_length": limit,
+        "original_total_length": original_total_length,
+        "original_response_length": original_response_length,
+        "training_total_length": len(prompt_token_ids) + len(trimmed_response),
+        "training_response_length": len(trimmed_response),
+        "response_start": selected_start,
+        "dropped_response_tokens": selected_start,
+        "retained_segment_count": retained_segment_count,
+        "retained_visual_segment_count": retained_visual_segment_count,
+        "retained_multimodal_chunk_count": len(selected_buffer),
+        "fallback_tail_cut": bool(
+            original_total_length > limit
+            and not any(start == selected_start for start in candidate_starts)
+        ),
+    }
+    return trimmed_response, trimmed_masks, trimmed_log_probs, selected_buffer, metadata
+
+
 def _compact_model_context(
     prompt_token_ids: list[int],
     segments: list[dict[str, Any]],
@@ -5366,8 +5541,12 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         response_token_ids.extend(obs_token_ids)
         loss_masks.extend([0] * len(obs_token_ids))
         sample.rollout_log_probs.extend([0.0] * len(obs_token_ids))
+        image_start = len(current_images)
         current_images.extend(obs_images)
+        image_end = len(current_images)
+        multimodal_train_input_index: int | None = None
         if obs_train_inputs:
+            multimodal_train_input_index = len(multimodal_train_inputs_buffer)
             multimodal_train_inputs_buffer.append(obs_train_inputs)
         text_observation_token_ids = list(obs_token_ids)
         text_observation_suffix_token_count = int(observation_suffix_token_count)
@@ -5409,6 +5588,10 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
             navigation_state["visual_input_reason"] = "requested page pixels were not attached"
         context_segments.append(
             {
+                "action_token_start": int(action_token_start),
+                "action_token_end": int(len(response_token_ids) - len(obs_token_ids)),
+                "response_token_start": int(action_token_start),
+                "response_token_end": int(len(response_token_ids)),
                 "action_token_ids": list(cur_response_token_ids),
                 "observation_token_ids": list(obs_token_ids),
                 "text_observation_token_ids": text_observation_token_ids,
@@ -5417,6 +5600,9 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                 "image_data": list(obs_image_data),
                 "image_token_count": int(_new_image_token_count or 0),
                 "image_paths": list(image_paths_for_next),
+                "image_start": int(image_start),
+                "image_end": int(image_end),
+                "multimodal_train_input_index": multimodal_train_input_index,
                 "vision_placeholder_present": bool(obs_image_data),
                 "visual_input_required": bool(image_paths_for_next),
             }
@@ -5454,11 +5640,24 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         terminal_status = "infra_error"
         terminal_reason = "one or more tool calls failed because a runtime backend was unavailable"
 
-    sample.tokens = prompt_tokens_ids + response_token_ids
-    sample.response_length = len(response_token_ids)
+    train_response_token_ids, train_loss_masks, train_rollout_log_probs, train_mm_chunks, train_trajectory = (
+        _cap_training_trajectory(
+            prompt_tokens_ids,
+            response_token_ids,
+            loss_masks,
+            sample.rollout_log_probs,
+            context_segments,
+            multimodal_train_inputs_buffer,
+            step_action_spans,
+            max_sequence_length=_resolve_training_sequence_limit(args),
+        )
+    )
+    sample.tokens = prompt_tokens_ids + train_response_token_ids
+    sample.response_length = len(train_response_token_ids)
     sample.response = response
-    sample.loss_mask = loss_masks
-    sample.multimodal_train_inputs = _merge_multimodal_train_inputs(multimodal_train_inputs_buffer)
+    sample.loss_mask = train_loss_masks
+    sample.rollout_log_probs = train_rollout_log_probs
+    sample.multimodal_train_inputs = _merge_multimodal_train_inputs(train_mm_chunks)
     if current_images:
         sample.multimodal_inputs = {"images": current_images, "videos": None}
 
@@ -5470,6 +5669,8 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     )
     sample.tool_error_count = int(action_log.get("tool_error_count", 0))
     sample.tool_execution_trace = execution_trace
+    training_response_start = int(train_trajectory.get("response_start", 0) or 0)
+    training_response_end = training_response_start + len(train_response_token_ids)
     for key in (
         "candidate_action_count",
         "executed_action_count",
@@ -5493,11 +5694,29 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     action_rewards: list[float] = []
     rejected_action_indices: list[int] = []
     for action_index, action in enumerate(action_log.get("actions", [])):
-        span = step_action_spans[action_index] if action_index < len(step_action_spans) else {}
+        full_span = step_action_spans[action_index] if action_index < len(step_action_spans) else {}
+        try:
+            full_start = int(full_span.get("token_start", 0) or 0)
+            full_end = int(full_span.get("token_end", 0) or 0)
+        except (TypeError, ValueError):
+            full_start = 0
+            full_end = 0
+        # The actor receives a suffix of the response.  Drop action metadata
+        # for discarded prefixes and translate the remaining token spans to
+        # the new response origin so rejected-action penalties cannot land on
+        # unrelated tokens.
+        if full_start < training_response_start or full_end > training_response_end:
+            continue
+        span = {
+            "token_start": full_start - training_response_start,
+            "token_end": full_end - training_response_start,
+        }
         valid_for_gradient = bool(action.get("action_valid_for_policy_gradient", True))
         action_reward = float(action.get("action_reward", 0.0) or 0.0)
         action["action_valid_for_policy_gradient"] = valid_for_gradient
         action["action_reward"] = action_reward
+        action["full_token_start"] = full_start
+        action["full_token_end"] = full_end
         action["token_start"] = int(span.get("token_start", 0))
         action["token_end"] = int(span.get("token_end", 0))
         mask_value = 1 if valid_for_gradient else 0
@@ -5511,7 +5730,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         )
         action_rewards.append(action_reward)
         if not valid_for_gradient:
-            rejected_action_indices.append(action_index)
+            rejected_action_indices.append(len(action_rewards) - 1)
 
     sample.metadata = sample.metadata or {}
     sample.metadata["tool_execution"] = {
@@ -5537,6 +5756,8 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         and terminal_status not in {"completed", "abstained"}
     )
     sample.metadata["bayes_decisions"] = list(action_log.get("bayes_decisions", []))
+    sample.metadata["training_trajectory"] = dict(train_trajectory)
+    sample.metadata["full_response_length"] = len(response_token_ids)
     sample.metadata["assistant_token_masks"] = assistant_token_masks
     sample.metadata["action_rewards"] = action_rewards
     sample.metadata["rejected_action_indices"] = rejected_action_indices

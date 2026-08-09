@@ -8,6 +8,11 @@ import os
 from pathlib import Path
 from typing import Any
 
+# Do not enable ``expandable_segments`` here: SGLang's colocated
+# TorchMemorySaver rejects that allocator mode during engine startup.  The
+# primary OOM protection is the bounded training trajectory in
+# ``generate_with_retool.py`` plus the dynamic-batch diagnostics in the actor.
+
 import run_qwen3_vl_4b_smoke as base
 from bayestool.config import validate_stage_capabilities
 
@@ -170,6 +175,9 @@ def _validate() -> dict[str, Any]:
             "global_batch_size": int(os.environ.get("OPENCLAW_BAYESTOOL_GLOBAL_BATCH_SIZE", "8")),
             "num_rollout": int(os.environ.get("OPENCLAW_BAYESTOOL_NUM_ROLLOUT", "1")),
             "save_interval": int(os.environ.get("OPENCLAW_BAYESTOOL_SAVE_INTERVAL", "20")),
+            "max_train_sequence_length": int(
+                os.environ.get("OPENCLAW_BAYESTOOL_MAX_TRAIN_SEQUENCE_LENGTH", "8192")
+            ),
             "expected_train_rows": expected_train_rows,
             "expected_eval_rows": expected_eval_rows,
             "agent_detail_log_dir": str(REAL_OUTPUT_DIR / "dump_details"),

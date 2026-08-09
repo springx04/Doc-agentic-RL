@@ -122,6 +122,61 @@ def test_observation_compaction_preserves_assistant_turn_boundary(monkeypatch):
     assert image_data == []
 
 
+def test_training_trajectory_cap_preserves_suffix_alignment(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+    response = list(range(30))
+    masks = [index % 2 for index in response]
+    log_probs = [float(index) for index in response]
+    segments = [
+        {
+            "action_token_start": 0,
+            "action_token_end": 2,
+            "response_token_start": 0,
+            "response_token_end": 8,
+            "multimodal_train_input_index": None,
+        },
+        {
+            "action_token_start": 8,
+            "action_token_end": 10,
+            "response_token_start": 8,
+            "response_token_end": 16,
+            "multimodal_train_input_index": None,
+        },
+        {
+            "action_token_start": 16,
+            "action_token_end": 18,
+            "response_token_start": 16,
+            "response_token_end": 24,
+            "multimodal_train_input_index": None,
+        },
+    ]
+    action_spans = [
+        {"token_start": 0, "token_end": 2},
+        {"token_start": 8, "token_end": 10},
+        {"token_start": 16, "token_end": 18},
+        {"token_start": 24, "token_end": 30},
+    ]
+
+    capped = module._cap_training_trajectory(
+        [100, 101, 102, 103],
+        response,
+        masks,
+        log_probs,
+        segments,
+        [],
+        action_spans,
+        max_sequence_length=22,
+    )
+
+    trimmed_response, trimmed_masks, trimmed_log_probs, _, metadata = capped
+    assert trimmed_response == response[16:]
+    assert trimmed_masks == masks[16:]
+    assert trimmed_log_probs == log_probs[16:]
+    assert metadata["response_start"] == 16
+    assert metadata["training_total_length"] == 18
+    assert metadata["fallback_tail_cut"] is False
+
+
 class _FakeTokenizer:
     chat_template = ""
 

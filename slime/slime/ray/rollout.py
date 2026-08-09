@@ -914,18 +914,11 @@ class RolloutManager:
             for sample in samples:
                 if _sample_excluded_from_rl(sample):
                     sample.remove_sample = True
-            if any(sample.multimodal_train_inputs is not None for sample in samples):
-                missing_mm_indices = []
-                for sample in samples:
-                    if sample.multimodal_train_inputs is None and not sample.remove_sample:
-                        sample.remove_sample = True
-                        missing_mm_indices.append(sample.index)
-                if missing_mm_indices:
-                    logger.warning(
-                        "Marked %d samples as non-trainable due to missing multimodal_train_inputs: indices=%s",
-                        len(missing_mm_indices),
-                        missing_mm_indices[:20],
-                    )
+            # FSDP's multimodal packer explicitly supports a mixed batch:
+            # visual samples carry a tensor dict while text-only samples carry
+            # ``None`` and are placed in separate homogeneous packs.  Do not
+            # discard valid text-only trajectories merely because another
+            # sibling requested a visual observation.
 
         def _drop_removed_samples(samples: list[Sample]) -> list[Sample]:
             """

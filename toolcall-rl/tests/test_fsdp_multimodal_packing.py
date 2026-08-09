@@ -2,6 +2,8 @@ import sys
 import importlib.util
 from pathlib import Path
 
+import torch
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SLIME_ROOT = ROOT / "slime"
@@ -14,6 +16,7 @@ assert _SPEC is not None and _SPEC.loader is not None
 _DATA_PACKING = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_DATA_PACKING)
 _get_multimodal_balanced_partitions = _DATA_PACKING._get_multimodal_balanced_partitions
+pack_sequences = _DATA_PACKING.pack_sequences
 
 
 def test_mixed_modalities_are_partitioned_into_homogeneous_packs():
@@ -39,3 +42,24 @@ def test_all_visual_inputs_keep_the_default_balanced_schedule():
 
     assert len(partitions) == 2
     assert sorted(index for part in partitions for index in part) == [0, 1, 2, 3]
+
+
+def test_pack_sequences_keeps_text_only_samples_in_mixed_batch():
+    packed = pack_sequences(
+        tokens=[[1, 2, 3], [4, 5]],
+        loss_masks=[[1, 1, 1], [1, 1]],
+        rewards=[1.0, -1.0],
+        raw_rewards=[1.0, -1.0],
+        response_lengths=[2, 1],
+        advantages=[[0.1, 0.1, 0.0], [-0.1, 0.0]],
+        returns=[[0.1, 0.1, 0.0], [-0.1, 0.0]],
+        multimodal_train_inputs=[
+            {"pixel_values": torch.ones((1, 2), dtype=torch.float32)},
+            None,
+        ],
+        num_packs=2,
+    )
+
+    assert len(packed) == 2
+    assert sum(int(batch["tokens"].numel()) for batch in packed) == 5
+    assert any("multimodal_train_inputs" in batch for batch in packed)

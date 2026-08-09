@@ -635,6 +635,25 @@ class FSDPTrainRayActor(TrainRayActor):
         else:
             raise NotImplementedError(f"Unsupported advantage_estimator {self.args.advantage_estimator}")
 
+        if dist.get_rank() == 0:
+            sequence_lengths = sorted(len(sequence) for sequence in rollout_data["tokens"])
+            p95_index = min(len(sequence_lengths) - 1, max(0, int(len(sequence_lengths) * 0.95) - 1))
+            multimodal_count = sum(
+                1
+                for value in rollout_data.get("multimodal_train_inputs", [])
+                if isinstance(value, dict) and value
+            )
+            logger.info(
+                "TRAIN_ROLLOUT_LENGTHS rollout_id=%s samples=%s max_tokens=%s p95_tokens=%s "
+                "total_tokens=%s multimodal_samples=%s",
+                rollout_id,
+                len(sequence_lengths),
+                max(sequence_lengths, default=0),
+                sequence_lengths[p95_index] if sequence_lengths else 0,
+                sum(sequence_lengths),
+                multimodal_count,
+            )
+
         packed_batches, grad_accum = self._packed_data(rollout_data)
 
         assert (
@@ -653,12 +672,50 @@ class FSDPTrainRayActor(TrainRayActor):
             for mbs_id, packed_batch in self.prof.iterate_train_actor(
                 enumerate(tqdm(packed_batches, desc="actor_train", disable=dist.get_rank() != 0))
             ):
-                self._train_step(
-                    packed_batch=packed_batch,
-                    reported_accum=reported_accum,
-                    mbs_id=mbs_id,
-                    grad_accum=grad_accum,
-                )
+                try:
+                    self._train_step(
+                        packed_batch=packed_batch,
+                        reported_accum=reported_accum,
+                        mbs_id=mbs_id,
+                        grad_accum=grad_accum,
+                    )
+                except RuntimeError as exc:
+                    if "out of memory" not in str(exc).lower():
+                        raise
+                    try:
+                        cu_seqlens = packed_batch.get("cu_seqlens")
+                        sequence_lengths = (
+                            (cu_seqlens[1:] - cu_seqlens[:-1]).detach().cpu().tolist()
+                            if isinstance(cu_seqlens, torch.Tensor)
+                            else []
+                        )
+                        multimodal_shapes = {
+                            key: tuple(value.shape)
+                            for key, value in packed_batch.get("multimodal_train_inputs", {}).items()
+                            if isinstance(value, torch.Tensor)
+                        }
+                        free_memory, total_memory = torch.cuda.mem_get_info(torch.cuda.current_device())
+                        logger.error(
+                            "FSDP_TRAIN_OOM_DIAGNOSTIC rollout_id=%s mbs_id=%s rank=%s "
+                            "packed_tokens=%s sequence_lengths=%s multimodal_shapes=%s "
+                            "allocated_bytes=%s reserved_bytes=%s free_bytes=%s total_bytes=%s",
+                            rollout_id,
+                            mbs_id,
+                            dist.get_rank(),
+                            int(packed_batch.get("tokens").numel()) if isinstance(packed_batch.get("tokens"), torch.Tensor) else None,
+                            sequence_lengths,
+                            multimodal_shapes,
+                            torch.cuda.memory_allocated(),
+                            torch.cuda.memory_reserved(),
+                            free_memory,
+                            total_memory,
+                            exc_info=True,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "FSDP_TRAIN_OOM_DIAGNOSTIC failed while collecting memory details"
+                        )
+                    raise
 
         self.prof.step(rollout_id=rollout_id)
 
