@@ -136,7 +136,7 @@ advantage_i = utility_i - baseline_g
 
 约束：
 
-- group size 至少为 2；
+- normal policy advantage group size 至少为 4；这是当前项目对稳定 GRPO 信号的最低要求；
 - 组内只能有一个 `episode_content_id`、`question_id`、`latent_world_id` 和 `initial_input_hash`；
 - reward/utility 定义和权重版本必须完全一致；
 - 保持现有“不做小组标准差归一化”的设计；
@@ -200,7 +200,7 @@ advantage_i = utility_i - baseline_g
 2. 对每组检查 content/question/world/input/prefix 唯一性；
 3. 任一 cross-world group 直接失败并保存最小诊断，不允许静默训练；
 4. 关键 ID 缺失的旧记录标记为 `invalid_advantage_identity`，只允许离线分析；
-5. 小于 2 条的组跳过 sequence-level advantage，并记录原因。
+5. 小于 4 条的 normal policy group 跳过 sequence-level advantage，并记录原因；不得用其他 world 补齐。
 
 ### M4：统一两种训练后端
 
@@ -234,14 +234,14 @@ advantage_i = utility_i - baseline_g
 - 加入另一个更困难 world 的样本后，原组两个 advantage 完全不变；
 - 打乱样本顺序或 optimizer packing 后，逐 trajectory advantage 不变；
 - FSDP 与 Megatron 的 baseline、advantage 和有效 loss mask 一致；
-- singleton group 不产生伪造的跨 world advantage。
+- 少于 4 条的 normal group 不产生伪造的跨 world advantage。
 
 ### 7.3 集成测试
 
-以 `4 worlds × 2 replicas × 2 questions` 构造固定测试：
+以 `4 worlds × 4 replicas × 2 questions` 构造固定测试：
 
 - normal trajectory 应形成 `4 × 2 = 8` 个 same-world/question groups；
-- 每个 normal group 正常大小为 2；
+- 每个 normal group 正常大小为 4；
 - `cross_world_advantage_group_count == 0`；
 - `cross_question_advantage_group_count == 0`；
 - branch group 只包含同一 replica、同一 prefix 的 parent/children；
@@ -332,6 +332,15 @@ global batch size = 8
 
 branch 发生在这 8 条基础 parent trajectories 的某个决策点之后。一次 eligible branch 当前最多增加 3 个短 continuation children；branch child 不会再各自重复生成 8 次。但是 parent 可能在多个 turn 触发 branch，因此总数仍会迅速膨胀。
 
+branch gate 本身不按 `world_type` 限定，因此不是只有异常 world 才分支；healthy trajectory 只要满足 regret、剩余预算和 OOD 等条件也可能触发。当前观测可直接写成：
+
+```text
+36 条/题 = 8 条基础 parent + 28 条 branch children
+52 条/题 = 8 条基础 parent + 44 条 branch children
+```
+
+按每个 event 最多 3 个 children 估算，分别至少需要约 10 次和 15 次成功 branch events；若某些 event 不足 3 个 children，实际 event 数还会更多。这些 event 分散在 8 条 parent trajectories 的不同 turn 上。
+
 所以在不产生任何 branch child 时，一个 rollout 应有约 16 条基础轨迹，并产生约 2 个 optimizer steps。
 
 实际观测：
@@ -391,50 +400,56 @@ branch_horizon = 3
 
 ### 12.1 总体目标
 
-将平均最终可训练记录控制在每题 4～6 条，P95 不超过 8 条；只有少量 coverage-anchor 题允许达到 10 条左右。
+任何参与 normal GRPO advantage 的 latent world 必须至少有 4 条完整、同 world、同初始输入的 on-policy trajectories。平均最终可训练记录仍控制在每题 5～6 条；少量 paired/coverage anchors 单独计量，不与普通题共用单题上限。
 
 对 1000 道题、GBS=8，目标规模约为：
 
 ```text
-4,000～6,000 条最终策略训练记录
-500～750 个 optimizer steps
+约 5,000 条基础策略轨迹
+约 5,000～6,000 条最终策略训练记录
+约 625～750 个 optimizer steps
 ```
 
 这比当前外推的 4,500～6,500 steps 低约一个数量级，同时仍保留 same-world relative advantage 和全部 world 类型覆盖。
 
 ### 12.2 推荐的混合采样结构
 
-不再让每道题都固定展开 `4 worlds × 2 replicas`，改成以下分层预算：
+保留包括 healthy 在内的 4 个 world slots，但不再让每道题都运行全部 4 个 world。改成以下分层预算：
 
 | 题目比例 | 采样结构 | 每题基础轨迹 | 主要用途 |
 |---|---|---:|---|
-| 75% 常规题 | 1 个 latent world × 4 replicas | 4 | 稳定的 same-world GRPO advantage |
-| 20% paired anchors | healthy + 1 个目标异常 world，各 2 replicas | 4 | 同题环境对照、switch/belief 辅助监督 |
-| 5% coverage anchors | 4 个 world slots × 2 replicas | 8 | 检查全部 world 覆盖和系统性退化 |
+| 85% 常规题 | 1 个 latent world × 4 replicas | 4 | 稳定的四样本 same-world GRPO advantage |
+| 10% paired anchors | healthy + 1 个目标异常 world，各 4 replicas | 8 | 同题环境对照、switch/belief 辅助监督 |
+| 5% coverage anchors | 4 个 world slots × 4 replicas | 16 | 检查全部 world 覆盖和系统性退化 |
 
-平均基础轨迹约为 `4.2/题`，而不是当前的 `8/题`。
+平均基础轨迹为：
+
+```text
+0.85 × 4 + 0.10 × 8 + 0.05 × 16 = 5.0 条/题
+```
+
+这比当前每题固定 8 条基础轨迹更少，并确保每一个实际计算 advantage 的 world group 都有 4 条轨迹。
 
 所有启用 world 类型通过跨题分层轮换保证覆盖。相同题目是否进入 anchor 集由固定种子决定，避免训练过程中随意改变对照集。
 
 若第一阶段希望降低实现复杂度，可先采用简化方案：
 
 ```text
-每题 healthy + 1 个轮换异常 world
-每个 world 2 replicas
-合计 4 条基础轨迹/题
+每道题从 4 个 world slots 中确定性选择 1 个
+该 latent world 生成 4 条独立 on-policy trajectories
+跨题均衡轮换 healthy/local/shared/change
+合计 1 world × 4 trajectories = 4 条/题
 ```
 
-这已经把基础推理减半，并且每个策略 advantage group 仍有 2 条 same-world trajectories。
+这已经把基础推理减半，并满足四样本 GRPO。其缺点是普通题没有同题跨 world 对照，因此必须由 paired/coverage anchors 补充。
 
-不能只把 `n_samples_per_prompt` 从 8 改成 4，同时继续声明 `4 worlds × 2 replicas`。那会导致每个 world 实际只有一个 replica，无法形成 same-world relative advantage，并违反采样数量不变量。改为 4 时必须同步选择一种合法结构：
+如果坚持每一道题都运行全部 4 个 world，同时每个 world 至少 4 条轨迹，那么最低成本必然是：
 
 ```text
-方案 A（简单且推荐）：2 worlds × 2 replicas = 4
-方案 B（advantage 更稳定）：1 world × 4 replicas = 4
-方案 C（长期推荐）：A/B 混合，并在少量 anchors 上保留 4 × 2
+4 worlds × 4 trajectories = 16 条基础轨迹/题
 ```
 
-方案 A 保留同题 healthy/异常对照；方案 B 的同组 advantage 样本更多，但同一道题没有跨 world auxiliary pair。因此完整训练采用前述混合结构更均衡。
+这个乘积无法通过改 batch size 或分组键消除。若既要四样本优势又要控制成本，必须采用“普通题单 world 轮换 + 少量多 world anchors”的结构。
 
 ### 12.3 World 调度原则
 
@@ -444,6 +459,21 @@ branch_horizon = 3
 4. 后续可根据“学习进展”调整采样权重：奖励长期不变的简单 world 降采样，仍有可学习梯度的 world 升采样；
 5. 自适应采样必须记录采样概率，评估仍使用固定 world 分布，防止 curriculum 指标失真；
 6. 不能仅按最低奖励过采样，否则会反复堆积模型当前无法解决或基础设施异常的样本。
+
+### 12.4 四条同 World 轨迹如何提高回答质量
+
+四条轨迹必须是真正独立的 on-policy completions，而不是复制 token、复制 reward，或用不同 world 的轨迹凑数。推荐：
+
+1. 四条轨迹共享完全相同的题目、文档、初始 prompt、tool schema 和 latent world；
+2. 使用四个可复现但不同的 policy sampling seeds，并在一个 shared-prefix batched request 中生成；
+3. 给完整轨迹保留足够的工具预算，优先获得完整证据链，而不是把预算花在大量短 branch 上；
+4. infra-invalid 轨迹只允许由同题、同 latent world 的新轨迹替换；
+5. 模型自身 protocol error 保留为负样本，但若四条全部以同一种协议错误结束，则该组记为 `degenerate_no_signal`，不强行做虚假相对优势；
+6. 若四条动作/奖励完全相同，可在固定上限内补采最多 2 条同 world trajectories；仍无差异则跳过本组 policy update，并进入协议或 curriculum 诊断；
+7. 正确答案、证据定位和工具纪律共同进入 utility，确保优势偏向“答对且证据可靠”的轨迹；
+8. teacher/corrected trajectory 可以用于独立 SFT 或 replay supervision，但不能混入四条 on-policy GRPO baseline。
+
+高质量的关键不是把 branch child 数量加到 4，而是让四条完整轨迹在相同环境下进行真实策略探索，并把节省的推理预算用于更完整的工具调用和证据获取。
 
 ## 13. Branch 的高信息、低数量使用方案
 
@@ -461,32 +491,38 @@ pre-gate 未通过时只执行 primary policy action，不再为了最终不会�
 
 ### 13.2 严格数量上限
 
-完整训练的推荐初始值：
+branch 必须区分两种用途：
+
+- `policy_branch_group`：参与相对策略优势，必须由同一 prefix/world 的 `1 parent + 3 children = 4` 条轨迹构成；
+- `q_only_pair`：只有 parent/alternative 两条时，只用于 Q/regret auxiliary target，不进入 GRPO baseline。
+
+完整训练的推荐初始预算：
 
 ```text
-branch_probability_when_eligible = 0.10
-max branch events per parent trajectory = 1
-max branch children per event = 1
-max branch children per question = 2
+policy-branch questions <= 全部问题的 5%
+max policy branch events per selected question = 1
+policy branch group = 1 parent + 3 children
 branch_horizon = 1～2
+paired/coverage anchors: policy branch disabled
 ```
 
-不再默认 `probability=1.0`、每次最多 3 children、同一 parent 多 turn 重复展开。
+这样每 100 道题最多只有 5 个 policy branch events、15 个 children，平均仅增加 `0.15` 条 child/题。它满足四样本 action comparison，又不会回到当前多 turn、全量分支的规模。
 
-branch 预算应以“每题 child 总数”为最终硬上限；概率只负责在预算内采样，不能替代上限。
+不再默认 `probability=1.0`，也不允许同一 parent 在多个 turn 重复展开。branch 配额以全局题目比例和每题 event 数为硬上限；概率或信息分数只负责决定哪些题获得这笔预算。
 
 ### 13.3 候选动作生成优化
 
 1. primary action 始终来自当前策略；
 2. 优先从合法工具 schema、navigation state 和 Q-head 候选中构造 canonical alternatives；
-3. 只有确需策略文本时才额外解码一个 alternative；
-4. 若必须采样多个候选，使用共享 prefix 的单次 batched generation，而不是最多 11 次串行尝试；
-5. 候选重复时停止，不为了凑满 4 个动作继续盲采样；
+3. `policy_branch_group` 所需的 3 个 alternatives 使用共享 prefix 的单次 batched generation，不能最多 11 次串行尝试；
+4. 若无法得到 4 个有效、具有不同 canonical action 的 siblings，则不计算 branch GRPO；已有 pair 可降级为 `q_only_pair`；
+5. 不为了凑满 4 个动作无限重采样，单个 event 只有一次有上限的候选批次；
 6. 对 branch policy loss 只训练分叉后的有效 suffix，共享 prefix 不重复贡献 loss。
 
 ### 13.4 Branch 数据如何发挥更大作用
 
-- 一个高质量 branch pair 同时服务于 sibling action advantage、Q target 和 regret audit；
+- 一个合格的四轨迹 policy branch group 同时服务于 sibling action advantage、Q target 和 regret audit；
+- 只有两条的 branch pair 仍可服务 Q/regret，但不得冒充四样本 GRPO；
 - Q/belief 可保存紧凑 feature/replay record，不必把同一长序列重复加入策略 batch；
 - policy branch sample 保持 on-policy 并立即使用，但每个 rollout 有固定 quota；
 - Q/belief replay 可以跨 rollout 重采样，避免为辅助头重复运行昂贵的 VLM generation；
@@ -544,11 +580,14 @@ world_type_coverage
 
 完整训练启动前必须满足：
 
-- 平均 `base_trajectory_count/original_question_count <= 4.5`；
-- 平均 `final_policy_sample_count/original_question_count <= 6`；
-- P95 每题最终策略样本数不超过 8；
-- branch children 不超过基础轨迹的 15%，且任何题不超过 2 个；
-- 每个触发的 branch 最多额外解码 1 个 child；
+- 平均 `base_trajectory_count/original_question_count <= 5.0`，允许的数值误差上限为 5.2；
+- 平均 `final_policy_sample_count/original_question_count <= 5.5`；
+- 常规题基础轨迹固定为 4，参与 normal advantage 的每个 group size 不小于 4；
+- 常规题最终 policy samples 不超过 7，paired anchor 不超过 8，coverage anchor 不超过 16；
+- policy branch event 覆盖率不超过问题数的 5%，每个选中问题只允许一个四轨迹 branch group；
+- 每个 policy branch event 固定为 primary parent 加 3 个 children，branch children 总量不超过基础轨迹的约 3%；
+- paired/coverage anchors 禁止 policy branch，保证对照公平并固定成本；
+- 每个触发的 branch 只允许一次 shared-prefix batched candidate request，不允许串行补满；
 - `cross_latent_world_group_count == 0`；
 - 改变 optimizer batch size 不改变样本选择和 advantage；
 - 各 world 在 rolling window 内达到预定覆盖率；
@@ -556,4 +595,4 @@ world_type_coverage
 
 如果某项超限，rollout manager 应先停止继续扩展该题，而不是生成后再靠丢弃样本解决。生成后丢弃虽然能减少训练记录，却不能挽回已经消耗的推理时间。
 
-最终采用哪个预算，应由一个小规模消融实验决定：比较 `8 base + aggressive branch`、`4 base + capped branch`、`4 base + no branch` 三组，在相同 generation-token 预算下评估 reward、ANLS、advantage 非零率和每 GPU 小时收益。推荐默认采用 `4 base + capped branch`，只有它相对 no-branch 产生稳定收益时才保留 branch。
+最终采用哪个预算，应由一个小规模消融实验决定：比较 `8 base（4 worlds × 2）+ aggressive branch`、`4 same-world base + sparse four-sibling branch`、`4 same-world base + no branch` 三组，在相同 generation-token 预算下评估 reward、ANLS、advantage 非零率和每 GPU 小时收益。推荐默认采用 `4 same-world base + sparse four-sibling branch`，只有它相对 no-branch 产生稳定收益时才保留 branch policy loss。
