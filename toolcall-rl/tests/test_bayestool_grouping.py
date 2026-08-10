@@ -209,6 +209,44 @@ def test_manifest_validation_requires_exact_realization_and_k_contract():
     assert invalid["violations"] or invalid["plan_errors"]
 
 
+def test_manifest_validation_binds_each_record_to_its_own_realization_plan():
+    plan, records = _records("per-record-plan", group_size=4)
+    frozen_plan = replace(
+        plan,
+        realizations=tuple(
+            replace(
+                realization,
+                decision_prefix_hash="root",
+                runtime_state_digest="runtime:frozen",
+            )
+            for realization in plan.realizations
+        ),
+    )
+    for record in records:
+        record["metadata"]["question_rollout_plan"] = frozen_plan.to_dict()
+
+    valid = validate_question_rollout_plan_records(records, frozen_plan)
+    assert valid["valid"]
+
+    changed = records[4]
+    changed_plan = dict(frozen_plan.to_dict())
+    changed_plan["realizations"] = [dict(item) for item in changed_plan["realizations"]]
+    changed_plan["realizations"][1]["decision_prefix_hash"] = "wrong-prefix"
+    changed["metadata"]["question_rollout_plan"] = changed_plan
+    invalid = validate_question_rollout_plan_records(records, frozen_plan)
+    assert not invalid["valid"]
+    assert any("record_plan_decision_prefix_hash_mismatch" in error for error in invalid["plan_errors"])
+
+    changed["metadata"]["question_rollout_plan"] = frozen_plan.to_dict()
+    changed["metadata"]["question_rollout_plan"]["realizations"] = [
+        dict(item) for item in changed["metadata"]["question_rollout_plan"]["realizations"]
+    ]
+    changed["metadata"]["question_rollout_plan"]["realizations"][1]["latent_world_id"] = "wrong-latent"
+    structural_invalid = validate_question_rollout_plan_records(records, frozen_plan)
+    assert not structural_invalid["valid"]
+    assert any("record_plan_structure_mismatch" in error for error in structural_invalid["plan_errors"])
+
+
 def test_primary_realization_index_maps_four_required_world_roles():
     plan = make_question_rollout_plan("world-map", group_size=4)
     fixed_specs = [

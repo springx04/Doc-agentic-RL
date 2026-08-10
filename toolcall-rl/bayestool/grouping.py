@@ -772,6 +772,104 @@ def validate_question_rollout_plan_records(
             errors.append(f"missing_plan_realizations:{missing}")
         if extra:
             errors.append(f"unexpected_plan_realizations:{extra}")
+
+    def _plan_structure_signature(plan_value: QuestionRolloutPlan) -> str:
+        payload = plan_value.to_dict()
+        for realization in payload.get("realizations", []):
+            if isinstance(realization, dict):
+                for field in ("selected_decision_event", "decision_prefix_hash", "runtime_state_digest"):
+                    realization.pop(field, None)
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+    parsed_plan_structure = _plan_structure_signature(parsed_plan)
+
+    def _record_plan(record: Any) -> tuple[QuestionRolloutPlan, bool] | None:
+        metadata = _record_metadata(record)
+        raw_plan = metadata.get("question_rollout_plan")
+        if not isinstance(raw_plan, Mapping):
+            return parsed_plan, False
+        try:
+            return QuestionRolloutPlan.from_mapping(raw_plan), True
+        except (TypeError, ValueError, KeyError) as exc:
+            errors.append(f"record_question_rollout_plan_invalid:{exc}")
+            return None
+
+    def _plan_realization(
+        plan_value: QuestionRolloutPlan,
+        pair: tuple[str, str],
+    ) -> RealizationPlan | None:
+        return next(
+            (
+                realization
+                for realization in plan_value.realizations
+                if (realization.world_slot_role, realization.variant_id) == pair
+            ),
+            None,
+        )
+
+    def _check_record_binding(
+        record: Any,
+        pair: tuple[str, str],
+        *,
+        group_id: str,
+    ) -> None:
+        metadata = _record_metadata(record)
+        parsed_record_plan = _record_plan(record)
+        if parsed_record_plan is None:
+            return
+        record_plan, has_explicit_plan = parsed_record_plan
+        if record_plan.question_id != parsed_plan.question_id:
+            errors.append(
+                f"record_plan_question_id_mismatch:{record_plan.question_id}!={parsed_plan.question_id}"
+            )
+        if has_explicit_plan and _plan_structure_signature(record_plan) != parsed_plan_structure:
+            errors.append(f"record_plan_structure_mismatch:{pair[0]}:{pair[1]}:{group_id}")
+        realization = _plan_realization(record_plan, pair)
+        if realization is None:
+            errors.append(f"record_plan_realization_missing:{pair[0]}:{pair[1]}")
+            return
+        expected_fields = {
+            "latent_world_id": realization.latent_world_id,
+            "selected_decision_event": realization.selected_decision_event,
+            "decision_prefix_hash": realization.decision_prefix_hash,
+            "runtime_state_digest": realization.runtime_state_digest,
+            "policy_version": realization.policy_version,
+        }
+        for field, expected_value in expected_fields.items():
+            actual_value = str(metadata_value(metadata, field, ""))
+            if has_explicit_plan and field in {
+                "selected_decision_event",
+                "decision_prefix_hash",
+                "runtime_state_digest",
+            } and not str(expected_value).strip():
+                errors.append(
+                    f"record_plan_{field}_not_frozen:{pair[0]}:{pair[1]}:{group_id}"
+                )
+            elif str(expected_value).strip() and actual_value != str(expected_value):
+                errors.append(
+                    f"record_plan_{field}_mismatch:{pair[0]}:{pair[1]}:{actual_value}!={expected_value}"
+                )
+        if int(realization.k) != len(groups.get(group_id, ())):
+            errors.append(
+                f"record_plan_group_size_mismatch:{pair[0]}:{pair[1]}:"
+                f"{len(groups.get(group_id, ()))}!={realization.k}"
+            )
+        actual_slot_weight = metadata_value(metadata, "slot_weight", None)
+        if actual_slot_weight is not None:
+            try:
+                if not math.isclose(
+                    float(actual_slot_weight),
+                    float(realization.slot_weight),
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                ):
+                    errors.append(
+                        f"record_plan_slot_weight_mismatch:{pair[0]}:{pair[1]}:"
+                        f"{actual_slot_weight}!={realization.slot_weight}"
+                    )
+            except (TypeError, ValueError):
+                errors.append(f"record_plan_slot_weight_invalid:{pair[0]}:{pair[1]}")
+
     for pair, expected_k in expected.items():
         if pair in actual and actual[pair][1] != int(expected[pair].k):
             errors.append(
@@ -823,6 +921,8 @@ def validate_question_rollout_plan_records(
                     )
             except (TypeError, ValueError):
                 errors.append(f"plan_slot_weight_invalid:{pair[0]}:{pair[1]}")
+        for record in groups[actual_group_id]:
+            _check_record_binding(record, pair, group_id=actual_group_id)
     return {
         **report,
         "plan_valid": not errors,
