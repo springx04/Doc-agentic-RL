@@ -246,6 +246,7 @@ def test_tool_prompt_preserves_qwen_role_boundaries_and_function_schema(monkeypa
     assert "<|im_start|>userDocument path: fixture.pdf" not in prompt
     assert "<tools>\n{\"type\": \"function\", \"function\":" in prompt
     assert "</tool_call><|im_end|>\n" in prompt
+    assert "exactly the keys name and arguments" in prompt
     assert prompt.endswith("<|im_start|>assistant\n")
 
 
@@ -264,8 +265,45 @@ def test_tool_prompt_marks_bayestool_state_read_only_and_enforces_one_action(mon
     assert "never copy or output them" in prompt
 
     status = module._navigation_status_text({"visited_pages": [], "unvisited_pages": []})
-    assert "Observation metadata is read-only" in status
-    assert "<task_state>" in status
+    assert "read-only context" in status
+    assert "<task_state>" not in status
+    assert "<tool_belief>" not in status
+    assert "<tool_call>" not in status
+    assert "<final>" not in status
+
+
+def test_bayestool_observation_labels_do_not_expose_copyable_metadata_tags(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+
+    block = (
+        '<task_state>{"remaining_tool_budget":3}</task_state>\n'
+        '<tool_belief>{"change_probability":0.1}</tool_belief>'
+    )
+    sanitized = module._sanitize_observation_metadata_markup(block)
+
+    assert "Task State (read-only):" in sanitized
+    assert "Tool Belief (read-only):" in sanitized
+    assert "remaining_tool_budget" in sanitized
+    assert "<task_state>" not in sanitized
+    assert "</task_state>" not in sanitized
+    assert "<tool_belief>" not in sanitized
+    assert "</tool_belief>" not in sanitized
+
+
+def test_final_guard_observation_keeps_interpreter_boundary_without_metadata_tags(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+
+    observation = module._final_guard_observation(
+        "no document page has been inspected yet",
+        {"visited_pages": [], "unvisited_pages": []},
+    )
+
+    assert observation.startswith("<interpreter>\n")
+    assert observation.endswith("\n</interpreter>")
+    assert "<task_state>" not in observation
+    assert "<tool_belief>" not in observation
+    assert "<tool_call>" not in observation
+    assert "<final>" not in observation
 
 
 def test_multi_action_and_placeholder_are_logged_without_execution(monkeypatch):

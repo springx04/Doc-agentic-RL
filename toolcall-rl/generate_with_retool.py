@@ -105,16 +105,36 @@ _STRICT_ASSISTANT_ACTION_RULE = (
     "Assistant output follows a strict action protocol. Every assistant turn must contain exactly one "
     "complete action and no other text: use <tool_call>...</tool_call> for one tool call, "
     "<final>...</final> for a grounded answer, or <abstain>...</abstain> when evidence is insufficient. "
+    "For JSON tool actions, use exactly the keys name and arguments; never use tool, args, or prose. "
     "Do not emit analysis, explanations, Markdown, code fences, or extra tags. "
     "<task_state>, <tool_belief>, <tool_state>, <tool_result>, and <interpreter> are read-only "
     "observation metadata; never copy or output them in an assistant turn."
 )
 
 _OBSERVATION_PROTOCOL_RULE = (
-    "Observation metadata is read-only. Never copy <task_state>, <tool_belief>, <tool_state>, "
-    "<tool_result>, or <interpreter> into an assistant turn. Reply with exactly one complete "
-    "<tool_call>...</tool_call>, <final>...</final>, or <abstain>...</abstain> action and no other text."
+    "The following environment state is read-only context, not an assistant action. "
+    "Use it to choose the next step. The next assistant turn must contain exactly one complete "
+    "action from the system protocol and no other text."
 )
+
+_OBSERVATION_METADATA_TAG_RE = re.compile(
+    r"</?\s*(?P<name>task_state|tool_belief|tool_state|tool_result)\s*>",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_observation_metadata_markup(value: str | None) -> str:
+    """Keep state readable without teaching the model to copy metadata tags."""
+
+    text = str(value or "")
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group("name").casefold().replace("_", " ")
+        if match.group(0).lstrip().startswith("</"):
+            return f"End {name}."
+        return f"{name.title()} (read-only):"
+
+    return _OBSERVATION_METADATA_TAG_RE.sub(replace, text)
 
 _PRM_SEMAPHORE: asyncio.Semaphore | None = None
 _PRM_TOKENIZER: Any = None
@@ -552,7 +572,7 @@ def _bayestool_append_observation(
     )
     if not block:
         return observed_result
-    return f"{observed_result}\n{block}"
+    return f"{observed_result}\n{_sanitize_observation_metadata_markup(block)}"
 
 
 def _bayestool_token_count(value: Any, tokenizer: Any | None = None) -> int:
@@ -2493,17 +2513,17 @@ def _navigation_status_text(navigation_state: dict[str, Any]) -> str:
     if navigation_state.get("search_budget_exhausted"):
         lines.append(
             "Search budget exhausted. Do not call another tool; produce the best "
-            "grounded <final>...</final> answer now."
+            "grounded final answer action now."
         )
     elif visited and not unvisited:
         lines.append(
             "All known document pages have been checked. Do not call another tool or "
-            "write a document summary; answer concisely and end with <final>...</final>."
+            "write a document summary; answer concisely with the final answer action."
         )
     if navigation_state.get("evidence_sufficient"):
         lines.append(
             "Sufficient supporting evidence has been found. You may stop searching and emit the concise "
-            "<final>...</final> answer; do not scan additional pages unless a table/visual follow-up is required."
+            "final answer action; do not scan additional pages unless a table/visual follow-up is required."
         )
     elif question_type == "table" and navigation_state.get("table_candidate_pages"):
         lines.append(
@@ -2999,7 +3019,6 @@ def _final_guard_observation(reason: str, navigation_state: dict[str, Any]) -> s
         "Final answer blocked by evidence guard.\n"
         f"Reason: {reason}\n"
         f"{_navigation_status_text(navigation_state)}\n"
-        f"{_OBSERVATION_PROTOCOL_RULE}\n"
         "Continue with the next appropriate tool call. Do not output None or "
         "not found until all relevant pages are checked or the search budget is exhausted.\n"
         "</interpreter>"
@@ -3410,7 +3429,7 @@ async def execute_predictions(
         return (
             "<interpreter>\n"
             "Tool search budget exhausted. Do not call another tool; output "
-            "the best grounded answer inside <final>...</final>.\n"
+            "the best grounded final answer action.\n"
             f"{_navigation_status_text(navigation_state)}\n"
             "</interpreter>",
             False,
@@ -4644,6 +4663,7 @@ async def _legacy_generate(args, sample: Sample, sampling_params, evaluation: bo
             )
         else:
             next_obs, done = await execute_predictions(cur_response, execution_trace=tool_execution_trace)
+            next_obs = _sanitize_observation_metadata_markup(next_obs)
 
         if getattr(args, "prm_enable", False):
             # Run PRM for every action step, including the final "Answer" step.
@@ -5737,6 +5757,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
             candidate_records=pre_action_candidates,
             candidate_decision=pre_action_decision,
         )
+        next_obs = _sanitize_observation_metadata_markup(next_obs)
         if action_log.get("actions"):
             parsed_meta = action_log["actions"][-1]
             step["parsed_action_type"] = parsed_meta.get("parsed_action_type")
