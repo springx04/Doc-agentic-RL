@@ -362,6 +362,9 @@ ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-8}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-32}
 BAYESTOOL_GROUP_SIZE=${BAYESTOOL_GROUP_SIZE:-4}
 BAYESTOOL_REALIZATIONS=${BAYESTOOL_REALIZATIONS:-4}
+BAYESTOOL_CHECKPOINT_INTERVAL_QUESTIONS=${BAYESTOOL_CHECKPOINT_INTERVAL_QUESTIONS:-100}
+BAYESTOOL_CHECKPOINT_RETENTION=${BAYESTOOL_CHECKPOINT_RETENTION:-2}
+SKIP_EVAL_BEFORE_TRAIN=${SKIP_EVAL_BEFORE_TRAIN:-0}
 N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-${BAYESTOOL_REALIZATIONS}}
 if (( BAYESTOOL_GROUP_SIZE != 4 && BAYESTOOL_GROUP_SIZE != 8 )); then
     echo "BayesTool requires K=4 or K=8, got ${BAYESTOOL_GROUP_SIZE}" >&2
@@ -430,6 +433,10 @@ EVAL_ARGS=(
     --eval-reward-key quality
 )
 
+if [[ "${SKIP_EVAL_BEFORE_TRAIN}" == "1" ]]; then
+    EVAL_ARGS+=(--skip-eval-before-train)
+fi
+
 BAYESTOOL_ARGS=(
     --advantage-estimator bayes_grpo
     --bayestool-enable
@@ -455,6 +462,8 @@ BAYESTOOL_ARGS=(
     --bayestool-switch-loss-weight 0.20
     --bayestool-preinv-loss-weight 0.05
     --bayestool-aux-micro-batch-size 4
+    --bayestool-checkpoint-interval-questions "${BAYESTOOL_CHECKPOINT_INTERVAL_QUESTIONS}"
+    --bayestool-checkpoint-retention "${BAYESTOOL_CHECKPOINT_RETENTION}"
     --disable-grpo-std-normalization
     --use-kl-loss
     --kl-loss-coef 0.01
