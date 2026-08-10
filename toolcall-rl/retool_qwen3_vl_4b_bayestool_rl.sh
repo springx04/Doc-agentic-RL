@@ -64,6 +64,53 @@ fi
 PYTHON_ENV_BIN="$(dirname -- "$(readlink -f "${PYTHON_BIN}")")"
 export PATH="${PYTHON_ENV_BIN}:${PATH}"
 
+# SGLang's fused kernels link against libnuma.  Keep this dependency entirely
+# offline and make the same verified library visible to the launcher, Ray
+# workers, and their descendants.  The explicit runtime path is the one
+# provisioned on the OpenClaw server; the other candidates keep the launcher
+# usable with a caller-supplied runtime prefix.
+NUMA_LIBRARY=${OPENCLAW_NUMA_LIBRARY:-}
+NUMA_LIBRARY_CANDIDATES=()
+if [[ -n "${OPENCLAW_NUMA_RUNTIME_DIR:-}" ]]; then
+    NUMA_LIBRARY_CANDIDATES+=("${OPENCLAW_NUMA_RUNTIME_DIR}/lib/libnuma.so.1")
+fi
+NUMA_LIBRARY_CANDIDATES+=(
+    "${PROJECT_DIR}/../envs/openclaw-rl-qwen3vl-numa-20260717-01/lib/libnuma.so.1"
+)
+if [[ -n "${OPENCLAW_ENV_DIR:-}" ]]; then
+    NUMA_LIBRARY_CANDIDATES+=("${OPENCLAW_ENV_DIR}/lib/libnuma.so.1")
+fi
+NUMA_LIBRARY_CANDIDATES+=(
+    "${PROJECT_DIR}/../envs/openclaw-rl-qwen3vl/lib/libnuma.so.1"
+)
+if [[ -n "${CONDA_PREFIX:-}" ]]; then
+    NUMA_LIBRARY_CANDIDATES+=("${CONDA_PREFIX}/lib/libnuma.so.1")
+fi
+if [[ -z "${NUMA_LIBRARY}" ]]; then
+    for candidate in "${NUMA_LIBRARY_CANDIDATES[@]}"; do
+        if [[ -f "${candidate}" ]]; then
+            NUMA_LIBRARY="${candidate}"
+            break
+        fi
+    done
+fi
+if [[ -z "${NUMA_LIBRARY}" || ! -f "${NUMA_LIBRARY}" ]]; then
+    echo "A verified offline libnuma.so.1 is required before starting SGLang" >&2
+    printf 'Checked NUMA paths:\n' >&2
+    printf '  %s\n' "${NUMA_LIBRARY_CANDIDATES[@]}" >&2
+    exit 1
+fi
+NUMA_LIBRARY="$(readlink -f -- "${NUMA_LIBRARY}")"
+NUMA_LIBRARY_DIR="$(dirname -- "${NUMA_LIBRARY}")"
+NUMA_RUNTIME_DIR="$(dirname -- "${NUMA_LIBRARY_DIR}")"
+export OPENCLAW_NUMA_LIBRARY="${NUMA_LIBRARY}"
+export OPENCLAW_NUMA_RUNTIME_DIR="${NUMA_RUNTIME_DIR}"
+export LD_LIBRARY_PATH="${NUMA_LIBRARY_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+case ":${LD_PRELOAD:-}:" in
+    *":${NUMA_LIBRARY}:"*) ;;
+    *) export LD_PRELOAD="${NUMA_LIBRARY}${LD_PRELOAD:+:${LD_PRELOAD}}" ;;
+esac
+
 # cv2 used by the offline OCR backends is a GUI-enabled wheel.  The server
 # image already contains its GL dependencies under /opt/conda; expose those
 # existing files to the launcher and Ray workers without installing anything.
@@ -100,6 +147,81 @@ if [[ -z "${RAY_BIN}" || ! -x "${RAY_BIN}" ]]; then
     echo "Ray CLI is not available in the Python runtime: ${PYTHON_BIN}" >&2
     exit 1
 fi
+
+# Do this before Ray starts.  sgl-kernel wheels are architecture-specific and
+# silently selecting sm100 for an A100 (sm80) leaves the rollout actor dead
+# after Ray has already allocated GPUs.  Check both package contents and the
+# actual import so a missing or incompatible kernel fails at the launcher.
+"${PYTHON_BIN}" - <<'PY'
+import importlib.metadata as metadata
+import json
+import os
+import re
+from pathlib import PurePosixPath
+
+import torch
+
+
+try:
+    distribution = metadata.distribution("sgl-kernel")
+except metadata.PackageNotFoundError as exc:
+    raise SystemExit("sgl-kernel is not installed in the selected Python runtime") from exc
+
+package_files = [str(path).replace("\\", "/") for path in (distribution.files or ())]
+visible_gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+required_gpu_count = int(os.environ.get("NUM_GPUS", "1"))
+if visible_gpu_count < required_gpu_count:
+    raise SystemExit(
+        f"selected runtime sees {visible_gpu_count} CUDA GPUs, expected at least "
+        f"{required_gpu_count}"
+    )
+
+gpu_report = []
+missing_architectures = []
+for index in range(required_gpu_count):
+    major, minor = torch.cuda.get_device_capability(index)
+    architecture = f"sm{major}{minor}"
+    common_ops = sorted(
+        path
+        for path in package_files
+        if f"/{architecture}/" in f"/{path}"
+        and re.search(r"common_ops(?:\.|$)", PurePosixPath(path).name)
+    )
+    if not common_ops:
+        missing_architectures.append(architecture)
+    gpu_report.append(
+        {
+            "index": index,
+            "name": torch.cuda.get_device_name(index),
+            "compute_capability": f"{major}.{minor}",
+            "architecture": architecture,
+            "common_ops": common_ops,
+        }
+    )
+if missing_architectures:
+    raise SystemExit(
+        "sgl-kernel has no common_ops binary for selected GPU architecture(s): "
+        + ", ".join(sorted(set(missing_architectures)))
+        + ". Build/install the matching offline sgl-kernel before training."
+    )
+
+try:
+    import sgl_kernel  # noqa: F401
+except Exception as exc:
+    raise SystemExit(f"sgl_kernel import failed after NUMA bootstrap: {exc}") from exc
+
+print(
+    json.dumps(
+        {
+            "sgl_kernel": distribution.version,
+            "numa_library": os.environ.get("OPENCLAW_NUMA_LIBRARY"),
+            "gpus": gpu_report,
+            "offline_ocr": os.environ.get("OPENCLAW_OCR_OFFLINE"),
+        },
+        sort_keys=True,
+    )
+)
+PY
 
 # Keep a dedicated Qwen3-VL configuration.  The official Megatron-Bridge
 # provider loads the vision tower, MRoPE metadata, image/video token IDs, and
@@ -430,6 +552,9 @@ RUNTIME_ENV_JSON="{
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
     \"PYTORCH_CUDA_ALLOC_CONF\": \"${PYTORCH_CUDA_ALLOC_CONF}\",
+    \"OPENCLAW_NUMA_LIBRARY\": \"${OPENCLAW_NUMA_LIBRARY}\",
+    \"OPENCLAW_NUMA_RUNTIME_DIR\": \"${OPENCLAW_NUMA_RUNTIME_DIR}\",
+    \"LD_PRELOAD\": \"${LD_PRELOAD:-}\",
     \"LD_LIBRARY_PATH\": \"${LD_LIBRARY_PATH:-}\",
     \"OPENCLAW_OCR_LIBRARY_DIR\": \"${OPENCLAW_OCR_LIBRARY_DIR:-}\",
     \"OPENCLAW_OCR_OFFLINE\": \"${OPENCLAW_OCR_OFFLINE}\",
