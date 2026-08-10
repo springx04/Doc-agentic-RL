@@ -238,3 +238,7 @@ toolcall-rl/tool_outputs/
 toolcall-rl/tool_studio/cache/
 toolcall-rl/tool_studio/outputs/
 toolcall-rl/tool_studio/runtime/
+
+# Evaluation scorer checkouts are server-side code-only vendors; benchmark
+# datasets, prepared PDFs, GT sidecars, and results live under BENCH_ROOT.
+toolcall-rl/eval_benchmarks/vendors/
