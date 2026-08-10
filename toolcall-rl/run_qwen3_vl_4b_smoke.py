@@ -44,7 +44,11 @@ NUMA_MANIFEST = NUMA_RUNTIME_DIR / "openclaw_numa_manifest.json"
 NUMA_CHILD_CHECK = TOOLCALL_DIR / "check_numa_child_runtime.py"
 SITE_CUSTOMIZE = TOOLCALL_DIR / "sitecustomize.py"
 EXPECTED_SGLANG_COMMIT = "24c91001cf99ba642be791e099d358f4dfe955f5"
-GPU_COUNT = 4
+GPU_COUNT = int(os.environ.get("OPENCLAW_GPU_COUNT", "2"))
+CUDA_DEVICES = os.environ.get(
+    "OPENCLAW_CUDA_VISIBLE_DEVICES",
+    ",".join(str(index) for index in range(GPU_COUNT)),
+)
 
 
 def _utc_now() -> str:
@@ -192,8 +196,10 @@ def validate() -> dict[str, Any]:
 
     import torch
 
+    if GPU_COUNT <= 0:
+        raise RuntimeError(f"OPENCLAW_GPU_COUNT must be positive, got {GPU_COUNT}")
     if not torch.cuda.is_available() or torch.cuda.device_count() < GPU_COUNT:
-        raise RuntimeError("four CUDA GPUs are required")
+        raise RuntimeError(f"{GPU_COUNT} CUDA GPUs are required")
     gpu_inventory = []
     for index in range(GPU_COUNT):
         properties = torch.cuda.get_device_properties(index)
@@ -375,7 +381,7 @@ def run() -> dict[str, Any]:
         "PYTHONPATH": python_path,
         "PYTHONUNBUFFERED": "1",
         "PYTHONFAULTHANDLER": "1",
-        "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+        "CUDA_VISIBLE_DEVICES": CUDA_DEVICES,
         "LD_PRELOAD": str(NUMA_LIBRARY),
         "LD_LIBRARY_PATH": runtime_library_path,
         "OPENCLAW_NUMA_LIBRARY": str(NUMA_LIBRARY),

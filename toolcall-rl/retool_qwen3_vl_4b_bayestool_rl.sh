@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Four-GPU BayesTool-RL launcher for Qwen3-VL-4B-Instruct.
+# Two-GPU BayesTool-RL launcher for Qwen3-VL-4B-Instruct.
 # BayesTool defaults to the FSDP actor path; Megatron remains an explicit
 # fail-fast incompatibility until it consumes the question manifest/weights.
 # The bridge reads the official Qwen3-VL vision tower, MRoPE, and image token
@@ -13,12 +13,17 @@ set -x
 export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 
-NUM_GPUS=${NUM_GPUS:-4}
-ACTOR_GPUS=${ACTOR_GPUS:-2}
-ROLLOUT_GPUS=${ROLLOUT_GPUS:-2}
+NUM_GPUS=${NUM_GPUS:-2}
+ACTOR_GPUS=${ACTOR_GPUS:-1}
+ROLLOUT_GPUS=${ROLLOUT_GPUS:-1}
 TRAIN_BACKEND=${TRAIN_BACKEND:-fsdp}
-if (( NUM_GPUS != 4 || ACTOR_GPUS != 2 || ROLLOUT_GPUS != 2 )); then
-    echo "This launcher is fixed to NUM_GPUS=4, ACTOR_GPUS=2, ROLLOUT_GPUS=2" >&2
+if (( NUM_GPUS <= 0 || ACTOR_GPUS <= 0 || ROLLOUT_GPUS <= 0 )); then
+    echo "NUM_GPUS, ACTOR_GPUS, and ROLLOUT_GPUS must all be positive" >&2
+    exit 1
+fi
+if (( ACTOR_GPUS + ROLLOUT_GPUS > NUM_GPUS )); then
+    echo "ACTOR_GPUS + ROLLOUT_GPUS must be <= NUM_GPUS" >&2
+    echo "actor=${ACTOR_GPUS}, rollout=${ROLLOUT_GPUS}, total=${NUM_GPUS}" >&2
     exit 1
 fi
 
@@ -150,8 +155,9 @@ EVAL_INTERVAL=${EVAL_INTERVAL:-20}
 N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-8}
 EVAL_MAX_RESPONSE_LEN=${EVAL_MAX_RESPONSE_LEN:-8192}
 EVAL_MAX_CONTEXT_LEN=${EVAL_MAX_CONTEXT_LEN:-16384}
-MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-16384}
-ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-2}
+MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-8192}
+ROLLOUT_NUM_GPUS_PER_ENGINE=${ROLLOUT_NUM_GPUS_PER_ENGINE:-1}
+TENSOR_MODEL_PARALLEL_SIZE=${TENSOR_MODEL_PARALLEL_SIZE:-1}
 SGLANG_MEM_FRACTION_STATIC=${SGLANG_MEM_FRACTION_STATIC:-0.6}
 # The actual Qwen3-VL packed THD layout (`thd_thd_thd` with padding-causal
 # masking) is not accepted by the cuDNN fused sub-backend in TE 2.12.0 on the
@@ -263,7 +269,7 @@ if [[ -n "${BAYESTOOL_SESSION_STATE_PROBABILITIES:-}" ]]; then
 fi
 
 PERF_ARGS=(
-    --tensor-model-parallel-size 2
+    --tensor-model-parallel-size "${TENSOR_MODEL_PARALLEL_SIZE}"
     --pipeline-model-parallel-size 1
     --context-parallel-size 1
     --expert-model-parallel-size 1
