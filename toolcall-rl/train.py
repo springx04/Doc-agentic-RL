@@ -397,7 +397,8 @@ class AgenticRLTrainer:
             ),
             "mean_advantage": sum(current_advantages) / len(current_advantages) if current_advantages else 0.0,
             "replay_used": replay_used,
-            "replay_size": len(self.replay_buffer) if self.replay_buffer is not None else 0,            "replay_indices": replay_indices,
+            "replay_size": len(self.replay_buffer) if self.replay_buffer is not None else 0,
+            "replay_indices": replay_indices,
             "bayes_information_gain": self.selector.total_information_gain if self.selector is not None else 0.0,
         }
         self.step_count += 1
