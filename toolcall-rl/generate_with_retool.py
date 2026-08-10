@@ -60,6 +60,7 @@ try:
         CleanResultCache,
         WorldRuntime,
         document_hash,
+        sample_tool_world,
         stable_seed,
     )
 except Exception:  # pragma: no cover - baseline rollout remains importable without the optional package
@@ -75,6 +76,7 @@ except Exception:  # pragma: no cover - baseline rollout remains importable with
     export_canonical_replay = None  # type: ignore[assignment]
     TaskStateView = None  # type: ignore[assignment]
     WorldRuntime = None  # type: ignore[assignment]
+    sample_tool_world = None  # type: ignore[assignment]
     DEFAULT_TOOL_ARGUMENT_CAPABILITIES = {}  # type: ignore[assignment]
     config_from_args = None  # type: ignore[assignment]
     stage_definition = None  # type: ignore[assignment]
@@ -4996,6 +4998,15 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                     if bayestool_question_id is not None
                     else str(bayes_coupling_id)
                 )
+                configured_primary_count = int(getattr(args, "n_samples_per_prompt", 4) or 4)
+                if not 4 <= configured_primary_count <= 6:
+                    if evaluation:
+                        configured_primary_count = 4
+                    else:
+                        raise ValueError(
+                            "BayesTool raw dataset fallback requires n_samples_per_prompt in [4, 6]; "
+                            f"got {configured_primary_count}"
+                        )
                 bayes_question_plan = make_question_rollout_plan(
                     question_id,
                     policy_version=str(
@@ -5003,6 +5014,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                     ),
                     seed=str(diagnostic_metadata.get("rollout_id", 0)),
                     group_size=int(getattr(bayestool_config, "default_group_size", 4)),
+                    realization_count=configured_primary_count,
                 )
                 diagnostic_metadata["question_rollout_plan"] = bayes_question_plan.to_dict()
                 diagnostic_metadata["question_id"] = question_id
@@ -5075,6 +5087,59 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                     for name, arguments in DEFAULT_TOOL_ARGUMENT_CAPABILITIES.items()
                 }
             world_sampling_context["tool_budget"] = bayestool_tool_budget
+            if bayes_question_plan is not None and not bayes_question_plan.latent_ids_finalized:
+                # Raw datasets have no prebuilt world manifest.  Freeze all
+                # realization worlds before constructing the first runtime so
+                # every primary and continuation uses one authoritative latent
+                # identity rather than a synthetic planning ID.
+                raw_fixed_specs = diagnostic_metadata.get("fixed_world_specs")
+                if isinstance(raw_fixed_specs, list) and len(raw_fixed_specs) == bayes_question_plan.group_count:
+                    frozen_specs = list(raw_fixed_specs)
+                else:
+                    if sample_tool_world is None:
+                        raise RuntimeError("BayesTool world sampler is unavailable for raw-plan materialization")
+                    frozen_specs = [
+                        sample_tool_world(
+                            bayes_coupling_id,
+                            world_slot=slot,
+                            replica_id=0,
+                            world_slot_role=realization.world_slot_role,
+                            variant_id=realization.variant_id,
+                            rollout_id=diagnostic_metadata.get("rollout_id", 0),
+                            config=bayestool_config,
+                            sampling_context=world_sampling_context,
+                            tool_budget=bayestool_tool_budget,
+                        ).to_dict()
+                        for slot, realization in enumerate(bayes_question_plan.realizations)
+                    ]
+                finalized_realizations = []
+                for realization, frozen_spec in zip(
+                    bayes_question_plan.realizations,
+                    frozen_specs,
+                    strict=True,
+                ):
+                    latent_world_id = (
+                        frozen_spec.get("latent_world_id")
+                        if isinstance(frozen_spec, Mapping)
+                        else getattr(frozen_spec, "latent_world_id", "")
+                    )
+                    if not str(latent_world_id).strip():
+                        raise ValueError(
+                            "raw BayesTool world materialization produced an empty latent_world_id"
+                        )
+                    finalized_realizations.append(
+                        replace(realization, latent_world_id=str(latent_world_id))
+                    )
+                bayes_question_plan = replace(
+                    bayes_question_plan,
+                    realizations=tuple(finalized_realizations),
+                    latent_ids_finalized=True,
+                )
+                diagnostic_metadata["fixed_world_specs"] = [
+                    spec.to_dict() if hasattr(spec, "to_dict") else dict(spec)
+                    for spec in frozen_specs
+                ]
+                diagnostic_metadata["question_rollout_plan"] = bayes_question_plan.to_dict()
             world_runtime = WorldRuntime.for_sample(
                 coupling_id=bayes_coupling_id,
                 sample_index=world_sample_index,

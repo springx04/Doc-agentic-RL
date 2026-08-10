@@ -1022,6 +1022,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Hard upper bound for complete questions in one BayesTool optimizer step.",
             )
             parser.add_argument(
+                "--bayestool-target-global-train-cost",
+                type=float,
+                default=None,
+                help="Target estimated token/visual training cost per BayesTool optimizer step.",
+            )
+            parser.add_argument(
+                "--bayestool-cost-visual-alpha",
+                type=float,
+                default=1.0,
+                help="Visual-token multiplier used by the BayesTool cost-aware batch planner.",
+            )
+            parser.add_argument(
+                "--bayestool-cost-overhead-beta",
+                type=float,
+                default=0.25,
+                help="Sequence-overhead multiplier used by the BayesTool cost-aware batch planner.",
+            )
+            parser.add_argument(
                 "--bayestool-empty-rollout-retry-limit",
                 type=int,
                 default=4,
@@ -1033,6 +1051,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--bayestool-posterior-particles", type=int, default=8)
             parser.add_argument("--bayestool-max-action-candidates", type=int, default=4)
             parser.add_argument("--bayestool-max-siblings", type=int, default=4)
+            parser.add_argument("--bayestool-k8-target-ratio", type=float, default=0.25)
+            parser.add_argument("--bayestool-k8-floor", type=float, default=0.0)
+            parser.add_argument("--bayestool-k8-ceiling", type=float, default=1.0)
+            parser.add_argument("--bayestool-k8-window", type=int, default=32)
             parser.add_argument("--bayestool-branch-horizon", type=int, default=3)
             parser.add_argument("--bayestool-branch-probability", type=float, default=None)
             parser.add_argument("--bayestool-consensus-threshold", type=float, default=0.75)
@@ -1954,6 +1976,11 @@ def slime_validate_args(args):
                 "BayesTool + Megatron is disabled until Megatron consumes the explicit "
                 "question/realization manifest and hierarchical loss weights. Use --train-backend fsdp."
             )
+        if bool(getattr(args, "calculate_per_token_loss", False)):
+            raise ValueError(
+                "BayesTool + calculate_per_token_loss is disabled because the per-token reducer "
+                "does not implement hierarchical BayesTool record weights; use sequence-level loss."
+            )
         if getattr(args, "num_steps_per_rollout", None) is not None:
             raise ValueError(
                 "BayesTool uses the explicit question manifest to define optimizer batches; "
@@ -1972,6 +1999,17 @@ def slime_validate_args(args):
         assert args.bayestool_max_observation_hypotheses >= 1
         assert 0.0 < args.bayestool_cvar_alpha <= 1.0
         assert args.bayestool_aux_micro_batch_size % 4 == 0, "Bayes auxiliary microbatch size must be a multiple of four"
+        if getattr(args, "bayestool_target_global_train_cost", None) is not None:
+            if float(args.bayestool_target_global_train_cost) <= 0.0:
+                raise ValueError("bayestool_target_global_train_cost must be positive when provided")
+        if float(getattr(args, "bayestool_cost_visual_alpha", 1.0)) < 0.0:
+            raise ValueError("bayestool_cost_visual_alpha must be non-negative")
+        if float(getattr(args, "bayestool_cost_overhead_beta", 0.25)) < 0.0:
+            raise ValueError("bayestool_cost_overhead_beta must be non-negative")
+        if not 0.0 <= float(getattr(args, "bayestool_k8_floor", 0.0)) <= float(getattr(args, "bayestool_k8_ceiling", 1.0)) <= 1.0:
+            raise ValueError("BayesTool K8 rolling floor/ceiling must satisfy 0 <= floor <= ceiling <= 1")
+        if int(getattr(args, "bayestool_k8_window", 32)) < 1:
+            raise ValueError("bayestool_k8_window must be positive")
         group_size = int(getattr(args, "bayestool_default_group_size", 4) or 4)
         if group_size not in {4, 8}:
             raise ValueError(f"BayesTool decision-group K must be 4 or 8, got {group_size}")

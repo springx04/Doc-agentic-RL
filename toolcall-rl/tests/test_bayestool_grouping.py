@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import sys
 from pathlib import Path
 
@@ -10,14 +11,18 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bayestool.grouping import (
+    K8RollingScheduler,
     WORLD_SLOT_ROLES,
     compute_hierarchical_loss_weights,
     make_question_rollout_plan,
+    select_extra_variants,
     validate_bayestool_question_records,
     validate_question_rollout_plan_records,
 )
+from bayestool.batching import assign_equal_cardinality_lpt, pack_questions_by_cost
 from bayestool.training import make_bayestool_decision_group_id
 from bayestool.world import WorldRuntime, sample_tool_world
+from build_bayestool_data import build_manifest
 
 
 def _records(
@@ -61,6 +66,108 @@ def test_explicit_plan_sizes_cover_r4k4_and_r6k8():
     assert make_question_rollout_plan(
         "q", group_size=8, extra_variants=["v1", "v2"]
     ).record_count == 48
+    assert make_question_rollout_plan("q5", group_size=4, realization_count=5).group_count == 5
+    assert make_question_rollout_plan("q6", group_size=8, realization_count=6).record_count == 48
+
+
+def test_variant_selection_is_seeded_and_fails_closed_after_selection():
+    candidates = [
+        {"world_slot_role": "local_degradation", "variant_id": "low", "coverage_deficit": 0.1},
+        {"world_slot_role": "change", "variant_id": "high", "calibration_gap": 0.9},
+        {"world_slot_role": "shared_family_fault", "variant_id": "mid", "diagnostic_value": 0.5},
+    ]
+    left, left_report = select_extra_variants("variant-q", candidates, seed=19)
+    right, right_report = select_extra_variants("variant-q", candidates, seed=19)
+    assert left == right
+    assert left_report == right_report
+    assert len(left) == 2
+    assert all("score" in item and "sampling_probability" in item for item in left_report["candidates"])
+    with pytest.raises(ValueError):
+        make_question_rollout_plan("too-many", extra_variants=["a", "b", "c"])
+
+
+def test_k8_rolling_scheduler_enforces_floor_and_ceiling():
+    scheduler = K8RollingScheduler(target_ratio=0.5, floor=0.5, ceiling=0.5, window=2, seed=3)
+    first, first_report = scheduler.choose("k8-q1")
+    second, second_report = scheduler.choose("k8-q2")
+    assert first == 8
+    assert second == 4
+    assert first_report["reason"] == "rolling_floor_recovery"
+    assert second_report["reason"] == "rolling_ceiling_guard"
+
+
+def test_manifest_rolling_scheduler_keeps_history_across_questions():
+    records = [
+        {
+            "id": "rolling-q1",
+            "question": "first",
+            "metadata": {
+                "bayestool_group_size": "rolling",
+                "bayestool_k8_target_ratio": 0.5,
+                "bayestool_k8_floor": 0.5,
+                "bayestool_k8_ceiling": 0.5,
+                "bayestool_k8_window": 2,
+            },
+        },
+        {
+            "id": "rolling-q2",
+            "question": "second",
+            "metadata": {
+                "bayestool_group_size": "rolling",
+                "bayestool_k8_target_ratio": 0.5,
+                "bayestool_k8_floor": 0.5,
+                "bayestool_k8_ceiling": 0.5,
+                "bayestool_k8_window": 2,
+            },
+        },
+    ]
+    coupled, _ = build_manifest(records, seed=17)
+    selections = [item["metadata"]["bayestool_k8_selection"] for item in coupled]
+    assert [item["selected_k"] for item in selections] == [8, 4]
+    assert selections[1]["ratio_before"] == pytest.approx(1.0)
+
+
+def test_manifest_preserves_an_upstream_explicit_plan():
+    plan = make_question_rollout_plan("explicit-manifest", group_size=8, realization_count=5)
+    record = {
+        "id": "explicit-manifest",
+        "question": "explicit question",
+        "metadata": {"question_rollout_plan": plan.to_dict()},
+    }
+    coupled, _ = build_manifest([record], seed=21)
+    persisted = coupled[0]["metadata"]["question_rollout_plan"]
+    assert persisted["question_id"] == plan.question_id
+    assert persisted["group_count"] == 5
+    assert [item["k"] for item in persisted["realizations"]] == [8] * 5
+
+
+def test_cost_packing_keeps_questions_atomic_and_honors_target():
+    ready = [("long", [0] * 16), ("short-a", [1] * 16), ("short-b", [2] * 16)]
+    batches, target, source = pack_questions_by_cost(
+        ready,
+        {"long": 100.0, "short-a": 40.0, "short-b": 40.0},
+        questions_per_step=2,
+        max_questions_per_step=2,
+        target_global_train_cost=140.0,
+    )
+    assert target == pytest.approx(140.0)
+    assert source == "explicit_cost_target"
+    assert [[question_id for question_id, _ in batch] for batch in batches] == [
+        ["long", "short-a"],
+        ["short-b"],
+    ]
+    assert all(indices for batch in batches for _, indices in batch)
+
+
+def test_lpt_balances_cost_with_equal_local_cardinality():
+    rank_indices, rank_costs = assign_equal_cardinality_lpt(
+        list(range(8)),
+        {index: float(9 - index) for index in range(8)},
+        dp_size=4,
+    )
+    assert all(len(indices) == 2 for indices in rank_indices)
+    assert sorted(index for indices in rank_indices for index in indices) == list(range(8))
+    assert max(rank_costs) - min(rank_costs) <= 1.0
 
 
 def test_manifest_validation_requires_exact_realization_and_k_contract():
@@ -140,6 +247,39 @@ def test_explicit_manifest_wins_over_legacy_world_type_hint():
     )
     assert runtime.spec.world_slot_role == realization.world_slot_role
     assert runtime.spec.latent_world_id == fixed_spec.latent_world_id
+
+
+def test_finalized_plan_rejects_a_different_frozen_latent_world():
+    plan = make_question_rollout_plan("strict-world", group_size=4)
+    fixed_specs = [
+        sample_tool_world(
+            "strict-world-coupling",
+            world_slot=index,
+            replica_id=0,
+            rollout_id=7,
+            world_slot_role=item.world_slot_role,
+            variant_id=item.variant_id,
+        )
+        for index, item in enumerate(plan.realizations)
+    ]
+    finalized = replace(
+        plan,
+        realizations=tuple(
+            replace(item, latent_world_id=spec.latent_world_id)
+            for item, spec in zip(plan.realizations, fixed_specs, strict=True)
+        ),
+        latent_ids_finalized=True,
+    )
+    bad_specs = [item.to_dict() for item in fixed_specs]
+    bad_specs[0]["latent_world_id"] = "wrong-latent"
+    with pytest.raises(ValueError, match="latent_world_id"):
+        WorldRuntime.for_sample(
+            coupling_id="strict-world-coupling",
+            sample_index=0,
+            realization_index=0,
+            question_rollout_plan=finalized,
+            fixed_world_specs=bad_specs,
+        )
 
 
 def test_expanded_record_offset_still_materializes_siblings_from_one_latent_spec():

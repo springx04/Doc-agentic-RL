@@ -1270,6 +1270,16 @@ class WorldRuntime:
             if isinstance(question_rollout_plan, Mapping)
             else None
         )
+        if plan is not None and plan.latent_ids_finalized:
+            if fixed_world_specs is None:
+                raise ValueError(
+                    "a finalized QuestionRolloutPlan requires fixed_world_specs for every realization"
+                )
+            if len(fixed_world_specs) != plan.group_count:
+                raise ValueError(
+                    "finalized QuestionRolloutPlan must carry one frozen world spec per realization: "
+                    f"{len(fixed_world_specs)} != {plan.group_count}"
+                )
         sample_offset = int(sample_index)
         if sample_offset < 0:
             raise ValueError(f"sample_index must be non-negative, got {sample_index}")
@@ -1350,7 +1360,29 @@ class WorldRuntime:
                     "fixed world spec coupling_id does not match the rollout coupling_id: "
                     f"{spec.coupling_id!r} != {coupling_id!r}"
                 )
-            if world_slot_role and not spec.world_slot_role:
+            if plan is not None:
+                expected_realization = plan.realizations[world_slot]
+                if int(spec.world_slot) != world_slot:
+                    raise ValueError(
+                        "fixed world spec slot does not match the QuestionRolloutPlan: "
+                        f"{spec.world_slot} != {world_slot}"
+                    )
+                if str(spec.world_slot_role) != str(expected_realization.world_slot_role):
+                    raise ValueError(
+                        "fixed world spec role does not match the QuestionRolloutPlan: "
+                        f"{spec.world_slot_role!r} != {expected_realization.world_slot_role!r}"
+                    )
+                if str(spec.variant_id or "base") != str(expected_realization.variant_id):
+                    raise ValueError(
+                        "fixed world spec variant does not match the QuestionRolloutPlan: "
+                        f"{spec.variant_id!r} != {expected_realization.variant_id!r}"
+                    )
+                if plan.latent_ids_finalized and str(spec.latent_world_id) != str(expected_realization.latent_world_id):
+                    raise ValueError(
+                        "fixed world latent_world_id does not match the finalized QuestionRolloutPlan: "
+                        f"{spec.latent_world_id!r} != {expected_realization.latent_world_id!r}"
+                    )
+            elif world_slot_role and not spec.world_slot_role:
                 spec = replace(spec, world_slot_role=world_slot_role, variant_id=variant_id)
             if plan is not None:
                 spec = replace(

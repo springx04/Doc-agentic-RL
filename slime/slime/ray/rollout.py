@@ -50,6 +50,7 @@ try:
         validate_bayestool_question_records,
         validate_question_rollout_plan_records,
     )
+    from bayestool.batching import assign_equal_cardinality_lpt, pack_questions_by_cost
 except ImportError:  # pragma: no cover - baseline Slime runs without BayesTool
     QuestionRolloutPlan = None
     WORLD_SLOT_ROLES = ("healthy", "local_degradation", "shared_family_fault", "change")
@@ -57,6 +58,8 @@ except ImportError:  # pragma: no cover - baseline Slime runs without BayesTool
     slot_role_from_metadata = None
     validate_bayestool_question_records = None
     validate_question_rollout_plan_records = None
+    assign_equal_cardinality_lpt = None
+    pack_questions_by_cost = None
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -240,12 +243,172 @@ def _validate_bayes_question_plan(
     }
 
 
+def _sample_bayes_train_cost(
+    sample: Sample,
+    *,
+    visual_alpha: float = 1.0,
+    overhead_beta: float = 0.25,
+) -> dict[str, float]:
+    """Estimate the forward/backward cost without using model labels."""
+
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    if metadata.get("dummy_removed_sample"):
+        return {
+            "text_loss_tokens": 0.0,
+            "visual_tokens": 0.0,
+            "sequence_overhead": 0.0,
+            "estimated_train_cost": 0.0,
+        }
+
+    def _non_negative(value: Any, default: float) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return default
+        return result if np.isfinite(result) and result >= 0.0 else default
+
+    loss_mask = sample.loss_mask or []
+    text_loss_tokens = _non_negative(
+        metadata.get("text_loss_tokens"),
+        float(sum(1 for value in loss_mask if value)) if loss_mask else float(sample.response_length),
+    )
+    visual_tokens = _non_negative(
+        metadata.get("visual_tokens", metadata.get("image_tokens")),
+        0.0,
+    )
+    if visual_tokens == 0.0 and isinstance(sample.multimodal_train_inputs, Mapping):
+        # Processor metadata varies by model.  Prefer a leading item dimension
+        # over raw pixel numel so image resolution does not dominate the cost.
+        for key, value in sample.multimodal_train_inputs.items():
+            if not isinstance(value, torch.Tensor) or value.numel() == 0:
+                continue
+            key_lower = str(key).casefold()
+            if "pixel" in key_lower or "image" in key_lower or "vision" in key_lower:
+                visual_tokens += float(value.shape[0] if value.ndim else value.numel())
+        visual_tokens = max(0.0, visual_tokens)
+    sequence_overhead = _non_negative(
+        metadata.get("sequence_overhead"),
+        float(max(0, len(sample.tokens) - int(text_loss_tokens))),
+    )
+    visual_alpha = max(0.0, float(visual_alpha))
+    overhead_beta = max(0.0, float(overhead_beta))
+    estimated = text_loss_tokens + visual_alpha * visual_tokens + overhead_beta * sequence_overhead
+    values = {
+        "text_loss_tokens": text_loss_tokens,
+        "visual_tokens": visual_tokens,
+        "sequence_overhead": sequence_overhead,
+        "estimated_train_cost": estimated,
+    }
+    if isinstance(sample.metadata, dict):
+        sample.metadata.update(values)
+    return values
+
+
+def _build_cost_aware_question_batches(
+    ready_questions: list[tuple[str, list[int]]],
+    question_costs: Mapping[str, float],
+    *,
+    questions_per_step: int,
+    max_questions_per_step: int,
+    target_global_train_cost: float | None,
+) -> tuple[list[list[tuple[str, list[int]]]], float, str]:
+    """Pack whole questions by estimated cost using a bounded greedy LPT pass."""
+    if pack_questions_by_cost is None:
+        raise RuntimeError("BayesTool cost batching helper is unavailable")
+    return pack_questions_by_cost(
+        ready_questions,
+        question_costs,
+        questions_per_step=questions_per_step,
+        max_questions_per_step=max_questions_per_step,
+        target_global_train_cost=target_global_train_cost,
+    )
+
+
+def _build_bayes_round_manifest(
+    samples: list[Sample],
+    batch_sizes: list[int],
+    *,
+    dp_size: int,
+    visual_alpha: float = 1.0,
+    overhead_beta: float = 0.25,
+) -> list[dict[str, Any]]:
+    """Create a rank-stable equal-cardinality LPT manifest for each round."""
+
+    if dp_size <= 0:
+        raise ValueError(f"dp_size must be positive, got {dp_size}")
+    if sum(int(value) for value in batch_sizes) != len(samples):
+        raise ValueError(
+            "BayesTool round manifest sizes must cover final samples: "
+            f"sum={sum(int(value) for value in batch_sizes)} samples={len(samples)}"
+        )
+    manifest: list[dict[str, Any]] = []
+    cursor = 0
+    for round_index, raw_batch_size in enumerate(batch_sizes):
+        batch_size = int(raw_batch_size)
+        if batch_size <= 0 or batch_size % dp_size:
+            raise ValueError(
+                f"BayesTool round size must be positive and divisible by dp_size: {batch_size}/{dp_size}"
+            )
+        indices = list(range(cursor, cursor + batch_size))
+        cursor += batch_size
+        costs = {
+            index: _sample_bayes_train_cost(
+                samples[index], visual_alpha=visual_alpha, overhead_beta=overhead_beta
+            )["estimated_train_cost"]
+            for index in indices
+        }
+        local_count = batch_size // dp_size
+        if assign_equal_cardinality_lpt is None:
+            raise RuntimeError("BayesTool LPT helper is unavailable")
+        # Equal local cardinality preserves the existing FSDP collective
+        # contract; LPT minimizes cost skew subject to that hard constraint.
+        rank_indices, rank_costs = assign_equal_cardinality_lpt(
+            indices,
+            costs,
+            dp_size=dp_size,
+        )
+        question_ids = sorted(
+            {
+                _bayes_question_id(samples[index])
+                for index in indices
+                if not (isinstance(samples[index].metadata, dict) and samples[index].metadata.get("dummy_removed_sample"))
+            }
+        )
+        max_cost = max(rank_costs, default=0.0)
+        min_cost = min(rank_costs, default=0.0)
+        manifest.append(
+            {
+                "round_index": round_index,
+                "global_sample_indices": indices,
+                "question_ids": question_ids,
+                "global_sample_count": batch_size,
+                "local_sample_count": local_count,
+                "rank_sample_indices": rank_indices,
+                "rank_costs": rank_costs,
+                "global_cost": float(sum(rank_costs)),
+                "max_rank_cost": float(max_cost),
+                "min_rank_cost": float(min_cost),
+                "rank_cost_imbalance": float((max_cost - min_cost) / max_cost) if max_cost else 0.0,
+                "dummy_sample_count": sum(
+                    1
+                    for index in indices
+                    if isinstance(samples[index].metadata, dict)
+                    and samples[index].metadata.get("dummy_removed_sample")
+                ),
+            }
+        )
+    return manifest
+
+
 def _prepare_bayes_question_batches(
     samples: list[Sample],
     *,
     dp_size: int,
     questions_per_step: int = 2,
     max_questions_per_step: int = 8,
+    target_global_train_cost: float | None = None,
+    visual_alpha: float = 1.0,
+    overhead_beta: float = 0.25,
 ) -> tuple[list[Sample], list[int], dict[str, Any]]:
     """Keep complete questions and produce a multi-question batch manifest.
 
@@ -274,6 +437,7 @@ def _prepare_bayes_question_batches(
             violations.append({"group_id": group_id, "size": len(indices), "errors": errors})
 
     ready_questions: list[tuple[str, list[int]]] = []
+    question_costs: dict[str, float] = {}
     skipped_questions: list[dict[str, Any]] = []
     question_plans_validated = 0
     for question_id, indices in questions.items():
@@ -327,6 +491,12 @@ def _prepare_bayes_question_batches(
                 {"question_id": question_id, "group_count": len(question_groups), "reason": "not_dp_divisible"}
             )
             continue
+        question_costs[question_id] = sum(
+            _sample_bayes_train_cost(
+                samples[index], visual_alpha=visual_alpha, overhead_beta=overhead_beta
+            )["estimated_train_cost"]
+            for index in ordered
+        )
         ready_questions.append((question_id, ordered))
 
     if not ready_questions:
@@ -344,15 +514,22 @@ def _prepare_bayes_question_batches(
             "violations": violations,
             "skipped_questions": skipped_questions,
             "question_plans_validated": question_plans_validated,
+            "question_costs": question_costs,
+            "target_global_train_cost": target_global_train_cost,
             "no_ready_questions": True,
         }
 
-    target = max(1, min(int(questions_per_step), int(max_questions_per_step)))
+    packed_questions, cost_target, cost_target_source = _build_cost_aware_question_batches(
+        ready_questions,
+        question_costs,
+        questions_per_step=questions_per_step,
+        max_questions_per_step=max_questions_per_step,
+        target_global_train_cost=target_global_train_cost,
+    )
     ordered_indices: list[int] = []
     batch_sizes: list[int] = []
     question_ids_by_batch: list[list[str]] = []
-    for start in range(0, len(ready_questions), target):
-        chunk = ready_questions[start : start + target]
+    for chunk in packed_questions:
         chunk_indices = [index for _, indices in chunk for index in indices]
         chunk_size = len(chunk_indices)
         if chunk_size % dp_size:
@@ -368,7 +545,7 @@ def _prepare_bayes_question_batches(
         questions_in_step_histogram[key] = questions_in_step_histogram.get(key, 0) + 1
     report = {
         "question_count": len(ready_questions),
-        "questions_in_step_target": target,
+        "questions_in_step_target": max(1, min(int(questions_per_step), int(max_questions_per_step))),
         "questions_in_step_histogram": questions_in_step_histogram,
         "batch_sizes": list(batch_sizes),
         "question_ids_by_batch": question_ids_by_batch,
@@ -377,6 +554,13 @@ def _prepare_bayes_question_batches(
         "violations": violations,
         "skipped_questions": skipped_questions,
         "question_plans_validated": question_plans_validated,
+        "question_costs": question_costs,
+        "target_global_train_cost": cost_target,
+        "cost_target_source": cost_target_source,
+        "estimated_global_batch_costs": [
+            float(sum(question_costs.get(question_id, 0.0) for question_id in question_ids))
+            for question_ids in question_ids_by_batch
+        ],
     }
     return reordered, batch_sizes, report
 
@@ -1310,12 +1494,16 @@ class RolloutManager:
         dp_size = self.train_parallel_config["dp_size"]
         bayes_batch_sizes: list[int] | None = None
         bayes_grouping_report: dict[str, Any] | None = None
+        bayes_round_manifest: list[dict[str, Any]] | None = None
         if self.args.advantage_estimator == "bayes_grpo":
             samples, bayes_batch_sizes, bayes_grouping_report = _prepare_bayes_question_batches(
                 samples,
                 dp_size=dp_size,
                 questions_per_step=int(getattr(self.args, "bayestool_questions_per_step", 2) or 2),
                 max_questions_per_step=int(getattr(self.args, "bayestool_max_questions_per_step", 8) or 8),
+                target_global_train_cost=getattr(self.args, "bayestool_target_global_train_cost", None),
+                visual_alpha=float(getattr(self.args, "bayestool_cost_visual_alpha", 1.0) or 1.0),
+                overhead_beta=float(getattr(self.args, "bayestool_cost_overhead_beta", 0.25) or 0.25),
             )
             logger.info(
                 "BAYESTOOL_QUESTION_BATCH_PLAN questions=%s batches=%s batch_sizes=%s skipped=%s violations=%s",
@@ -1468,6 +1656,20 @@ class RolloutManager:
             )
             samples.extend(_make_zero_loss_dummy_samples(dummy_count, visual_template))
 
+        if bayes_batch_sizes:
+            bayes_round_manifest = _build_bayes_round_manifest(
+                samples,
+                list(bayes_batch_sizes),
+                dp_size=dp_size,
+                visual_alpha=float(getattr(self.args, "bayestool_cost_visual_alpha", 1.0) or 1.0),
+                overhead_beta=float(getattr(self.args, "bayestool_cost_overhead_beta", 0.25) or 0.25),
+            )
+            if bayes_grouping_report is not None:
+                bayes_grouping_report["round_manifest"] = bayes_round_manifest
+                bayes_grouping_report["rank_costs_by_round"] = [
+                    item["rank_costs"] for item in bayes_round_manifest
+                ]
+
         raw_rewards, rewards = self._post_process_rewards(samples)
 
         assert len(raw_rewards) == len(samples)
@@ -1488,6 +1690,7 @@ class RolloutManager:
             train_data["bayes_batch_sizes"] = list(bayes_batch_sizes)
             train_data["bayes_question_ids"] = [_bayes_question_id(sample) for sample in samples]
             train_data["bayes_grouping_report"] = bayes_grouping_report or {}
+            train_data["bayes_round_manifest"] = bayes_round_manifest or []
         if fsdp_modality_aligned:
             train_data["_fsdp_modality_aligned"] = True
             if bayes_batch_sizes:
@@ -1719,7 +1922,32 @@ class RolloutManager:
         total_lengths = [len(t) for t in data["tokens"]]
         data["total_lengths"] = total_lengths
 
-        if data.get("_fsdp_modality_aligned") and data.get("_fsdp_bayes_batch_sizes"):
+        if data.get("bayes_round_manifest"):
+            round_manifest = data["bayes_round_manifest"]
+            partitions = [[] for _ in range(dp_size)]
+            seen: list[int] = []
+            for round_item in round_manifest:
+                rank_indices = round_item.get("rank_sample_indices") if isinstance(round_item, Mapping) else None
+                global_indices = round_item.get("global_sample_indices") if isinstance(round_item, Mapping) else None
+                if not isinstance(rank_indices, list) or len(rank_indices) != dp_size:
+                    raise ValueError("BayesTool round manifest must contain one rank_sample_indices list per DP rank")
+                if not isinstance(global_indices, list):
+                    raise ValueError("BayesTool round manifest is missing global_sample_indices")
+                flattened = [int(index) for rank in rank_indices for index in rank]
+                expected = [int(index) for index in global_indices]
+                if sorted(flattened) != sorted(expected):
+                    raise ValueError("BayesTool round manifest rank assignments do not cover the global round exactly")
+                if len({len(rank) for rank in rank_indices}) != 1:
+                    raise ValueError("BayesTool LPT round must preserve equal local sample counts")
+                for rank, rank_indices_for_rank in enumerate(rank_indices):
+                    partitions[rank].extend(int(index) for index in rank_indices_for_rank)
+                seen.extend(flattened)
+            if sorted(seen) != list(range(len(total_lengths))):
+                raise ValueError(
+                    "BayesTool round manifest does not partition every sample exactly once: "
+                    f"covered={len(seen)} samples={len(total_lengths)}"
+                )
+        elif data.get("_fsdp_modality_aligned") and data.get("_fsdp_bayes_batch_sizes"):
             batch_sizes = [int(value) for value in data["_fsdp_bayes_batch_sizes"]]
             partitions = [[] for _ in range(dp_size)]
             cursor = 0
@@ -1826,6 +2054,7 @@ class RolloutManager:
                 "bayes_batch_sizes",
                 "bayes_grouping_report",
                 "bayes_weight_report",
+                "bayes_round_manifest",
                 "_fsdp_bayes_batch_sizes",
             ]:
                 if key in data:

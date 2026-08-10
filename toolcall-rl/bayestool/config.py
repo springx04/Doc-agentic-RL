@@ -118,6 +118,10 @@ class BayesToolConfig:
     min_realizations: int = 4
     max_realizations: int = 6
     max_records_per_question: int = 48
+    k8_target_ratio: float = 0.25
+    k8_floor: float = 0.0
+    k8_ceiling: float = 1.0
+    k8_window: int = 32
     policy_version: str = "bayestool-policy-v1"
     worlds_per_prompt: int = 4
     # Compatibility metadata only.  New plans materialize K continuations
@@ -435,6 +439,10 @@ def add_bayestool_arguments(parser: argparse.ArgumentParser) -> argparse.Argumen
     parser.add_argument("--bayestool-min-realizations", type=int, default=None)
     parser.add_argument("--bayestool-max-realizations", type=int, default=None)
     parser.add_argument("--bayestool-max-records-per-question", type=int, default=None)
+    parser.add_argument("--bayestool-k8-target-ratio", type=float, default=None)
+    parser.add_argument("--bayestool-k8-floor", type=float, default=None)
+    parser.add_argument("--bayestool-k8-ceiling", type=float, default=None)
+    parser.add_argument("--bayestool-k8-window", type=int, default=None)
     parser.add_argument("--bayestool-policy-version", type=str, default=None)
     parser.add_argument("--bayestool-worlds-per-prompt", type=int, default=None)
     parser.add_argument("--bayestool-replicas-per-world", type=int, default=None)

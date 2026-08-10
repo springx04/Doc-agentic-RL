@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import random
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
@@ -26,6 +27,180 @@ WORLD_SLOT_ROLES: tuple[str, ...] = (
 ALLOWED_GROUP_SIZES: frozenset[int] = frozenset({4, 8})
 GROUPING_SCHEMA_VERSION = "bayestool-question-grouping-v2"
 DEFAULT_POLICY_VERSION = "bayestool-policy-v1"
+
+
+def _finite_float(value: Any, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) else default
+
+
+def _variant_score(candidate: Mapping[str, Any]) -> float:
+    """Score observable variant value; hidden labels are never consulted."""
+
+    explicit = candidate.get("score")
+    if explicit is not None:
+        return _finite_float(explicit)
+    return (
+        0.35 * _finite_float(candidate.get("coverage_deficit"))
+        + 0.25 * _finite_float(candidate.get("learning_progress"))
+        + 0.25 * _finite_float(candidate.get("calibration_gap"))
+        + 0.15 * _finite_float(candidate.get("diagnostic_value"))
+    )
+
+
+def select_extra_variants(
+    question_id: str,
+    candidates: Sequence[Mapping[str, Any] | str],
+    *,
+    seed: int | str = 0,
+    max_extra: int = 2,
+    exploration_probability: float = 0.10,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Select at most two observable world variants with a fixed seed.
+
+    The caller may provide more than two candidates; selection is explicit and
+    auditable.  ``make_question_rollout_plan`` still rejects more than two
+    already-selected variants so malformed manifests fail closed.
+    """
+
+    if int(max_extra) < 0 or int(max_extra) > 2:
+        raise ValueError(f"max_extra must be in [0, 2], got {max_extra!r}")
+    probability = max(0.0, min(1.0, _finite_float(exploration_probability)))
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for index, value in enumerate(candidates):
+        if isinstance(value, Mapping):
+            role = str(value.get("world_slot_role", value.get("slot_role", "local_degradation")))
+            variant = str(value.get("variant_id", f"variant-{index + 1}"))
+            item = dict(value)
+        else:
+            role = "local_degradation"
+            variant = str(value or f"variant-{index + 1}")
+            item = {}
+        if role not in WORLD_SLOT_ROLES or role == "healthy":
+            raise ValueError(f"extra variant must target a non-healthy required role, got {role!r}")
+        key = (role, variant)
+        if key in seen:
+            raise ValueError(f"duplicate extra variant candidate: {role}:{variant}")
+        seen.add(key)
+        item.update({"world_slot_role": role, "variant_id": variant})
+        item["score"] = _variant_score(item)
+        normalized.append(item)
+
+    if not normalized or max_extra == 0:
+        return [], {
+            "question_id": str(question_id),
+            "seed": str(seed),
+            "candidates": normalized,
+            "selected": [],
+            "selection_reason": "no_variant_candidates",
+        }
+
+    temperature = max(0.05, _finite_float(normalized[0].get("temperature"), 1.0))
+    max_score = max(float(item["score"]) for item in normalized)
+    exp_scores = [math.exp((float(item["score"]) - max_score) / temperature) for item in normalized]
+    normalizer = sum(exp_scores) or 1.0
+    for item, value in zip(normalized, exp_scores, strict=True):
+        item["sampling_probability"] = float(value / normalizer)
+
+    rng = random.Random(f"{question_id}:{seed}:bayestool-variant-selection")
+    remaining = list(normalized)
+    selected: list[dict[str, Any]] = []
+    for _ in range(min(int(max_extra), len(remaining))):
+        explore = rng.random() < probability
+        if explore:
+            weights = [max(0.0, float(item.get("sampling_probability", 0.0))) for item in remaining]
+            total = sum(weights) or float(len(remaining))
+            draw = rng.random() * total
+            chosen_index = 0
+            for chosen_index, weight in enumerate(weights):
+                draw -= weight or 1.0
+                if draw <= 0.0:
+                    break
+            reason = "seeded_exploration"
+        else:
+            chosen_index = max(
+                range(len(remaining)),
+                key=lambda index: (float(remaining[index]["score"]), -index),
+            )
+            reason = "highest_observable_value"
+        chosen = dict(remaining.pop(chosen_index))
+        chosen["selection_reason"] = reason
+        chosen["selected"] = True
+        selected.append(chosen)
+
+    selected_keys = {(item["world_slot_role"], item["variant_id"]) for item in selected}
+    for item in normalized:
+        item["selected"] = (item["world_slot_role"], item["variant_id"]) in selected_keys
+        item.setdefault("selection_reason", "not_selected")
+    return selected, {
+        "question_id": str(question_id),
+        "seed": str(seed),
+        "candidates": normalized,
+        "selected": [dict(item) for item in selected],
+        "selection_reason": "seeded_exploration" if any(item["selection_reason"] == "seeded_exploration" for item in selected) else "highest_observable_value",
+    }
+
+
+@dataclass
+class K8RollingScheduler:
+    """Bound K=8 usage while keeping an auditable rolling target."""
+
+    target_ratio: float = 0.25
+    floor: float = 0.0
+    ceiling: float = 1.0
+    window: int = 32
+    seed: int | str = 0
+    history: list[int] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.target_ratio = max(0.0, min(1.0, _finite_float(self.target_ratio)))
+        self.floor = max(0.0, min(1.0, _finite_float(self.floor)))
+        self.ceiling = max(self.floor, min(1.0, _finite_float(self.ceiling, 1.0)))
+        self.window = max(1, int(self.window))
+
+    @property
+    def ratio(self) -> float:
+        recent = self.history[-self.window :]
+        return sum(recent) / len(recent) if recent else 0.0
+
+    def choose(self, question_id: str, *, requested_k: int = 4, signal: float = 0.0) -> tuple[int, dict[str, Any]]:
+        requested_k = int(requested_k)
+        if requested_k not in ALLOWED_GROUP_SIZES:
+            raise ValueError(f"requested_k must be 4 or 8, got {requested_k!r}")
+        before = self.ratio
+        if requested_k == 8:
+            selected_k = 8
+            reason = "manifest_requested_k8"
+        elif before < self.floor:
+            selected_k = 8
+            reason = "rolling_floor_recovery"
+        elif before >= self.ceiling:
+            selected_k = 4
+            reason = "rolling_ceiling_guard"
+        else:
+            signal_adjustment = max(-0.25, min(0.25, _finite_float(signal)))
+            probability = max(self.floor, min(self.ceiling, self.target_ratio + signal_adjustment))
+            draw = random.Random(f"{question_id}:{self.seed}:k8").random()
+            selected_k = 8 if draw < probability else 4
+            reason = "rolling_target_exploration" if selected_k == 8 else "rolling_target_k4"
+        self.history.append(1 if selected_k == 8 else 0)
+        if len(self.history) > self.window:
+            del self.history[:-self.window]
+        return selected_k, {
+            "question_id": str(question_id),
+            "selected_k": selected_k,
+            "reason": reason,
+            "ratio_before": before,
+            "ratio_after": self.ratio,
+            "target_ratio": self.target_ratio,
+            "floor": self.floor,
+            "ceiling": self.ceiling,
+            "window": self.window,
+        }
 
 
 def _nested(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -130,6 +305,14 @@ class QuestionRolloutPlan:
     schema_version: str = GROUPING_SCHEMA_VERSION
     max_records: int = 48
     slot_weights: tuple[tuple[str, float], ...] = tuple((role, 0.25) for role in WORLD_SLOT_ROLES)
+    # Data-builder manifests set this after freezing one latent world spec per
+    # realization.  Runtime-created fallback plans keep it false until their
+    # first world is materialized; this prevents a synthetic planning ID from
+    # being mistaken for a finalized world identity.
+    latent_ids_finalized: bool = False
+    # Candidate/selection diagnostics are part of the frozen manifest so a
+    # dynamic variant decision can be audited without changing group weights.
+    variant_selection: tuple[Mapping[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
         if not str(self.question_id).strip():
@@ -157,6 +340,10 @@ class QuestionRolloutPlan:
         if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-6):
             raise ValueError(f"slot weights must sum to one, got {total}")
         for realization in self.realizations:
+            if self.latent_ids_finalized and not str(realization.latent_world_id).strip():
+                raise ValueError(
+                    "a finalized question plan must declare latent_world_id for every realization"
+                )
             expected = float(weights[realization.world_slot_role])
             if not math.isclose(float(realization.slot_weight), expected, rel_tol=0.0, abs_tol=1e-6):
                 raise ValueError(
@@ -184,6 +371,8 @@ class QuestionRolloutPlan:
             "record_count": self.record_count,
             "max_records": int(self.max_records),
             "slot_weights": {role: float(weight) for role, weight in self.slot_weights},
+            "latent_ids_finalized": bool(self.latent_ids_finalized),
+            "variant_selection": [dict(item) for item in self.variant_selection if isinstance(item, Mapping)],
         }
 
     @classmethod
@@ -215,6 +404,10 @@ class QuestionRolloutPlan:
             schema_version=str(value.get("schema_version", GROUPING_SCHEMA_VERSION)),
             max_records=int(value.get("max_records", 48)),
             slot_weights=slot_weights,
+            latent_ids_finalized=bool(value.get("latent_ids_finalized", False)),
+            variant_selection=tuple(
+                dict(item) for item in (value.get("variant_selection", ()) or ()) if isinstance(item, Mapping)
+            ),
         )
 
 
@@ -223,9 +416,12 @@ def make_question_rollout_plan(
     *,
     policy_version: str = DEFAULT_POLICY_VERSION,
     seed: int | str = 0,
-    group_size: int = 4,
+    group_size: int | str = 4,
     extra_variants: Sequence[Mapping[str, Any] | str] = (),
     k_by_role: Mapping[str, int] | None = None,
+    realization_count: int | None = None,
+    k8_scheduler: K8RollingScheduler | None = None,
+    selection_signal: float = 0.0,
 ) -> QuestionRolloutPlan:
     """Create the mandatory H/L/F/C plan plus at most two variants.
 
@@ -233,15 +429,56 @@ def make_question_rollout_plan(
     it never changes the required four roles or the loss weights.
     """
 
+    if isinstance(group_size, str) and group_size.casefold() == "rolling":
+        if k8_scheduler is None:
+            raise ValueError("group_size='rolling' requires a K8RollingScheduler")
+        group_size, _ = k8_scheduler.choose(
+            str(question_id), requested_k=4, signal=selection_signal
+        )
     if int(group_size) not in ALLOWED_GROUP_SIZES:
         raise ValueError(f"group_size must be 4 or 8, got {group_size!r}")
+    if realization_count is not None and not 4 <= int(realization_count) <= 6:
+        raise ValueError(f"realization_count must be in [4, 6], got {realization_count!r}")
+    requested_extra_count = max(0, int(realization_count) - 4) if realization_count is not None else None
+    if requested_extra_count and not extra_variants:
+        defaults = (
+            {"world_slot_role": "local_degradation", "variant_id": "fallback-local"},
+            {"world_slot_role": "change", "variant_id": "fallback-change"},
+        )
+        extra_variants = defaults[:requested_extra_count]
+    if requested_extra_count is not None and len(extra_variants) != requested_extra_count:
+        raise ValueError(
+            "realization_count and extra_variants disagree: "
+            f"expected {requested_extra_count} extras, got {len(extra_variants)}"
+        )
     variants: list[tuple[str, str]] = []
+    selection_records: list[Mapping[str, Any]] = []
+    if len(extra_variants) > 2:
+        raise ValueError(
+            "at most two extra BayesTool variants may enter a question plan; "
+            "select candidates before calling make_question_rollout_plan"
+        )
     for index, value in enumerate(extra_variants):
-        if index >= 2:
-            break
         if isinstance(value, Mapping):
             role = str(value.get("world_slot_role", value.get("slot_role", "local_degradation")))
             variant = str(value.get("variant_id", f"variant-{index + 1}"))
+            selection = value.get("selection")
+            if isinstance(selection, Mapping):
+                selection_records.append(dict(selection))
+            elif any(key in value for key in ("score", "sampling_probability", "selection_reason")):
+                selection_records.append(
+                    {
+                        key: value[key]
+                        for key in (
+                            "world_slot_role",
+                            "variant_id",
+                            "score",
+                            "sampling_probability",
+                            "selection_reason",
+                        )
+                        if key in value
+                    }
+                )
         else:
             role = "local_degradation"
             variant = str(value or f"variant-{index + 1}")
@@ -277,7 +514,12 @@ def make_question_rollout_plan(
                 policy_version=policy_version,
             )
         )
-    return QuestionRolloutPlan(question_id=str(question_id), policy_version=policy_version, realizations=tuple(entries))
+    return QuestionRolloutPlan(
+        question_id=str(question_id),
+        policy_version=policy_version,
+        realizations=tuple(entries),
+        variant_selection=tuple(selection_records),
+    )
 
 
 def _record_metadata(record: Any) -> Mapping[str, Any]:
@@ -503,14 +745,15 @@ def validate_question_rollout_plan_records(
         errors.append("plan_question_id_mismatch")
     if len(active_records) > int(parsed_plan.max_records):
         errors.append("plan_record_limit_exceeded")
+    if len(active_records) != int(parsed_plan.record_count):
+        errors.append(
+            f"plan_record_count_mismatch:{len(active_records)}!={parsed_plan.record_count}"
+        )
 
     groups: dict[str, list[Any]] = defaultdict(list)
     for record in active_records:
         groups[_group_id(_record_metadata(record))].append(record)
-    expected = {
-        (item.world_slot_role, item.variant_id): int(item.k)
-        for item in parsed_plan.realizations
-    }
+    expected = {(item.world_slot_role, item.variant_id): item for item in parsed_plan.realizations}
     actual: dict[tuple[str, str], tuple[str, int]] = {}
     for group_id, group_records in groups.items():
         metadata = _record_metadata(group_records[0])
@@ -526,15 +769,64 @@ def validate_question_rollout_plan_records(
         if extra:
             errors.append(f"unexpected_plan_realizations:{extra}")
     for pair, expected_k in expected.items():
-        if pair in actual and actual[pair][1] != expected_k:
+        if pair in actual and actual[pair][1] != int(expected[pair].k):
             errors.append(
-                f"plan_group_size_mismatch:{pair[0]}:{pair[1]}:{actual[pair][1]}!={expected_k}"
+                f"plan_group_size_mismatch:{pair[0]}:{pair[1]}:{actual[pair][1]}!={expected[pair].k}"
             )
+        if pair not in actual:
+            continue
+        actual_group_id = actual[pair][0]
+        metadata = _record_metadata(groups[actual_group_id][0])
+        realization = expected[pair]
+        expected_identity = {
+            "latent_world_id": realization.latent_world_id,
+            "selected_decision_event": realization.selected_decision_event,
+            "decision_prefix_hash": realization.decision_prefix_hash,
+            "runtime_state_digest": realization.runtime_state_digest,
+            "policy_version": realization.policy_version,
+        }
+        for field, expected_value in expected_identity.items():
+            # Root plans created before a runtime checkpoint exists leave the
+            # node-specific fields blank.  Once a plan declares one, a record
+            # must match it exactly; silently accepting a different node would
+            # mix advantages from different prefixes.
+            if not str(expected_value).strip():
+                continue
+            actual_value = str(metadata_value(metadata, field, ""))
+            if actual_value != str(expected_value):
+                errors.append(
+                    f"plan_{field}_mismatch:{pair[0]}:{pair[1]}:{actual_value}!={expected_value}"
+                )
+        actual_policy = str(metadata_value(metadata, "policy_version", ""))
+        if actual_policy != str(realization.policy_version):
+            errors.append(
+                f"plan_policy_version_mismatch:{pair[0]}:{pair[1]}:{actual_policy}!={realization.policy_version}"
+            )
+        actual_slot_weight = metadata_value(metadata, "slot_weight", None)
+        if actual_slot_weight is None:
+            if parsed_plan.latent_ids_finalized:
+                errors.append(f"plan_slot_weight_missing:{pair[0]}:{pair[1]}")
+        else:
+            try:
+                if not math.isclose(
+                    float(actual_slot_weight),
+                    float(realization.slot_weight),
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                ):
+                    errors.append(
+                        f"plan_slot_weight_mismatch:{pair[0]}:{pair[1]}:{actual_slot_weight}!={realization.slot_weight}"
+                    )
+            except (TypeError, ValueError):
+                errors.append(f"plan_slot_weight_invalid:{pair[0]}:{pair[1]}")
     return {
         **report,
         "plan_valid": not errors,
         "plan_errors": errors,
-        "expected_realizations": {f"{role}:{variant}": k for (role, variant), k in expected.items()},
+        "expected_realizations": {
+            f"{role}:{variant}": realization.k
+            for (role, variant), realization in expected.items()
+        },
         "actual_realizations": {
             f"{role}:{variant}": {"group_id": group_id, "size": size}
             for (role, variant), (group_id, size) in actual.items()
@@ -689,9 +981,11 @@ __all__ = [
     "ALLOWED_GROUP_SIZES",
     "GROUPING_SCHEMA_VERSION",
     "DEFAULT_POLICY_VERSION",
+    "K8RollingScheduler",
     "RealizationPlan",
     "QuestionRolloutPlan",
     "make_question_rollout_plan",
+    "select_extra_variants",
     "question_id_from_metadata",
     "slot_role_from_metadata",
     "validate_bayestool_question_records",

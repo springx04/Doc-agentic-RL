@@ -8,10 +8,15 @@ import json
 from collections import defaultdict
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from bayestool.config import default_config, stage_schedule
-from bayestool.grouping import make_question_rollout_plan
+from bayestool.grouping import (
+    K8RollingScheduler,
+    QuestionRolloutPlan,
+    make_question_rollout_plan,
+    select_extra_variants,
+)
 from bayestool.meta_episode import build_meta_episode
 from bayestool.world import document_hash, sample_tool_world, sample_world_type
 
@@ -74,6 +79,11 @@ def build_manifest(
             config,
             session_state_probabilities=_probability_pairs(session_state_probabilities, "session state"),
         )
+    # A rolling K8 policy is stateful across questions.  Keep independent
+    # histories only when a manifest explicitly requests different policy
+    # bounds; constructing a scheduler inside the question loop would reset
+    # the rolling floor/ceiling on every question.
+    rolling_schedulers: dict[tuple[float, float, float, int, int], K8RollingScheduler] = {}
     coupled: list[dict[str, Any]] = []
     for record_index, record in enumerate(records):
         cid = coupling_id(record)
@@ -99,16 +109,73 @@ def build_manifest(
             or record.get("task_id")
             or cid
         )
+        raw_plan = metadata.get("question_rollout_plan")
         extra_variants = metadata.get("bayestool_extra_variants", ())
         if not isinstance(extra_variants, (list, tuple)):
             extra_variants = ()
-        plan = make_question_rollout_plan(
-            question_id,
-            policy_version=str(getattr(config, "policy_version", "bayestool-policy-v1")),
-            seed=seed + record_index,
-            group_size=int(getattr(config, "default_group_size", 4)),
-            extra_variants=extra_variants,
+        if len(extra_variants) > 2:
+            raise ValueError(
+                f"{question_id}: bayestool_extra_variants already contains {len(extra_variants)} entries; "
+                "select candidates explicitly before building the manifest"
+            )
+        variant_candidates = metadata.get("bayestool_variant_candidates", ())
+        variant_selection: dict[str, Any] = {}
+        if not extra_variants and isinstance(variant_candidates, (list, tuple)):
+            extra_variants, variant_selection = select_extra_variants(
+                question_id,
+                variant_candidates,
+                seed=seed + record_index,
+                max_extra=2,
+                exploration_probability=float(metadata.get("bayestool_variant_exploration_probability", 0.10) or 0.10),
+            )
+        requested_group_size = metadata.get("bayestool_group_size", getattr(config, "default_group_size", 4))
+        k8_selection = None
+        if isinstance(raw_plan, Mapping):
+            # An upstream builder may already have frozen a plan.  Preserve
+            # it and fail closed on a question-id mismatch instead of
+            # silently replacing the producer's world/variant contract.
+            plan = QuestionRolloutPlan.from_mapping(raw_plan)
+            if plan.question_id != question_id:
+                raise ValueError(
+                    f"{question_id}: question_rollout_plan question_id {plan.question_id!r} does not match"
+                )
+        else:
+            if isinstance(requested_group_size, str) and requested_group_size.casefold() == "rolling":
+                target_ratio = float(metadata.get("bayestool_k8_target_ratio", 0.25) or 0.25)
+                floor = float(metadata.get("bayestool_k8_floor", 0.0) or 0.0)
+                ceiling = float(metadata.get("bayestool_k8_ceiling", 1.0) or 1.0)
+                window = int(metadata.get("bayestool_k8_window", 32) or 32)
+                scheduler_key = (target_ratio, floor, ceiling, window, int(seed))
+                scheduler = rolling_schedulers.setdefault(
+                    scheduler_key,
+                    K8RollingScheduler(
+                        target_ratio=target_ratio,
+                        floor=floor,
+                        ceiling=ceiling,
+                        window=window,
+                        seed=seed,
+                    ),
+                )
+                requested_group_size, k8_selection = scheduler.choose(question_id, requested_k=4)
+            plan = make_question_rollout_plan(
+                question_id,
+                policy_version=str(getattr(config, "policy_version", "bayestool-policy-v1")),
+                seed=seed + record_index,
+                group_size=int(requested_group_size),
+                extra_variants=extra_variants,
+            )
+        selection_items = (
+            [dict(item) for item in variant_selection.get("candidates", []) if isinstance(item, dict)]
+            if isinstance(variant_selection, dict)
+            else []
         )
+        if k8_selection is not None:
+            selection_items.append(dict(k8_selection))
+        if selection_items:
+            plan = replace(
+                plan,
+                variant_selection=tuple(selection_items),
+            )
         worlds = []
         finalized_realizations = []
         for slot, realization in enumerate(plan.realizations):
@@ -130,12 +197,14 @@ def build_manifest(
             finalized_realizations.append(
                 replace(realization, latent_world_id=spec.latent_world_id)
             )
-        plan = replace(plan, realizations=tuple(finalized_realizations))
+        plan = replace(plan, realizations=tuple(finalized_realizations), latent_ids_finalized=True)
         metadata.update({
             "coupling_id": cid,
             "document_hash": document_hash(document),
             "question_id": question_id,
             "question_rollout_plan": plan.to_dict(),
+            "bayestool_variant_selection": dict(variant_selection),
+            "bayestool_k8_selection": k8_selection,
             "realization_count": plan.group_count,
             "records_per_question": plan.record_count,
             # These are compatibility diagnostics only.  They are not used
