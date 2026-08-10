@@ -2149,6 +2149,31 @@ def _candidate_relation_score(candidate: dict[str, Any]) -> float:
         return 0.0
 
 
+def _bayestool_dvoi_score(value: Any) -> float:
+    """Return a scalar DVOI score for branch ranking and telemetry.
+
+    ``DecisionReport.dvoi`` is intentionally a mapping from candidate action
+    keys to scores.  Branch selection needs one checkpoint-level score, so use
+    the strongest finite candidate value while retaining the original mapping
+    in the decision metadata.  Older callers may still provide a scalar.
+    """
+    if isinstance(value, Mapping):
+        scores: list[float] = []
+        for candidate in value.values():
+            try:
+                score = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(score):
+                scores.append(score)
+        return max(scores, default=0.0)
+    try:
+        score = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return score if math.isfinite(score) else 0.0
+
+
 def _valid_evidence_candidates(candidates: Any) -> list[dict[str, Any]]:
     """Return only candidates that satisfy the question-bound relation rule."""
     if not isinstance(candidates, (list, tuple)):
@@ -5659,7 +5684,10 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                 "turn": int(turn),
                 "prefix_hash": pre_action_checkpoint.get("prefix_hash", ""),
                 "decision_regret": float(branch_decision.get("decision_regret", 0.0) or 0.0),
-                "dvoi": float(branch_decision.get("dvoi", 0.0) or 0.0),
+                "dvoi": _bayestool_dvoi_score(branch_decision.get("dvoi", 0.0)),
+                "dvoi_values": dict(branch_decision.get("dvoi") or {})
+                if isinstance(branch_decision.get("dvoi"), Mapping)
+                else {},
             }
             branch_events.append(deferred_event)
             navigation_state.setdefault("bayes_branch_events", []).append(deferred_event)
@@ -5840,7 +5868,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                 deferred_branch_candidates,
                 key=lambda item: (
                     float(item["decision"].get("decision_regret", 0.0) or 0.0),
-                    float(item["decision"].get("dvoi", 0.0) or 0.0),
+                    _bayestool_dvoi_score(item["decision"].get("dvoi", 0.0)),
                     float(item["decision"].get("best_action_margin", 0.0) or 0.0),
                     -int(item.get("turn", 0)),
                 ),

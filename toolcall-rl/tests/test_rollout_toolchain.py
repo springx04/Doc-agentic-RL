@@ -78,6 +78,14 @@ def test_world_injected_failure_is_a_valid_sendable_observation(monkeypatch):
     assert not module._is_world_injected_observation({"success": False})
 
 
+def test_bayestool_dvoi_mapping_is_reduced_only_for_branch_ranking(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+
+    assert module._bayestool_dvoi_score({"render_page": 0.25, "ocr_region": 0.7}) == 0.7
+    assert module._bayestool_dvoi_score({"invalid": "not-a-number"}) == 0.0
+    assert module._bayestool_dvoi_score(0.4) == 0.4
+
+
 def test_image_context_compaction_keeps_follow_up_generation_possible(monkeypatch):
     module, _ = _load_generator(monkeypatch)
     segments = [
