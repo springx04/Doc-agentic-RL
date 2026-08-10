@@ -86,6 +86,23 @@ def test_variant_selection_is_seeded_and_fails_closed_after_selection():
         make_question_rollout_plan("too-many", extra_variants=["a", "b", "c"])
 
 
+def test_variant_exploration_skips_zero_probability_candidates():
+    selected, report = select_extra_variants(
+        "zero-probability-q",
+        [
+            {"world_slot_role": "local_degradation", "variant_id": "underflow", "score": -1e9},
+            {"world_slot_role": "change", "variant_id": "high-value", "score": 0.0},
+        ],
+        seed=7,
+        max_extra=1,
+        exploration_probability=1.0,
+    )
+
+    assert [item["variant_id"] for item in selected] == ["high-value"]
+    assert report["candidates"][0]["sampling_probability"] == 0.0
+    assert report["candidates"][1]["sampling_probability"] == 1.0
+
+
 def test_k8_rolling_scheduler_enforces_floor_and_ceiling():
     scheduler = K8RollingScheduler(target_ratio=0.5, floor=0.5, ceiling=0.5, window=2, seed=3)
     first, first_report = scheduler.choose("k8-q1")

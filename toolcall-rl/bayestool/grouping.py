@@ -113,13 +113,17 @@ def select_extra_variants(
         explore = rng.random() < probability
         if explore:
             weights = [max(0.0, float(item.get("sampling_probability", 0.0))) for item in remaining]
-            total = sum(weights) or float(len(remaining))
-            draw = rng.random() * total
-            chosen_index = 0
-            for chosen_index, weight in enumerate(weights):
-                draw -= weight or 1.0
-                if draw <= 0.0:
-                    break
+            total = sum(weights)
+            if total <= 0.0:
+                chosen_index = rng.randrange(len(remaining))
+            else:
+                draw = rng.random() * total
+                chosen_index = len(remaining) - 1
+                for index, weight in enumerate(weights):
+                    draw -= weight
+                    if draw < 0.0:
+                        chosen_index = index
+                        break
             reason = "seeded_exploration"
         else:
             chosen_index = max(
