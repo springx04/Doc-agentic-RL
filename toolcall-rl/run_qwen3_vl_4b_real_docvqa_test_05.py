@@ -26,14 +26,23 @@ REAL_TRAIN_DATA = Path(
 REAL_EVAL_DATA = Path(
     os.environ.get("OPENCLAW_BAYESTOOL_EVAL_DATA", str(FULL_DATA_DIR / "eval.jsonl"))
 ).resolve()
-STAGE_A_DIR = (base.PROJECT / "outputs" / "qwen3-vl-4b-docvqa-bayestool-rl-20260807-11" / "stage_a_v2").resolve()
+STAGE_A_DIR = (
+    base.PROJECT / "artifacts" / "bayestool-stage-a-20260809-fulltrain" / "checkpoints"
+).resolve()
 DEFAULT_CHECKPOINTS = {
     "BAYESTOOL_BELIEF_CHECKPOINT": STAGE_A_DIR / "belief_filter.pt",
     "BAYESTOOL_Q_CHECKPOINT": STAGE_A_DIR / "bayes_q_head.pt",
     "BAYESTOOL_RISK_CHECKPOINT": STAGE_A_DIR / "answer_risk.json",
 }
 REAL_OUTPUT_DIR = Path(os.environ.get("OPENCLAW_BAYESTOOL_OUTPUT_DIR", str(base.PROJECT / "outputs" / "qwen3-vl-4b-docvqa-bayestool-rl-20260807-13"))).resolve()
-REAL_RAY_TEMP_DIR = Path(os.environ.get("OPENCLAW_BAYESTOOL_RAY_TEMP_DIR", str(base.WORKSPACE / ".ray" / "bt0813c"))).resolve()
+# Ray creates Unix-domain sockets below this directory.  Keep the default
+# deliberately short: the project path may be nested deeply on a mounted
+# workspace and can otherwise exceed the Linux 107-byte AF_UNIX limit before
+# training even starts.  Operators can still override it for a dedicated
+# per-run directory.
+REAL_RAY_TEMP_DIR = Path(
+    os.environ.get("OPENCLAW_BAYESTOOL_RAY_TEMP_DIR", str(base.WORKSPACE / "ocrl-ray"))
+).resolve()
 _BASE_TRAINING_ARGV = base.training_argv
 
 
@@ -56,19 +65,21 @@ def _training_argv() -> list[str]:
     argv = _BASE_TRAINING_ARGV()
     argv.remove("--disable-rewards-normalization")
     _replace_value(argv, "--rollout-batch-size", os.environ.get("OPENCLAW_BAYESTOOL_ROLLOUT_BATCH_SIZE", "2"))
-    samples_per_prompt = os.environ.get("OPENCLAW_BAYESTOOL_SAMPLES_PER_PROMPT", "8")
+    # Four mandatory world slots x four independent root siblings.  The old
+    # 4x2 layout could not form a valid K=4 decision group.
+    samples_per_prompt = os.environ.get("OPENCLAW_BAYESTOOL_SAMPLES_PER_PROMPT", "16")
     eval_samples_per_prompt = os.environ.get("OPENCLAW_BAYESTOOL_EVAL_SAMPLES_PER_PROMPT", "1")
     _replace_value(argv, "--n-samples-per-prompt", samples_per_prompt)
     _replace_value(argv, "--n-samples-per-eval-prompt", eval_samples_per_prompt)
-    _replace_value(argv, "--global-batch-size", os.environ.get("OPENCLAW_BAYESTOOL_GLOBAL_BATCH_SIZE", "8"))
+    _replace_value(argv, "--global-batch-size", os.environ.get("OPENCLAW_BAYESTOOL_GLOBAL_BATCH_SIZE", "32"))
     _replace_value(argv, "--num-rollout", os.environ.get("OPENCLAW_BAYESTOOL_NUM_ROLLOUT", "1"))
     _replace_value(argv, "--eval-interval", os.environ.get("OPENCLAW_BAYESTOOL_EVAL_INTERVAL", "1"))
-    # A Qwen3-VL FSDP checkpoint is large enough that saving after every
-    # rollout exhausts the remote volume during a long run.  Keep the
-    # cadence configurable, but make the real-data default a rollout-level
-    # retention-friendly interval rather than one checkpoint per rollout.
+    # The actor gates actual writes by valid-question count.  Calling the
+    # save hook every rollout lets it hit exactly 100 valid questions even
+    # when a rollout contains skipped/invalid questions; the hook is cheap
+    # when the threshold has not been reached.
     if "--save-interval" in argv:
-        _replace_value(argv, "--save-interval", os.environ.get("OPENCLAW_BAYESTOOL_SAVE_INTERVAL", "20"))
+        _replace_value(argv, "--save-interval", os.environ.get("OPENCLAW_BAYESTOOL_SAVE_INTERVAL", "1"))
     _replace_value(argv, "--advantage-estimator", "bayes_grpo")
     response_len = os.environ.get("OPENCLAW_BAYESTOOL_RESPONSE_LEN", "512")
     _replace_value(argv, "--rollout-max-response-len", response_len)
@@ -89,14 +100,20 @@ def _training_argv() -> list[str]:
     argv.extend(
         [
             "--bayestool-enable",
-            "--bayestool-worlds-per-prompt", "4",
-            "--bayestool-replicas-per-world", "2",
+            "--bayestool-worlds-per-prompt", os.environ.get("OPENCLAW_BAYESTOOL_WORLDS_PER_PROMPT", "4"),
+            "--bayestool-replicas-per-world", os.environ.get("OPENCLAW_BAYESTOOL_REPLICAS_PER_WORLD", "4"),
+            "--bayestool-questions-per-step", os.environ.get("OPENCLAW_BAYESTOOL_QUESTIONS_PER_STEP", "2"),
+            "--bayestool-max-questions-per-step", os.environ.get("OPENCLAW_BAYESTOOL_MAX_QUESTIONS_PER_STEP", "8"),
             "--bayestool-stage", stage,
             "--bayestool-branch-probability", os.environ.get("OPENCLAW_BAYESTOOL_BRANCH_PROBABILITY", "1.0"),
             "--bayestool-decision-regret-threshold", os.environ.get("OPENCLAW_BAYESTOOL_REGRET_THRESHOLD", "-1.0"),
             "--bayestool-max-action-candidates", "4",
             "--bayestool-max-siblings", "4",
             "--bayestool-branch-horizon", "3",
+            "--bayestool-checkpoint-interval-questions",
+            os.environ.get("OPENCLAW_BAYESTOOL_CHECKPOINT_INTERVAL_QUESTIONS", "100"),
+            "--bayestool-checkpoint-retention",
+            os.environ.get("OPENCLAW_BAYESTOOL_CHECKPOINT_RETENTION", "2"),
         ]
     )
     checkpoint_options = (
@@ -186,12 +203,16 @@ def _validate() -> dict[str, Any]:
             "rewards_normalization": True,
             "gradient_checkpointing": os.environ.get("OPENCLAW_BAYESTOOL_GRADIENT_CHECKPOINTING", "1") == "1",
             "rollout_batch_size": int(os.environ.get("OPENCLAW_BAYESTOOL_ROLLOUT_BATCH_SIZE", "2")),
-            "samples_per_prompt": int(os.environ.get("OPENCLAW_BAYESTOOL_SAMPLES_PER_PROMPT", "8")),
+            "samples_per_prompt": int(os.environ.get("OPENCLAW_BAYESTOOL_SAMPLES_PER_PROMPT", "16")),
             "eval_samples_per_prompt": int(os.environ.get("OPENCLAW_BAYESTOOL_EVAL_SAMPLES_PER_PROMPT", "1")),
-            "global_batch_size": int(os.environ.get("OPENCLAW_BAYESTOOL_GLOBAL_BATCH_SIZE", "8")),
+            "global_batch_size": int(os.environ.get("OPENCLAW_BAYESTOOL_GLOBAL_BATCH_SIZE", "32")),
             "num_rollout": int(os.environ.get("OPENCLAW_BAYESTOOL_NUM_ROLLOUT", "1")),
             "eval_interval": int(os.environ.get("OPENCLAW_BAYESTOOL_EVAL_INTERVAL", "1")),
-            "save_interval": int(os.environ.get("OPENCLAW_BAYESTOOL_SAVE_INTERVAL", "20")),
+            "save_interval": int(os.environ.get("OPENCLAW_BAYESTOOL_SAVE_INTERVAL", "1")),
+            "checkpoint_interval_questions": int(
+                os.environ.get("OPENCLAW_BAYESTOOL_CHECKPOINT_INTERVAL_QUESTIONS", "100")
+            ),
+            "checkpoint_retention": int(os.environ.get("OPENCLAW_BAYESTOOL_CHECKPOINT_RETENTION", "2")),
             "max_train_sequence_length": int(
                 os.environ.get("OPENCLAW_BAYESTOOL_MAX_TRAIN_SEQUENCE_LENGTH", "8192")
             ),
