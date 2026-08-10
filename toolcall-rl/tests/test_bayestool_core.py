@@ -43,14 +43,19 @@ from bayestool.decision import (  # noqa: E402
 from bayestool.meta_episode import build_meta_episode  # noqa: E402
 from bayestool.schema import TaskStateView, WorldEvent  # noqa: E402
 from bayestool.training import (  # noqa: E402
+    bayes_grpo_advantages,
+    bayestool_group_id,
+    bayestool_question_id,
     build_preinv_bundle,
     build_switch_bundle,
     build_switch_pair,
     compute_bayestool_utility,
+    make_bayestool_decision_group_id,
     pre_invariance_loss,
     support_valid_pair,
     suffix_meta_returns,
     switch_loss,
+    validate_bayestool_group_records,
     weighted_sibling_advantage,
 )
 from bayestool.world import (  # noqa: E402
@@ -265,6 +270,16 @@ def test_manifest_accepts_the_same_configured_world_distribution():
     assert coupled[0]["metadata"]["world_type_probabilities"] == {"healthy": 0.0, "gradual_change": 1.0}
     assert set(coupled[0]["metadata"]["sampled_training_world_types"]) == {"gradual_change"}
     assert [item["name"] for item in coupled[0]["metadata"]["bayestool_stage_schedule"]] == ["a", "b", "c", "d"]
+    plan = coupled[0]["metadata"]["question_rollout_plan"]
+    assert plan["group_count"] == 4
+    assert plan["record_count"] == 16
+    assert len(coupled[0]["metadata"]["fixed_world_specs"]) == 4
+    assert {item["world_slot_role"] for item in plan["realizations"]} == {
+        "healthy",
+        "local_degradation",
+        "shared_family_fault",
+        "change",
+    }
 
 
 def test_world_observation_never_exposes_hidden_answer_or_clean_result():
@@ -574,6 +589,70 @@ def test_pairing_sibling_utility_and_meta_persistence():
     assert episode.task_belief is not None
     assert episode.task_belief.snapshot().step == 0
     assert episode.task_belief.snapshot().session_probs != (0.70, 0.20, 0.08, 0.02)
+
+
+def test_bayestool_advantage_is_question_and_decision_scoped():
+    common = {
+        "question_id": "question-a",
+        "episode_content_id": "document-a",
+        "latent_world_id": "healthy",
+        "coupling_id": "coupling-a",
+        "decision_event_id": "root",
+        "decision_prefix_hash": "initial-a",
+    }
+    group_id = make_bayestool_decision_group_id(common)
+    samples = [
+        {"utility": 1.0, "metadata": {**common, "decision_group_id": group_id}},
+        {"utility": 0.0, "metadata": {**common, "decision_group_id": group_id}},
+    ]
+    # A same-named legacy sibling group from another question must not mix
+    # with this question.  This reproduces the previous fallback bug.
+    samples.extend(
+        [
+            {
+                "utility": 10.0,
+                "metadata": {
+                    "question_id": "question-b",
+                    "latent_world_id": "healthy",
+                    "sibling_group_id": "old-shared-id",
+                },
+                "sibling_group_id": "old-shared-id",
+            },
+            {
+                "utility": 8.0,
+                "metadata": {
+                    "question_id": "question-b",
+                    "latent_world_id": "healthy",
+                    "sibling_group_id": "old-shared-id",
+                },
+                "sibling_group_id": "old-shared-id",
+            },
+        ]
+    )
+    assert bayestool_question_id(samples[0]["metadata"]) == "question-a"
+    assert bayestool_group_id(samples[2], index=2) != group_id
+    advantages = bayes_grpo_advantages(samples)
+    assert advantages[:2] == [0.5, -0.5]
+    assert advantages[2:] == [1.0, -1.0]
+
+
+def test_bayestool_group_validator_rejects_cross_question_and_incomplete_groups():
+    rows = [
+        {
+            "utility": float(index),
+            "metadata": {
+                "question_id": "q-a" if index < 3 else "q-b",
+                "latent_world_id": "healthy",
+                "decision_prefix_hash": "root",
+                "decision_group_id": "bad-group",
+            },
+        }
+        for index in range(4)
+    ]
+    report = validate_bayestool_group_records(rows)
+    assert report["invalid_group_count"] == 1
+    assert report["cross_question_group_count"] == 1
+    assert report["groups"][0]["size"] == 4
 
 
 def test_tokenized_auxiliary_bundle_contract():

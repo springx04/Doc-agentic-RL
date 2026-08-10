@@ -24,6 +24,7 @@ assert _SEQ_SPEC is not None and _SEQ_SPEC.loader is not None
 _SEQ_BALANCING = importlib.util.module_from_spec(_SEQ_SPEC)
 _SEQ_SPEC.loader.exec_module(_SEQ_BALANCING)
 build_fsdp_modality_aligned_order = _SEQ_BALANCING.build_fsdp_modality_aligned_order
+build_fsdp_modality_aligned_order_for_batches = _SEQ_BALANCING.build_fsdp_modality_aligned_order_for_batches
 get_fsdp_modality_aligned_partitions = _SEQ_BALANCING.get_fsdp_modality_aligned_partitions
 
 
@@ -73,6 +74,21 @@ def test_pack_sequences_keeps_text_only_samples_in_mixed_batch():
     assert any("multimodal_train_inputs" in batch for batch in packed)
 
 
+def test_pack_sequences_carries_question_loss_weights():
+    packed = pack_sequences(
+        tokens=[[1, 2], [3, 4]],
+        loss_masks=[[1, 1], [1, 1]],
+        rewards=[1.0, -1.0],
+        raw_rewards=[1.0, -1.0],
+        response_lengths=[1, 1],
+        advantages=[[0.1, 0.0], [-0.1, 0.0]],
+        returns=[[0.1, 0.0], [-0.1, 0.0]],
+        num_packs=1,
+        bayes_loss_weights=[0.75, 0.25],
+    )
+    assert packed[0]["bayes_loss_weights"] == [0.75, 0.25]
+
+
 def test_mixed_modalities_are_aligned_across_fsdp_ranks_without_dropping_real_samples():
     flags = [True, False, True, False, False, False]
     order = build_fsdp_modality_aligned_order(flags, dp_size=4, global_batch_size=8)
@@ -100,3 +116,15 @@ def test_modality_alignment_keeps_all_real_samples_when_multiple_batches_are_nee
     assert sum(index >= 0 for index in order) == len(flags)
     assert order.count(-1) == 3
     assert order.count(-2) == 3
+
+
+def test_modality_alignment_does_not_cross_question_batch_boundaries():
+    flags = [True, False, False, True, False, False, False, False]
+    order, sizes = build_fsdp_modality_aligned_order_for_batches(flags, [4, 4], dp_size=4)
+    assert sizes == [8, 4]
+    assert len(order) == sum(sizes)
+    # The first four records are aligned independently; the second question
+    # starts only after its own padded first batch.
+    assert order[:4] == [0, 3, -1, -1]
+    assert order[4:8] == [1, 2, -2, -2]
+    assert order[8:] == [4, 5, 6, 7]

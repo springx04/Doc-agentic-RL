@@ -111,8 +111,19 @@ class BayesToolConfig:
     """All runtime, decision, and training knobs in the implementation plan."""
 
     enabled: bool = False
+    # Explicit question -> realization -> decision-group planning.  The
+    # legacy world/replica fields below remain loadable for old manifests, but
+    # they must never determine RL group cardinality or loss weighting.
+    default_group_size: int = 4
+    min_realizations: int = 4
+    max_realizations: int = 6
+    max_records_per_question: int = 48
+    policy_version: str = "bayestool-policy-v1"
     worlds_per_prompt: int = 4
-    replicas_per_world: int = 2
+    # Compatibility metadata only.  New plans materialize K continuations
+    # from one frozen realization; keeping the default at one avoids implying
+    # the retired worlds x replicas (4 x 2 -> K2) training semantics.
+    replicas_per_world: int = 1
     posterior_particles: int = 8
     max_action_candidates: int = 4
     max_siblings: int = 4
@@ -420,8 +431,15 @@ def add_bayestool_arguments(parser: argparse.ArgumentParser) -> argparse.Argumen
     """Add the public BayesTool flags to an existing training parser."""
 
     parser.add_argument("--bayestool-enable", action="store_true", default=False)
+    parser.add_argument("--bayestool-group-size", dest="bayestool_default_group_size", type=int, default=None)
+    parser.add_argument("--bayestool-min-realizations", type=int, default=None)
+    parser.add_argument("--bayestool-max-realizations", type=int, default=None)
+    parser.add_argument("--bayestool-max-records-per-question", type=int, default=None)
+    parser.add_argument("--bayestool-policy-version", type=str, default=None)
     parser.add_argument("--bayestool-worlds-per-prompt", type=int, default=None)
     parser.add_argument("--bayestool-replicas-per-world", type=int, default=None)
+    parser.add_argument("--bayestool-questions-per-step", type=int, default=None)
+    parser.add_argument("--bayestool-max-questions-per-step", type=int, default=None)
     parser.add_argument("--bayestool-posterior-particles", type=int, default=None)
     parser.add_argument("--bayestool-max-action-candidates", type=int, default=None)
     parser.add_argument("--bayestool-max-siblings", type=int, default=None)
@@ -458,6 +476,8 @@ def add_bayestool_arguments(parser: argparse.ArgumentParser) -> argparse.Argumen
     parser.add_argument("--bayestool-q-checkpoint", type=str, default=None)
     parser.add_argument("--bayestool-risk-checkpoint", type=str, default=None)
     parser.add_argument("--bayestool-meta-manifest", type=str, default=None)
+    parser.add_argument("--bayestool-checkpoint-interval-questions", type=int, default=None)
+    parser.add_argument("--bayestool-checkpoint-retention", type=int, default=None)
     parser.add_argument("--bayestool-allow-heuristic-belief", action="store_true", default=False)
     parser.add_argument("--bayestool-allow-heuristic-q", action="store_true", default=False)
     parser.add_argument("--bayestool-allow-heuristic-risk", action="store_true", default=False)

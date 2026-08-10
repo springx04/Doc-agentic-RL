@@ -990,8 +990,46 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help="Enable the BayesTool world, belief, and Bayes-ARPO rollout path.",
             )
+            parser.add_argument(
+                "--bayestool-group-size",
+                dest="bayestool_default_group_size",
+                type=int,
+                default=4,
+                choices=[4, 8],
+                help="Decision-group K for each explicit world realization.",
+            )
+            parser.add_argument("--bayestool-min-realizations", type=int, default=4)
+            parser.add_argument("--bayestool-max-realizations", type=int, default=6)
+            parser.add_argument("--bayestool-max-records-per-question", type=int, default=48)
+            parser.add_argument("--bayestool-policy-version", type=str, default="bayestool-policy-v1")
             parser.add_argument("--bayestool-worlds-per-prompt", type=int, default=4)
-            parser.add_argument("--bayestool-replicas-per-world", type=int, default=2)
+            parser.add_argument(
+                "--bayestool-replicas-per-world",
+                type=int,
+                default=1,
+                help="Legacy compatibility field only; explicit plans determine K and realization count.",
+            )
+            parser.add_argument(
+                "--bayestool-questions-per-step",
+                type=int,
+                default=2,
+                help="Target number of complete questions in one BayesTool optimizer step.",
+            )
+            parser.add_argument(
+                "--bayestool-max-questions-per-step",
+                type=int,
+                default=8,
+                help="Hard upper bound for complete questions in one BayesTool optimizer step.",
+            )
+            parser.add_argument(
+                "--bayestool-empty-rollout-retry-limit",
+                type=int,
+                default=4,
+                help=(
+                    "Maximum consecutive raw question batches to skip when every question is invalid; "
+                    "a later batch is fetched, then a clear error is raised if the limit is exceeded."
+                ),
+            )
             parser.add_argument("--bayestool-posterior-particles", type=int, default=8)
             parser.add_argument("--bayestool-max-action-candidates", type=int, default=4)
             parser.add_argument("--bayestool-max-siblings", type=int, default=4)
@@ -1029,6 +1067,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--bayestool-q-checkpoint", type=str, default=None)
             parser.add_argument("--bayestool-risk-checkpoint", type=str, default=None)
             parser.add_argument("--bayestool-meta-manifest", type=str, default=None)
+            parser.add_argument(
+                "--bayestool-checkpoint-interval-questions",
+                type=int,
+                default=100,
+                help="Save a BayesTool checkpoint after this many valid questions (not every rollout).",
+            )
+            parser.add_argument(
+                "--bayestool-checkpoint-retention",
+                type=int,
+                default=2,
+                help="Keep this many recent BayesTool checkpoints plus the best scored one.",
+            )
             parser.add_argument("--bayestool-allow-heuristic-belief", action="store_true", default=False)
             parser.add_argument("--bayestool-allow-heuristic-q", action="store_true", default=False)
             parser.add_argument("--bayestool-allow-heuristic-risk", action="store_true", default=False)
@@ -1899,6 +1949,16 @@ def slime_validate_args(args):
         )
 
     if getattr(args, "bayestool_enable", False):
+        if str(getattr(args, "train_backend", "")) == "megatron":
+            raise ValueError(
+                "BayesTool + Megatron is disabled until Megatron consumes the explicit "
+                "question/realization manifest and hierarchical loss weights. Use --train-backend fsdp."
+            )
+        if getattr(args, "num_steps_per_rollout", None) is not None:
+            raise ValueError(
+                "BayesTool uses the explicit question manifest to define optimizer batches; "
+                "do not set the legacy --num-steps-per-rollout formula."
+            )
         assert args.advantage_estimator == "bayes_grpo", (
             "--bayestool-enable requires --advantage-estimator bayes_grpo so the full-trajectory "
             "utility and sibling-relative baseline are used."
@@ -1906,15 +1966,39 @@ def slime_validate_args(args):
         assert args.bayestool_worlds_per_prompt >= 1
         assert args.bayestool_replicas_per_world >= 1
         assert args.bayestool_posterior_particles >= 1
+        assert args.bayestool_checkpoint_interval_questions >= 1
+        assert args.bayestool_checkpoint_retention >= 0
+        assert args.bayestool_empty_rollout_retry_limit >= 0
         assert args.bayestool_max_observation_hypotheses >= 1
         assert 0.0 < args.bayestool_cvar_alpha <= 1.0
         assert args.bayestool_aux_micro_batch_size % 4 == 0, "Bayes auxiliary microbatch size must be a multiple of four"
-        expected_samples = args.bayestool_worlds_per_prompt * args.bayestool_replicas_per_world
-        actual_samples = int(getattr(args, "n_samples_per_prompt", expected_samples))
-        assert actual_samples == expected_samples, (
-            "BayesTool requires n_samples_per_prompt == worlds_per_prompt * replicas_per_world "
-            f"({expected_samples}), got {actual_samples}"
-        )
+        group_size = int(getattr(args, "bayestool_default_group_size", 4) or 4)
+        if group_size not in {4, 8}:
+            raise ValueError(f"BayesTool decision-group K must be 4 or 8, got {group_size}")
+        min_realizations = int(getattr(args, "bayestool_min_realizations", 4) or 4)
+        max_realizations = int(getattr(args, "bayestool_max_realizations", 6) or 6)
+        max_records = int(getattr(args, "bayestool_max_records_per_question", 48) or 48)
+        if not 4 <= min_realizations <= max_realizations <= 6:
+            raise ValueError(
+                "BayesTool realization bounds must satisfy 4 <= min <= max <= 6; "
+                f"got {min_realizations}..{max_realizations}"
+            )
+        if max_records < min_realizations * group_size:
+            raise ValueError(
+                "BayesTool max_records_per_question is smaller than the mandatory plan: "
+                f"{max_records} < {min_realizations}*{group_size}"
+            )
+        actual_samples = int(getattr(args, "n_samples_per_prompt", 0) or 0)
+        # ``n_samples_per_prompt`` is the number of primary trajectories.  It
+        # must be exactly the realization count; each realization is then
+        # completed to K records by the shared-prefix continuation stage.
+        if not min_realizations <= actual_samples <= max_realizations:
+            raise ValueError(
+                "BayesTool n_samples_per_prompt must be large enough for the explicit "
+                f"primary realization plan ({min_realizations}-{max_realizations} primaries); "
+                f"got {actual_samples}. It must not be the expanded R*K record count; "
+                "legacy worlds_per_prompt/replicas_per_world do not define this."
+            )
         if validate_stage_capabilities is not None:
             args.bayestool_capability_manifest = validate_stage_capabilities(
                 args.bayestool_stage,

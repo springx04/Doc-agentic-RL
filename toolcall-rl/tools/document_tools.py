@@ -37,6 +37,93 @@ DOC_SUFFIXES = {".docx"}
 PPT_SUFFIXES = {".pptx"}
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_list(name: str, default: str) -> list[str]:
+    value = os.environ.get(name, default)
+    return [item.strip().lower() for item in value.split(",") if item.strip()]
+
+
+def _docling_ocr_languages() -> list[str]:
+    return _env_list("OPENCLAW_DOCLING_OCR_LANG", "en")
+
+
+def _docling_ocr_options(RapidOcrOptions: Any) -> Any:
+    engine = os.environ.get("OPENCLAW_DOCLING_OCR_ENGINE", "rapidocr").strip().lower()
+    if engine != "rapidocr":
+        raise RuntimeError(
+            "OpenClaw Docling OCR is restricted to the offline RapidOCR backend; "
+            f"got {engine!r}"
+        )
+    return RapidOcrOptions(
+        lang=_docling_ocr_languages(),
+        backend=os.environ.get("OPENCLAW_DOCLING_RAPIDOCR_BACKEND", "onnxruntime").strip().lower(),
+        print_verbose=False,
+    )
+
+
+def _rapidocr_artifact_params(lang: str = "en", backend: str = "onnxruntime") -> dict[str, Any] | None:
+    artifacts = os.environ.get("OPENCLAW_DOCLING_ARTIFACTS_PATH") or os.environ.get("DOCLING_ARTIFACTS_PATH")
+    if not artifacts:
+        if _env_flag("OPENCLAW_OCR_OFFLINE"):
+            raise RuntimeError(
+                "offline OCR requires OPENCLAW_DOCLING_ARTIFACTS_PATH with the bundled RapidOCR models"
+            )
+        return None
+    backend = backend.strip().lower()
+    if backend == "onnxruntime":
+        root = Path(artifacts).expanduser() / "RapidOcr" / "onnx"
+        paths = {
+            "det": root / "PP-OCRv6" / "det" / "PP-OCRv6_det_small.onnx",
+            "cls": root / "PP-OCRv4" / "cls" / "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+            "rec": root / "PP-OCRv6" / "rec" / "PP-OCRv6_rec_small.onnx",
+            "keys": None,
+        }
+        engine_type_name = "ONNXRUNTIME"
+    elif backend == "torch":
+        root = Path(artifacts).expanduser() / "RapidOcr"
+        chinese = lang.strip().lower() in {"zh", "zho", "chi", "chinese", "ch"}
+        paths = {
+            "det": root / "torch" / "PP-OCRv4" / "det" / ("ch_PP-OCRv4_det_mobile.pth" if chinese else "en_PP-OCRv3_det_mobile.pth"),
+            "cls": root / "torch" / "PP-OCRv4" / "cls" / "ch_ptocr_mobile_v2.0_cls_mobile.pth",
+            "rec": root / "torch" / "PP-OCRv4" / "rec" / ("ch_PP-OCRv4_rec_mobile.pth" if chinese else "en_PP-OCRv4_rec_mobile.pth"),
+            "keys": root / "paddle" / "PP-OCRv4" / "rec" / ("ch_PP-OCRv4_rec_mobile" if chinese else "en_PP-OCRv4_rec_mobile") / ("ppocr_keys_v1.txt" if chinese else "en_dict.txt"),
+        }
+        engine_type_name = "TORCH"
+    else:
+        raise RuntimeError(f"unsupported local RapidOCR backend: {backend}")
+    missing = [str(path) for path in paths.values() if path is not None and not path.is_file()]
+    if missing:
+        raise RuntimeError("bundled RapidOCR model files are missing: " + ", ".join(missing))
+    from rapidocr import EngineType
+    engine_type = getattr(EngineType, engine_type_name)
+
+    params: dict[str, Any] = {
+        "Global.text_score": 0.5,
+        "Det.model_path": str(paths["det"]),
+        "Cls.model_path": str(paths["cls"]),
+        "Rec.model_path": str(paths["rec"]),
+        "Det.engine_type": engine_type,
+        "Cls.engine_type": engine_type,
+        "Rec.engine_type": engine_type,
+        "Det.use_cuda": False,
+        "Cls.use_cuda": False,
+        "Rec.use_cuda": False,
+        "Det.use_dml": False,
+        "Cls.use_dml": False,
+        "Rec.use_dml": False,
+        "EngineConfig.onnxruntime.intra_op_num_threads": int(os.environ.get("OPENCLAW_OCR_THREADS", "4")),
+    }
+    if paths["keys"] is not None:
+        params["Rec.rec_keys_path"] = str(paths["keys"])
+    return params
+
+
 def _register_tool(name: str, description: str, properties: dict[str, Any], required: list[str] | None = None) -> None:
     DOC_TOOL_SPECS[name] = {
         "type": "function",
@@ -294,6 +381,7 @@ def _render_pdf_page(document_path: Path, page_number: int, dpi: int, output_pat
         pix.save(str(output_path))
         return {
             "image_path": str(output_path),
+            "document_path": str(document_path),
             "page_number": page_number,
             "page_count": len(doc),
             "width": pix.width,
@@ -353,8 +441,14 @@ def render_page(arguments: dict[str, Any]) -> str:
         output_path = _resolve_output_path(
             arguments.get("output_path"), ".png", tool, document_path, {"page_number": page_number, "dpi": dpi}
         )
-        result = _render_page_to_image(document_path=document_path, page_number=page_number, dpi=dpi, output_path=output_path)
-        return _json_result(status="ok", tool=tool, document_path=str(document_path), **result)
+        result = _render_page_to_image(
+            document_path=document_path,
+            page_number=page_number,
+            dpi=dpi,
+            output_path=output_path,
+        )
+        result = {"document_path": str(document_path), **result}
+        return _json_result(status="ok", tool=tool, **result)
     except Exception as exc:
         return _error(tool, str(exc), document_path=str(document_path))
 
@@ -556,13 +650,19 @@ def _get_docling_converter() -> Any:
             os.environ["DOCLING_ARTIFACTS_PATH"] = str(Path(artifacts_path).expanduser())
         try:
             from docling.datamodel.base_models import InputFormat
-            from docling.datamodel.pipeline_options import PdfPipelineOptions
+            from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
             from docling.document_converter import DocumentConverter, ImageFormatOption, PdfFormatOption
         except ImportError as exc:
             raise ImportError("Docling is required. Install with: pip install docling") from exc
         format_options = None
         if artifacts_path:
-            pipeline_options = PdfPipelineOptions(artifacts_path=str(Path(artifacts_path).expanduser()))
+            pipeline_options = PdfPipelineOptions(
+                artifacts_path=str(Path(artifacts_path).expanduser()),
+                ocr_options=_docling_ocr_options(RapidOcrOptions),
+            )
+            if _env_flag("OPENCLAW_DOCLING_DISABLE_OCR_TABLE"):
+                pipeline_options.do_ocr = False
+                pipeline_options.do_table_structure = False
             format_options = {
                 InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
                 InputFormat.IMAGE: ImageFormatOption(pipeline_options=pipeline_options),
@@ -1736,37 +1836,190 @@ def _easyocr_lines(result: Any) -> list[dict[str, Any]]:
     return lines
 
 
-def _run_ocr(image_path: Path, lang: str, engine: str) -> tuple[str, list[dict[str, Any]]]:
+def _paddle_local_model_dir(kind: str, model_name: str) -> Path:
+    override = os.environ.get(f"OPENCLAW_PADDLEOCR_{kind.upper()}_DIR")
+    candidates = [Path(override).expanduser()] if override else []
+    cache = os.environ.get("OPENCLAW_PADDLEOCR_CACHE_DIR")
+    if cache:
+        cache_path = Path(cache).expanduser()
+        candidates.extend(
+            [
+                cache_path / model_name,
+                cache_path / "models" / model_name,
+                cache_path / "official_models" / model_name,
+            ]
+        )
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    raise RuntimeError(
+        f"local PaddleOCR {kind} model is not cached ({model_name}); refusing to download it"
+    )
+
+
+def _easyocr_local_model_dir(lang: str) -> Path:
+    override = os.environ.get("OPENCLAW_EASYOCR_MODEL_DIR")
+    if override:
+        model_dir = Path(override).expanduser()
+    else:
+        cache = os.environ.get("OPENCLAW_PADDLEOCR_CACHE_DIR")
+        model_dir = Path(cache).expanduser() / "home" / ".EasyOCR" / "model" if cache else Path.home() / ".EasyOCR" / "model"
+    required = [model_dir / "craft_mlt_25k.pth"]
+    if lang.strip().lower() in {"en", "eng", "english"}:
+        required.append(model_dir / "english_g2.pth")
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError(
+            "local EasyOCR model files are missing; refusing to download them: " + ", ".join(missing)
+        )
+    return model_dir
+
+
+def _pdf_text_fallback_lines(region_meta: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Read selectable PDF text when all image OCR engines are unavailable.
+
+    This is intentionally local and deterministic.  It is not presented as
+    OCR: the returned engine name tells the policy that the observation came
+    from the PDF text layer, which is often the correct fallback for a crop
+    rendered from a digitally-created document.
+    """
+
+    if not isinstance(region_meta, dict):
+        return []
+    source = region_meta.get("source") if isinstance(region_meta.get("source"), dict) else region_meta
+    document_value = source.get("document_path") or region_meta.get("document_path")
+    if not document_value:
+        return []
+    document_path = Path(str(document_value)).expanduser()
+    if document_path.suffix.lower() not in PDF_SUFFIXES or not document_path.is_file():
+        return []
+    try:
+        fitz = _import_fitz()
+        page_number = int(source.get("page_number", region_meta.get("page_number", 1)) or 1)
+        with fitz.open(str(document_path)) as document:
+            if page_number < 1 or page_number > len(document):
+                return []
+            page = document[page_number - 1]
+            blocks = page.get_text("blocks") or []
+            selected_bbox = region_meta.get("bbox_pixels")
+            dpi = float(source.get("dpi") or 72.0)
+            scale = 72.0 / max(1.0, dpi)
+            target = None
+            if isinstance(selected_bbox, (list, tuple)) and len(selected_bbox) == 4:
+                try:
+                    target = tuple(float(value) * scale for value in selected_bbox)
+                except (TypeError, ValueError):
+                    target = None
+
+            def intersects(block: tuple[float, float, float, float], wanted: tuple[float, float, float, float]) -> bool:
+                left, top, right, bottom = block
+                w_left, w_top, w_right, w_bottom = wanted
+                return right > w_left and left < w_right and bottom > w_top and top < w_bottom
+
+            rows: list[dict[str, Any]] = []
+            for block in blocks:
+                if len(block) < 5:
+                    continue
+                text = str(block[4] or "").strip()
+                if not text:
+                    continue
+                block_bbox = tuple(float(value) for value in block[:4])
+                if target is not None and not intersects(block_bbox, target):
+                    continue
+                rows.append({"bbox": list(block_bbox), "text": text, "confidence": 1.0})
+            # If a crop did not intersect the PDF text boxes due to differing
+            # coordinate conventions, a page-scoped text observation is still
+            # more useful than an empty OCR result and remains explicitly
+            # labelled as such by the caller.
+            if not rows and target is not None:
+                for block in blocks:
+                    if len(block) < 5:
+                        continue
+                    text = str(block[4] or "").strip()
+                    if text:
+                        rows.append({"bbox": list(tuple(float(value) for value in block[:4])), "text": text, "confidence": 1.0})
+            return rows
+    except Exception:
+        return []
+
+
+def _run_ocr(
+    image_path: Path,
+    lang: str,
+    engine: str,
+    region_meta: dict[str, Any] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
     requested = (engine or "auto").lower()
     errors: list[str] = []
+    # Production runs are offline.  PaddleOCR/EasyOCR are optional only when
+    # their model directories are explicitly provisioned; they must never be
+    # reached by an automatic path that could trigger a download.  The two
+    # bundled RapidOCR engines provide a deterministic local fallback chain.
+    auto_backends = _env_list(
+        # RapidOCR is preferred, but an empty/failed RapidOCR result is not
+        # a reason to abandon the observation.  PaddleOCR and EasyOCR are
+        # local-only fallbacks; their artifact checks below reject missing
+        # models before import and neither backend is allowed to download.
+        "OPENCLAW_OCR_AUTO_BACKENDS", "rapidocr,rapidocr_torch,paddleocr,easyocr"
+    )
+    backends = auto_backends if requested == "auto" else [requested]
 
-    if requested in {"auto", "rapidocr"}:
+    if "rapidocr" in backends:
         try:
             if "rapidocr" not in _OCR_ENGINES:
                 from rapidocr import RapidOCR
 
-                _OCR_ENGINES["rapidocr"] = RapidOCR()
+                _OCR_ENGINES["rapidocr"] = RapidOCR(
+                    params=_rapidocr_artifact_params(lang=lang, backend="onnxruntime")
+                )
             result = _OCR_ENGINES["rapidocr"](str(image_path))
-            return "rapidocr", _rapidocr_lines(result)
+            lines = _rapidocr_lines(result)
+            if not lines:
+                raise RuntimeError("rapidocr returned no text")
+            return "rapidocr", lines
         except Exception as exc:
             errors.append(f"rapidocr: {exc}")
             if requested == "rapidocr":
                 raise RuntimeError("; ".join(errors)) from exc
 
-    if requested in {"auto", "paddleocr"}:
+    if "rapidocr_torch" in backends:
         try:
+            if "rapidocr_torch" not in _OCR_ENGINES:
+                from rapidocr import RapidOCR
+
+                _OCR_ENGINES["rapidocr_torch"] = RapidOCR(
+                    params=_rapidocr_artifact_params(lang=lang, backend="torch")
+                )
+            result = _OCR_ENGINES["rapidocr_torch"](str(image_path))
+            lines = _rapidocr_lines(result)
+            if not lines:
+                raise RuntimeError("RapidOCR torch backend returned no text")
+            return "rapidocr_torch", lines
+        except Exception as exc:
+            errors.append(f"rapidocr_torch: {exc}")
+            if requested == "rapidocr_torch":
+                raise RuntimeError("; ".join(errors)) from exc
+
+    if "paddleocr" in backends:
+        try:
+            det_model = os.environ.get("OPENCLAW_PADDLEOCR_DET_MODEL", "PP-OCRv6_small_det")
+            rec_model = os.environ.get("OPENCLAW_PADDLEOCR_REC_MODEL", "PP-OCRv6_small_rec")
+            # Resolve local artifacts before importing optional ML stacks.  A
+            # missing model must report the offline/no-download contract,
+            # even on hosts with a broken torchvision preload.
+            det_dir = _paddle_local_model_dir("det", det_model)
+            rec_dir = _paddle_local_model_dir("rec", rec_model)
             _prepare_ml_backend_environment()
             _preload_torch_for_windows()
             if "paddleocr" not in _OCR_ENGINES:
                 from paddleocr import PaddleOCR
-
-                det_model = os.environ.get("OPENCLAW_PADDLEOCR_DET_MODEL", "PP-OCRv6_small_det")
-                rec_model = os.environ.get("OPENCLAW_PADDLEOCR_REC_MODEL", "PP-OCRv6_small_rec")
                 try:
                     _OCR_ENGINES["paddleocr"] = PaddleOCR(
                         lang=lang,
                         text_detection_model_name=det_model,
+                        text_detection_model_dir=str(det_dir),
                         text_recognition_model_name=rec_model,
+                        text_recognition_model_dir=str(rec_dir),
                         use_doc_orientation_classify=False,
                         use_doc_unwarping=False,
                         use_textline_orientation=False,
@@ -1777,8 +2030,10 @@ def _run_ocr(image_path: Path, lang: str, engine: str) -> tuple[str, list[dict[s
                         enable_mkldnn=False,
                         enable_cinn=False,
                     )
-                except TypeError:
-                    _OCR_ENGINES["paddleocr"] = PaddleOCR(use_angle_cls=True, lang=lang)
+                except TypeError as exc:
+                    raise RuntimeError(
+                        "installed PaddleOCR does not support local model directories"
+                    ) from exc
             ocr = _OCR_ENGINES["paddleocr"]
             if hasattr(ocr, "predict"):
                 try:
@@ -1799,27 +2054,46 @@ def _run_ocr(image_path: Path, lang: str, engine: str) -> tuple[str, list[dict[s
                     result = ocr.ocr(str(image_path))
             else:
                 raise RuntimeError("PaddleOCR instance has neither predict nor ocr method")
-            return "paddleocr", _paddleocr_lines(result)
+            lines = _paddleocr_lines(result)
+            if not lines:
+                raise RuntimeError("PaddleOCR returned no text")
+            return "paddleocr", lines
         except Exception as exc:
             errors.append(f"paddleocr: {exc}")
             if requested == "paddleocr":
                 raise RuntimeError("; ".join(errors)) from exc
 
-    if requested in {"auto", "easyocr"}:
+    if "easyocr" in backends:
         try:
+            langs = [lang] if lang else ["en"]
+            # Check the explicitly provisioned local model first.  This keeps
+            # an offline run from failing in an unrelated torch/torchvision
+            # import before it can state that a download is forbidden.
+            model_dir = _easyocr_local_model_dir(langs[0])
             _prepare_ml_backend_environment()
             _preload_torch_for_windows()
             if "easyocr" not in _OCR_ENGINES:
                 import easyocr
 
-                langs = [lang] if lang else ["en"]
-                _OCR_ENGINES["easyocr"] = easyocr.Reader(langs)
+                _OCR_ENGINES["easyocr"] = easyocr.Reader(
+                    langs,
+                    model_storage_directory=str(model_dir),
+                    download_enabled=False,
+                )
             result = _OCR_ENGINES["easyocr"].readtext(str(image_path))
-            return "easyocr", _easyocr_lines(result)
+            lines = _easyocr_lines(result)
+            if not lines:
+                raise RuntimeError("EasyOCR returned no text")
+            return "easyocr", lines
         except Exception as exc:
             errors.append(f"easyocr: {exc}")
             if requested == "easyocr":
                 raise RuntimeError("; ".join(errors)) from exc
+
+    if requested == "auto":
+        pdf_lines = _pdf_text_fallback_lines(region_meta)
+        if pdf_lines:
+            return "pdf_text_fallback", pdf_lines
 
     raise RuntimeError("No OCR backend succeeded. " + "; ".join(errors))
 
@@ -1858,7 +2132,20 @@ def ocr_region(arguments: dict[str, Any]) -> str:
             image_path, source_meta = _image_for_region(arguments, tool)
             region_meta = source_meta
         lang = str(arguments.get("lang", "en"))
-        engine, lines = _run_ocr(image_path, lang=lang, engine=str(arguments.get("engine", "auto")))
+        engine_name = str(arguments.get("engine", "auto"))
+        try:
+            engine, lines = _run_ocr(
+                image_path,
+                lang=lang,
+                engine=engine_name,
+                region_meta=region_meta,
+            )
+        except TypeError as exc:
+            # Keep compatibility with small test/integration adapters that
+            # implement the historical three-argument OCR hook.
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            engine, lines = _run_ocr(image_path, lang=lang, engine=engine_name)
         max_lines = int(arguments.get("max_lines", 200))
         lines = lines[:max_lines]
         text = "\n".join(str(line.get("text", "")).strip() for line in lines if str(line.get("text", "")).strip())

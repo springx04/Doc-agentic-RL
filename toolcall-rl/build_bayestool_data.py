@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from bayestool.config import default_config, stage_schedule
+from bayestool.grouping import make_question_rollout_plan
 from bayestool.meta_episode import build_meta_episode
 from bayestool.world import document_hash, sample_tool_world, sample_world_type
 
@@ -91,23 +92,57 @@ def build_manifest(
             ),
             "tool_budget": record.get("tool_budget", metadata.get("tool_budget", 8)),
         }
+        question_id = str(
+            record.get("question_id")
+            or metadata.get("question_id")
+            or record.get("id")
+            or record.get("task_id")
+            or cid
+        )
+        extra_variants = metadata.get("bayestool_extra_variants", ())
+        if not isinstance(extra_variants, (list, tuple)):
+            extra_variants = ()
+        plan = make_question_rollout_plan(
+            question_id,
+            policy_version=str(getattr(config, "policy_version", "bayestool-policy-v1")),
+            seed=seed + record_index,
+            group_size=int(getattr(config, "default_group_size", 4)),
+            extra_variants=extra_variants,
+        )
         worlds = []
-        for slot in range(config.worlds_per_prompt):
-            for replica_id in range(config.replicas_per_world):
-                spec = sample_tool_world(
-                    cid,
-                    world_slot=slot,
-                    replica_id=replica_id,
-                    rollout_id=seed + record_index,
-                    config=config,
-                    sampling_context=sampling_context,
-                )
-                worlds.append(spec.to_dict())
+        finalized_realizations = []
+        for slot, realization in enumerate(plan.realizations):
+            # Persist one latent realization spec.  K independent
+            # continuations are generated from this frozen world at rollout
+            # time; storing K copies would reintroduce replica-defined
+            # semantics and inflate the manifest.
+            spec = sample_tool_world(
+                cid,
+                world_slot=slot,
+                replica_id=0,
+                rollout_id=seed + record_index,
+                config=config,
+                sampling_context=sampling_context,
+                world_slot_role=realization.world_slot_role,
+                variant_id=realization.variant_id,
+            )
+            worlds.append(spec.to_dict())
+            finalized_realizations.append(
+                replace(realization, latent_world_id=spec.latent_world_id)
+            )
+        plan = replace(plan, realizations=tuple(finalized_realizations))
         metadata.update({
             "coupling_id": cid,
             "document_hash": document_hash(document),
-            "worlds_per_prompt": config.worlds_per_prompt,
+            "question_id": question_id,
+            "question_rollout_plan": plan.to_dict(),
+            "realization_count": plan.group_count,
+            "records_per_question": plan.record_count,
+            # These are compatibility diagnostics only.  They are not used
+            # to infer the plan, group ids, or loss weights.
+            "worlds_per_prompt": plan.group_count,
             "replicas_per_world": config.replicas_per_world,
+            "legacy_replica_fields_semantics": "continuation_only;plan_is_authoritative",
             "world_sampling_context": sampling_context,
             "fixed_world_specs": worlds,
             "world_type_probabilities": dict(config.world_type_probabilities),
@@ -128,11 +163,11 @@ def build_manifest(
                 sample_world_type(
                     cid,
                     rollout_id=seed + record_index,
-                    world_slot=config.worlds_per_prompt + index,
+                    world_slot=plan.group_count + index,
                     replica_id=0,
                     config=config,
                 )
-                for index in range(max(8, config.worlds_per_prompt * config.replicas_per_world))
+                for index in range(max(8, plan.group_count))
             ],
         })
         output = dict(record)

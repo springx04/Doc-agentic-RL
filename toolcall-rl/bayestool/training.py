@@ -145,22 +145,272 @@ def weighted_sibling_advantage(
     return advantages
 
 
+def bayestool_question_id(metadata: Mapping[str, Any], *, default: str = "unknown") -> str:
+    """Return the stable question identity used by RL grouping.
+
+    ``coupling_id`` identifies document/question content for ordinary
+    DocVQA rows, while ``meta_trajectory_id`` identifies one question inside
+    a persistent meta episode.  Neither a world id nor a rollout/sample
+    index is a valid question identity: those values deliberately differ
+    between policy siblings.
+    """
+
+    nested = metadata.get("bayestool")
+    nested = nested if isinstance(nested, Mapping) else {}
+    candidates = (
+        metadata.get("question_id"),
+        nested.get("question_id"),
+        metadata.get("meta_trajectory_id"),
+        nested.get("meta_trajectory_id"),
+        metadata.get("task_id"),
+        nested.get("task_id"),
+    )
+    for value in candidates:
+        if value is not None and str(value).strip():
+            return str(value)
+    episode = metadata.get("episode_content_id") or nested.get("episode_content_id")
+    question_index = metadata.get("meta_question_index", nested.get("meta_question_index"))
+    if episode is not None and question_index is not None:
+        return f"{episode}:q{question_index}"
+    coupling = metadata.get("coupling_id") or nested.get("coupling_id")
+    if coupling is not None and str(coupling).strip():
+        return str(coupling)
+    return str(default)
+
+
+def make_bayestool_decision_group_id(
+    metadata: Mapping[str, Any],
+    *,
+    decision_event_id: str | None = None,
+    decision_prefix_hash: str | None = None,
+) -> str:
+    """Build a question- and decision-node-scoped sibling group id.
+
+    The old implementation used ``latent_world_id`` or ``coupling_id`` as a
+    fallback group id.  That makes unrelated questions (and, after a branch,
+    unrelated prefixes) share a GRPO baseline.  This key includes every
+    state component that defines a valid BayesTool decision group.  It is
+    intentionally a pure deterministic function so workers/ranks can derive
+    the same id without sharing process state.
+    """
+
+    nested = metadata.get("bayestool")
+    nested = nested if isinstance(nested, Mapping) else {}
+    question_id = bayestool_question_id(metadata)
+    latent_world_id = str(
+        metadata.get("latent_world_id")
+        or nested.get("latent_world_id")
+        or metadata.get("world_id")
+        or nested.get("world_id")
+        or "unknown-world"
+    )
+    episode_content_id = str(
+        metadata.get("episode_content_id")
+        or nested.get("episode_content_id")
+        or metadata.get("document_hash")
+        or nested.get("document_hash")
+        or "unknown-content"
+    )
+    initial_input_hash = str(
+        metadata.get("initial_input_hash")
+        or nested.get("initial_input_hash")
+        or metadata.get("bayes_initial_input_hash")
+        or nested.get("bayes_initial_input_hash")
+        or metadata.get("document_hash")
+        or nested.get("document_hash")
+        or ""
+    )
+    if not initial_input_hash:
+        initial_input_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "question_id": question_id,
+                    "prompt": metadata.get("prompt") or nested.get("prompt") or "",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+    event_id = str(
+        decision_event_id
+        or metadata.get("decision_event_id")
+        or nested.get("decision_event_id")
+        or "root"
+    )
+    prefix_hash = str(
+        decision_prefix_hash
+        or metadata.get("decision_prefix_hash")
+        or nested.get("decision_prefix_hash")
+        or metadata.get("bayestool_branch_prefix_hash")
+        or nested.get("branch_prefix_hash")
+        or initial_input_hash
+    )
+    runtime_state_digest = str(
+        metadata.get("runtime_state_digest")
+        or nested.get("runtime_state_digest")
+        or metadata.get("bayes_runtime_state_digest")
+        or nested.get("bayes_runtime_state_digest")
+        or "initial"
+    )
+    rng_coupling_id = str(
+        metadata.get("rng_coupling_id")
+        or nested.get("rng_coupling_id")
+        or metadata.get("coupling_id")
+        or nested.get("coupling_id")
+        or ""
+    )
+    return_definition_version = str(
+        metadata.get("return_definition_version")
+        or nested.get("return_definition_version")
+        or "bayestool-utility-v1"
+    )
+    world_slot_role = str(
+        metadata.get("world_slot_role")
+        or nested.get("world_slot_role")
+        or ""
+    )
+    variant_id = str(metadata.get("variant_id") or nested.get("variant_id") or "base")
+    policy_version = str(
+        metadata.get("policy_version")
+        or nested.get("policy_version")
+        or metadata.get("bayestool_policy_version")
+        or "bayestool-policy-v1"
+    )
+    payload = {
+        "objective_version": str(
+            metadata.get("objective_version")
+            or nested.get("objective_version")
+            or "bayestool-grpo-v2"
+        ),
+        "episode_content_id": episode_content_id,
+        "question_id": question_id,
+        "latent_world_id": latent_world_id,
+        "initial_input_hash": initial_input_hash,
+        "decision_event_id": event_id,
+        "decision_prefix_hash": prefix_hash,
+        "runtime_state_digest": runtime_state_digest,
+        "rng_coupling_id": rng_coupling_id,
+        "return_definition_version": return_definition_version,
+        "world_slot_role": world_slot_role,
+        "variant_id": variant_id,
+        "policy_version": policy_version,
+    }
+    digest = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:32]
+    return f"bayes-decision:{digest}"
+
+
+def bayestool_group_id(sample: Mapping[str, Any], *, index: int = 0) -> str:
+    """Read a strict decision group id without cross-question fallbacks."""
+
+    metadata = sample.get("metadata") if isinstance(sample.get("metadata"), Mapping) else sample
+    nested = metadata.get("bayestool")
+    nested = nested if isinstance(nested, Mapping) else {}
+    value = metadata.get("decision_group_id") or nested.get("decision_group_id")
+    if value:
+        return str(value)
+    # Legacy records are still isolated by question.  In particular, never
+    # use latent_world_id/coupling_id alone as an advantage group.
+    legacy = metadata.get("sibling_group_id") or nested.get("sibling_group_id")
+    question = bayestool_question_id(metadata, default=f"sample-{index}")
+    if legacy:
+        return f"legacy:{question}:{legacy}"
+    return f"unpaired:{question}:{index}"
+
+
+def validate_bayestool_group_records(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    allowed_sizes: Sequence[int] = (4, 8),
+    require_complete: bool = False,
+) -> dict[str, Any]:
+    """Audit policy records before they enter a Bayes GRPO loss.
+
+    The validator reports rather than silently repairs groups.  A caller may
+    then skip incomplete groups or fail the rollout; copying a record or
+    mixing a different question/world is never a valid repair.
+    """
+
+    groups: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for index, record in enumerate(records):
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else record
+        if bool(metadata.get("dummy_removed_sample")) or bool(metadata.get("exclude_from_group_statistics")):
+            continue
+        groups[bayestool_group_id(record, index=index)].append(record)
+    allowed = {int(value) for value in allowed_sizes}
+    violations: list[dict[str, Any]] = []
+    group_summaries: list[dict[str, Any]] = []
+    for group_id, items in groups.items():
+        metadata_rows = [
+            item.get("metadata") if isinstance(item.get("metadata"), Mapping) else item
+            for item in items
+        ]
+        questions = {bayestool_question_id(row) for row in metadata_rows}
+        worlds = {
+            str(row.get("latent_world_id") or (row.get("bayestool") or {}).get("latent_world_id") or "")
+            for row in metadata_rows
+        }
+        prefixes = {
+            str(row.get("decision_prefix_hash") or (row.get("bayestool") or {}).get("decision_prefix_hash") or "")
+            for row in metadata_rows
+        }
+        size = len(items)
+        errors: list[str] = []
+        if size not in allowed:
+            errors.append(f"group_size={size} not in {sorted(allowed)}")
+        if len(questions) > 1:
+            errors.append("cross_question")
+        if len(worlds) > 1:
+            errors.append("cross_latent_world")
+        if len(prefixes - {""}) > 1:
+            errors.append("cross_decision_prefix")
+        if any(
+            str(row.get("rollout_status") or "") in {"infra_error", "context_overflow", "tool_error"}
+            or bool(row.get("infra_error"))
+            or bool(row.get("context_overflow"))
+            for row in metadata_rows
+        ):
+            errors.append("infrastructure_invalid")
+        if errors:
+            violations.append({"group_id": group_id, "errors": errors, "size": size})
+        group_summaries.append(
+            {
+                "group_id": group_id,
+                "size": size,
+                "question_ids": sorted(questions),
+                "latent_world_ids": sorted(worlds),
+                "decision_prefix_hashes": sorted(prefixes),
+                "valid": not errors,
+            }
+        )
+    if require_complete and violations:
+        raise ValueError(f"invalid BayesTool decision groups: {violations}")
+    return {
+        "group_count": len(groups),
+        "group_size_histogram": {
+            str(size): sum(1 for group in group_summaries if group["size"] == size)
+            for size in sorted({group["size"] for group in group_summaries})
+        },
+        "valid_group_count": sum(1 for group in group_summaries if group["valid"]),
+        "invalid_group_count": len(violations),
+        "cross_question_group_count": sum("cross_question" in item["errors"] for item in violations),
+        "cross_latent_world_group_count": sum("cross_latent_world" in item["errors"] for item in violations),
+        "cross_decision_prefix_group_count": sum("cross_decision_prefix" in item["errors"] for item in violations),
+        "violations": violations,
+        "groups": group_summaries,
+    }
+
+
 def bayes_grpo_advantages(
     samples: Sequence[Mapping[str, Any]],
     *,
     standardize: bool = False,
 ) -> list[float]:
     returns = [float(sample.get("utility", sample.get("reward", 0.0))) for sample in samples]
-    groups = [
-        str(
-            sample.get("sibling_group_id")
-            or sample.get("latent_world_id")
-            or sample.get("coupling_id")
-            or sample.get("world_id")
-            or index
-        )
-        for index, sample in enumerate(samples)
-    ]
+    groups = [bayestool_group_id(sample, index=index) for index, sample in enumerate(samples)]
     weights = [float(sample.get("sibling_weight", 1.0)) for sample in samples]
     return weighted_sibling_advantage(returns, groups, weights=weights, standardize=standardize)
 
@@ -501,6 +751,10 @@ __all__ = [
     "compute_bayestool_utility",
     "attach_bayestool_utility",
     "weighted_sibling_advantage",
+    "bayestool_question_id",
+    "make_bayestool_decision_group_id",
+    "bayestool_group_id",
+    "validate_bayestool_group_records",
     "bayes_grpo_advantages",
     "content_signature",
     "support_valid_pair",

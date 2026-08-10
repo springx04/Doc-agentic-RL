@@ -186,6 +186,10 @@ class ToolWorldSpec:
     world_slot: int = 0
     replica_id: int = 0
     latent_seed: int = 0
+    # Stable realization identity.  ``replica_id`` is retained only as a
+    # continuation index for old manifests; it is not an RL grouping key.
+    world_slot_role: str = ""
+    variant_id: str = "base"
 
     def __post_init__(self) -> None:
         missing = set(TOOL_NAMES) - set(self.tool_states)
@@ -210,6 +214,8 @@ class ToolWorldSpec:
             "world_slot": int(self.world_slot),
             "replica_id": int(self.replica_id),
             "latent_seed": int(self.latent_seed),
+            "world_slot_role": self.world_slot_role,
+            "variant_id": self.variant_id,
         }
 
     def to_latent_dict(self) -> dict[str, Any]:
@@ -220,6 +226,8 @@ class ToolWorldSpec:
             "latent_world_id": self.latent_world_id,
             "world_slot": int(self.world_slot),
             "latent_seed": int(self.latent_seed),
+            "world_slot_role": self.world_slot_role,
+            "variant_id": self.variant_id,
             "world_type": self.world_type,
             "session_state": self.session_state.to_dict(),
             "tool_states": {name: quality.to_dict() for name, quality in self.tool_states.items()},

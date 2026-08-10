@@ -13,7 +13,7 @@ import random
 import re
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -25,6 +25,7 @@ from .config import (
     BayesToolConfig,
     default_config,
 )
+from .grouping import QuestionRolloutPlan, WORLD_SLOT_ROLES
 from .schema import (
     ContextRule,
     RegimeSegment,
@@ -223,6 +224,8 @@ def tool_world_spec_from_dict(value: Mapping[str, Any]) -> ToolWorldSpec:
         world_slot=int(value.get("world_slot", 0)),
         replica_id=int(value.get("replica_id", 0)),
         latent_seed=int(value.get("latent_seed", value.get("seed", 0))),
+        world_slot_role=str(value.get("world_slot_role", "")),
+        variant_id=str(value.get("variant_id", "base")),
     )
 
 
@@ -348,8 +351,15 @@ def _clean_quality() -> ToolQualitySpec:
     )
 
 
-def _latent_identity(coupling_id: str, rollout_id: int | str, world_slot: int, world_type: str) -> str:
-    payload = f"{coupling_id}\x1f{rollout_id}\x1f{int(world_slot)}\x1f{world_type}".encode(
+def _latent_identity(
+    coupling_id: str,
+    rollout_id: int | str,
+    world_slot: int,
+    world_type: str,
+    world_slot_role: str = "",
+    variant_id: str = "base",
+) -> str:
+    payload = f"{coupling_id}\x1f{rollout_id}\x1f{int(world_slot)}\x1f{world_slot_role}\x1f{variant_id}\x1f{world_type}".encode(
         "utf-8", "surrogatepass"
     )
     return hashlib.sha256(payload).hexdigest()[:24]
@@ -444,6 +454,42 @@ def _coverage_world_types(
     return tuple(slots)  # type: ignore[return-value]
 
 
+def _world_type_for_role(
+    coupling_id: str,
+    *,
+    rollout_id: int | str,
+    world_slot: int,
+    world_slot_role: str,
+    config: BayesToolConfig,
+) -> str:
+    """Resolve a required realization role to a concrete world regime.
+
+    The role is the semantic identity consumed by grouping/weighting.  The
+    concrete local and change regimes may vary deterministically inside their
+    role without changing the four-slot coverage contract.
+    """
+
+    if world_slot_role == "healthy":
+        return "healthy"
+    configured = dict(getattr(config, "world_type_probabilities", ()) or ())
+    if world_slot_role == "shared_family_fault":
+        return "shared_family_fault"
+    if world_slot_role == "local_degradation":
+        choices = ("single_tool_degradation", "context_degradation")
+    elif world_slot_role == "change":
+        choices = ("abrupt_change", "gradual_change")
+    else:
+        raise ValueError(f"unknown BayesTool world_slot_role: {world_slot_role!r}")
+    weights = tuple(max(0.0, float(configured.get(name, 0.0))) for name in choices)
+    if sum(weights) <= 0.0:
+        weights = (1.0, 1.0)
+    return str(
+        random.Random(
+            stable_seed(coupling_id, rollout_id, world_slot, world_slot_role, "concrete-world-type")
+        ).choices(choices, weights=weights, k=1)[0]
+    )
+
+
 def _default_shared_factors() -> dict[str, SharedFactorSpec]:
     return {name: SharedFactorSpec(name, "healthy", 0.0) for name in TOOL_FAMILIES}
 
@@ -453,6 +499,8 @@ def sample_tool_world(
     *,
     world_slot: int,
     replica_id: int = 0,
+    world_slot_role: str | None = None,
+    variant_id: str = "base",
     rollout_id: int | str = 0,
     config: BayesToolConfig | None = None,
     world_type: str | None = None,
@@ -473,13 +521,24 @@ def sample_tool_world(
             tool_argument_capabilities=public_context.tool_argument_capabilities,
             tool_budget=tool_budget,
         )
-    latent_seed = stable_seed(coupling_id, rollout_id, world_slot, "latent-world")
+    role = str(world_slot_role or "")
+    if role and role not in WORLD_SLOT_ROLES:
+        raise ValueError(f"unknown BayesTool world_slot_role: {role!r}")
+    latent_seed = stable_seed(coupling_id, rollout_id, world_slot, role, variant_id, "latent-world")
     # ``seed`` remains replica-specific for backwards-compatible manifests;
     # hidden world state below is sampled exclusively from ``latent_seed``.
     seed = stable_seed(latent_seed, "replica-observation", replica_id)
     rng = random.Random(latent_seed)
     world_types = WORLD_TYPES
-    if world_type is not None:
+    if role:
+        selected_type = _world_type_for_role(
+            coupling_id,
+            rollout_id=rollout_id,
+            world_slot=world_slot,
+            world_slot_role=role,
+            config=config,
+        )
+    elif world_type is not None:
         selected_type = sample_world_type(
             coupling_id,
             rollout_id=rollout_id,
@@ -488,7 +547,7 @@ def sample_tool_world(
             config=config,
         ) if str(world_type).casefold() == "sampled" else world_type
     else:
-        # The default four slots are deliberately heterogeneous: one healthy
+        # The legacy default four slots are deliberately heterogeneous: one healthy
         # world, one local/context world, one shared-family world, and one
         # non-stationary world. The local/change choices and slot ordering are
         # deterministic but use the configured training distribution; replicas
@@ -594,7 +653,10 @@ def sample_tool_world(
 
     return ToolWorldSpec(
         coupling_id=str(coupling_id),
-        world_id=f"{coupling_id}:slot={world_slot}:replica={replica_id}:type={selected_type}",
+        world_id=(
+            f"{coupling_id}:slot={world_slot}:role={role or 'legacy'}:variant={variant_id or 'base'}"
+            f":replica={replica_id}:type={selected_type}"
+        ),
         seed=seed,
         world_type=selected_type,
         session_state=session,
@@ -602,10 +664,19 @@ def sample_tool_world(
         shared_factors=shared,
         context_rules=tuple(context_rules),
         regime_schedule=tuple(schedule),
-        latent_world_id=_latent_identity(coupling_id, rollout_id, world_slot, selected_type),
+        latent_world_id=_latent_identity(
+            coupling_id,
+            rollout_id,
+            world_slot,
+            selected_type,
+            role,
+            variant_id,
+        ),
         world_slot=int(world_slot),
         replica_id=int(replica_id),
         latent_seed=int(latent_seed),
+        world_slot_role=role,
+        variant_id=str(variant_id or "base"),
     )
 
 
@@ -1160,6 +1231,8 @@ class WorldRuntime:
         document_digest: str = "",
         clean_cache: CleanResultCache | None = None,
         fixed_world_specs: Sequence[Mapping[str, Any] | ToolWorldSpec] | None = None,
+        question_rollout_plan: QuestionRolloutPlan | Mapping[str, Any] | None = None,
+        realization_index: int | None = None,
         sampling_context: WorldSamplingContext | Mapping[str, Any] | None = None,
         tool_budget: int | None = None,
     ) -> "WorldRuntime":
@@ -1187,17 +1260,86 @@ class WorldRuntime:
                     tool_argument_capabilities=runtime_context.tool_argument_capabilities,
                     tool_budget=tool_budget,
                 )
-        world_slot = int(sample_index) % max(1, int(config.worlds_per_prompt))
-        replica_id = (int(sample_index) // max(1, int(config.worlds_per_prompt))) % max(
-            1, int(config.replicas_per_world)
+        # A rollout plan is the semantic source of truth.  The old
+        # ``worlds_per_prompt``/``replicas_per_world`` pair is retained only
+        # for loading legacy manifests; it cannot define K or world count.
+        plan = (
+            question_rollout_plan
+            if isinstance(question_rollout_plan, QuestionRolloutPlan)
+            else QuestionRolloutPlan.from_mapping(question_rollout_plan)
+            if isinstance(question_rollout_plan, Mapping)
+            else None
         )
-        fixed_index = world_slot * max(1, int(config.replicas_per_world)) + replica_id
+        sample_offset = int(sample_index)
+        if sample_offset < 0:
+            raise ValueError(f"sample_index must be non-negative, got {sample_index}")
+        if plan is not None:
+            if realization_index is not None:
+                # New rollout generation submits one primary trajectory per
+                # realization.  Its index is therefore a realization index,
+                # while K-1 sibling continuations are created later from the
+                # frozen checkpoint.  Keeping this explicit prevents the
+                # legacy expanded-record offset from mapping all primaries to
+                # the first K-sized group.
+                world_slot = int(realization_index)
+                if world_slot < 0 or world_slot >= plan.group_count:
+                    raise IndexError(
+                        f"realization_index {realization_index} exceeds rollout plan group_count {plan.group_count}"
+                    )
+                continuation = 0
+                realization = plan.realizations[world_slot]
+            else:
+                # Compatibility for callers that already hold an expanded
+                # record offset.  New generators should pass
+                # ``realization_index`` explicitly.
+                remaining = sample_offset
+                world_slot = 0
+                continuation = 0
+                realization = None
+                for slot_index, candidate in enumerate(plan.realizations):
+                    if remaining < int(candidate.k):
+                        world_slot = slot_index
+                        continuation = remaining
+                        realization = candidate
+                        break
+                    remaining -= int(candidate.k)
+                if realization is None:
+                    raise IndexError(
+                        f"sample_index {sample_index} exceeds rollout plan record_count {plan.record_count}"
+                    )
+            replica_id = int(continuation)
+            world_slot_role = realization.world_slot_role
+            variant_id = realization.variant_id
+            # New manifests persist one frozen latent spec per realization;
+            # the continuation id is materialized below.  A legacy expanded
+            # manifest is still accepted when it contains one entry per
+            # record.
+            fixed_index = (
+                sample_offset
+                if realization_index is None
+                and fixed_world_specs is not None
+                and len(fixed_world_specs) >= plan.record_count
+                else world_slot
+            )
+        else:
+            group_size = max(1, int(getattr(config, "default_group_size", 4)))
+            world_slot = sample_offset // group_size
+            replica_id = sample_offset % group_size
+            world_slot_role = None
+            variant_id = "base"
+            # Legacy fixed manifests were emitted in slot x replica order;
+            # without an explicit plan the linear sample index is the only
+            # compatible lookup and is never used for new grouping semantics.
+            fixed_index = sample_offset
         fixed_value = (
             fixed_world_specs[fixed_index]
             if fixed_world_specs is not None and fixed_index < len(fixed_world_specs)
             else None
         )
-        if fixed_value is not None and world_type is None:
+        # An explicit question plan freezes one latent world per realization.
+        # A legacy ``world_type`` field must not override that manifest and
+        # silently resample a different world at rollout time.
+        if fixed_value is not None and (plan is not None or world_type is None):
             spec = (
                 fixed_value
                 if isinstance(fixed_value, ToolWorldSpec)
@@ -1208,11 +1350,25 @@ class WorldRuntime:
                     "fixed world spec coupling_id does not match the rollout coupling_id: "
                     f"{spec.coupling_id!r} != {coupling_id!r}"
                 )
+            if world_slot_role and not spec.world_slot_role:
+                spec = replace(spec, world_slot_role=world_slot_role, variant_id=variant_id)
+            if plan is not None:
+                spec = replace(
+                    spec,
+                    seed=int(stable_seed(spec.latent_seed, "replica-observation", replica_id)),
+                    replica_id=int(replica_id),
+                    world_id=(
+                        f"{spec.coupling_id}:slot={world_slot}:role={spec.world_slot_role or world_slot_role}"
+                        f":variant={spec.variant_id or variant_id}:replica={replica_id}:type={spec.world_type}"
+                    ),
+                )
         else:
             spec = sample_tool_world(
                 coupling_id,
                 world_slot=world_slot,
                 replica_id=replica_id,
+                world_slot_role=world_slot_role,
+                variant_id=variant_id,
                 rollout_id=rollout_id,
                 config=config,
                 world_type=world_type,

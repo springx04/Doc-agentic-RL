@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 
-# Four-A100 BayesTool-RL launcher for Qwen3-VL-8B-Instruct.
-# GPU 0-1: Megatron actor (TP=2); GPU 2-3: SGLang rollout (TP=2).
+# Four-GPU BayesTool-RL launcher for Qwen3-VL-8B-Instruct.
+# BayesTool defaults to the FSDP actor path; Megatron remains an explicit
+# fail-fast incompatibility until it consumes the question manifest/weights.
+# The actor uses FSDP by default; rollout workers use the remaining GPUs.
 # The official Qwen3-VL checkpoint is loaded through the bridge so the vision
 # tower, MRoPE, and multimodal token configuration are retained.
 
@@ -14,6 +16,7 @@ export PYTHONFAULTHANDLER=1
 NUM_GPUS=${NUM_GPUS:-4}
 ACTOR_GPUS=${ACTOR_GPUS:-2}
 ROLLOUT_GPUS=${ROLLOUT_GPUS:-2}
+TRAIN_BACKEND=${TRAIN_BACKEND:-fsdp}
 if (( NUM_GPUS != 4 || ACTOR_GPUS != 2 || ROLLOUT_GPUS != 2 )); then
     echo "This launcher is fixed to NUM_GPUS=4, ACTOR_GPUS=2, ROLLOUT_GPUS=2" >&2
     exit 1
@@ -89,14 +92,19 @@ SAVE_INTERVAL=${SAVE_INTERVAL:-20}
 NUM_ROLLOUT=${NUM_ROLLOUT:-3000}
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-4}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-32}
-N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8}
-if (( N_SAMPLES_PER_PROMPT != 8 )); then
-    echo "BayesTool requires N_SAMPLES_PER_PROMPT=8 (4 worlds x 2 replicas), got ${N_SAMPLES_PER_PROMPT}" >&2
+BAYESTOOL_GROUP_SIZE=${BAYESTOOL_GROUP_SIZE:-4}
+BAYESTOOL_REALIZATIONS=${BAYESTOOL_REALIZATIONS:-4}
+N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-${BAYESTOOL_REALIZATIONS}}
+if (( BAYESTOOL_GROUP_SIZE != 4 && BAYESTOOL_GROUP_SIZE != 8 )); then
+    echo "BayesTool requires K=4 or K=8, got ${BAYESTOOL_GROUP_SIZE}" >&2
+    exit 1
+fi
+if (( BAYESTOOL_REALIZATIONS < 4 || BAYESTOOL_REALIZATIONS > 6 || N_SAMPLES_PER_PROMPT != BAYESTOOL_REALIZATIONS )); then
+    echo "BayesTool requires an explicit 4-6 primary realization plan; got K=${BAYESTOOL_GROUP_SIZE}, R=${BAYESTOOL_REALIZATIONS}, primary_samples=${N_SAMPLES_PER_PROMPT}" >&2
     exit 1
 fi
 ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-6144}
 ROLLOUT_MAX_CONTEXT_LEN=${ROLLOUT_MAX_CONTEXT_LEN:-16384}
-NUM_STEPS_PER_ROLLOUT=${NUM_STEPS_PER_ROLLOUT:-2}
 EVAL_INTERVAL=${EVAL_INTERVAL:-20}
 N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-8}
 EVAL_MAX_RESPONSE_LEN=${EVAL_MAX_RESPONSE_LEN:-6144}
@@ -117,6 +125,7 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
+    --train-backend "${TRAIN_BACKEND}"
     --prompt-data "${PROMPT_DATA}"
     --input-key prompt
     --label-key label
@@ -131,7 +140,6 @@ ROLLOUT_ARGS=(
     --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}"
     --rollout-max-context-len "${ROLLOUT_MAX_CONTEXT_LEN}"
     --rollout-temperature 1
-    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT}"
     --balance-data
 )
 
@@ -148,11 +156,12 @@ EVAL_ARGS=(
 BAYESTOOL_ARGS=(
     --advantage-estimator bayes_grpo
     --bayestool-enable
-    --bayestool-worlds-per-prompt 4
-    --bayestool-replicas-per-world 2
+    --bayestool-group-size "${BAYESTOOL_GROUP_SIZE}"
+    --bayestool-worlds-per-prompt "${BAYESTOOL_REALIZATIONS}"
+    --bayestool-replicas-per-world 1
     --bayestool-posterior-particles 8
-    --bayestool-max-action-candidates 4
-    --bayestool-max-siblings 4
+    --bayestool-max-action-candidates "${BAYESTOOL_GROUP_SIZE}"
+    --bayestool-max-siblings "${BAYESTOOL_GROUP_SIZE}"
     --bayestool-branch-horizon 3
     --bayestool-branch-probability "${BAYESTOOL_BRANCH_PROBABILITY}"
     --bayestool-consensus-threshold 0.75

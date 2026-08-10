@@ -690,7 +690,23 @@ async def generate_rollout_async(
     data = []
     all_data = []
     do_print = True
-    pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
+    # In the explicit BayesTool plan, n_samples_per_prompt is the number of
+    # primary realization trajectories (R); each primary is completed to K
+    # records by shared-prefix continuations.  Keep the progress indicator
+    # aligned with the actual expanded output while preserving the legacy
+    # worlds x replicas sampler's old total.
+    nominal_expansion = 1
+    if (
+        bool(getattr(args, "bayestool_enable", False))
+        and getattr(args, "advantage_estimator", "") == "bayes_grpo"
+        and int(getattr(args, "n_samples_per_prompt", 0) or 0)
+        == int(getattr(args, "bayestool_worlds_per_prompt", 0) or 0)
+    ):
+        nominal_expansion = int(getattr(args, "bayestool_default_group_size", 4) or 4)
+    pbar = tqdm(
+        total=target_data_size * args.n_samples_per_prompt * nominal_expansion,
+        desc="Rollout generation",
+    )
     while len(data) < target_data_size:
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.

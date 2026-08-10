@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import random
 from argparse import Namespace
@@ -141,6 +142,12 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.global_step = 0
         self.micro_step = 0
+        self.bayestool_questions_seen = 0
+        self.bayestool_next_checkpoint_question = max(
+            1,
+            int(getattr(args, "bayestool_checkpoint_interval_questions", 100) or 100),
+        )
+        self.last_rollout_score = None
 
         checkpoint_payload = checkpoint.load(self)
 
@@ -326,7 +333,24 @@ class FSDPTrainRayActor(TrainRayActor):
         if self.args.debug_rollout_only or self.args.save is None:
             return
 
+        # The train loop may call this hook every rollout so that checkpoint
+        # cadence is based on valid questions rather than on a fixed number of
+        # optimizer/rollout iterations.  Only the actual threshold crossing
+        # writes a model; the final rollout always forces one last checkpoint.
+        if (
+            getattr(self.args, "bayestool_enable", False)
+            and not force_sync
+            and self.bayestool_questions_seen < self.bayestool_next_checkpoint_question
+        ):
+            return
+
         assert not self.args.async_save, "FSDPTrainRayActor does not support async_save yet."
+        if getattr(self.args, "bayestool_enable", False):
+            interval = max(
+                1,
+                int(getattr(self.args, "bayestool_checkpoint_interval_questions", 100) or 100),
+            )
+            self.bayestool_next_checkpoint_question = self.bayestool_questions_seen + interval
         checkpoint.save(self, rollout_id)
 
     def _compute_log_prob(
@@ -411,18 +435,41 @@ class FSDPTrainRayActor(TrainRayActor):
 
         packed_batches = []
         mbs_size_list = []
-        local_batch_size = self.args.global_batch_size // self.dp_size
-        assert (
-            self.args.global_batch_size % self.dp_size == 0
-        ), f"global_batch_size {self.args.global_batch_size} is not divisible by dp_world_size {self.dp_size}"
-        # Use global_batch_size for splitting when max_tokens_per_gpu is enabled
+        manifest = rollout_data.get("bayes_batch_sizes")
+        if manifest:
+            global_batch_sizes = [int(value) for value in manifest]
+            if any(value <= 0 or value % self.dp_size for value in global_batch_sizes):
+                raise ValueError(
+                    f"BayesTool batch manifest must be positive and divisible by dp_size={self.dp_size}: {manifest}"
+                )
+            expected_local_samples = sum(global_batch_sizes) // self.dp_size
+            if expected_local_samples != len(tokens):
+                raise ValueError(
+                    f"BayesTool local manifest expects {expected_local_samples} samples, got {len(tokens)}"
+                )
+            local_batch_sizes = [value // self.dp_size for value in global_batch_sizes]
+        else:
+            global_batch_sizes = [self.args.global_batch_size] * (
+                len(tokens) // (self.args.global_batch_size // self.dp_size)
+            )
+            local_batch_sizes = [self.args.global_batch_size // self.dp_size] * len(global_batch_sizes)
+            assert (
+                self.args.global_batch_size % self.dp_size == 0
+            ), f"global_batch_size {self.args.global_batch_size} is not divisible by dp_world_size {self.dp_size}"
+
+        # Use the actual per-step local sizes for dynamic microbatching.  All
+        # ranks have the same manifest length, so the MAX reduction preserves
+        # identical collective rounds even when token lengths differ.
         if self.args.use_dynamic_batch_size:
             max_tokens = self.args.max_tokens_per_gpu
-
-            for i in range(0, len(tokens), local_batch_size):
+            for start, local_batch_size in zip(
+                [sum(local_batch_sizes[:index]) for index in range(len(local_batch_sizes))],
+                local_batch_sizes,
+                strict=True,
+            ):
                 mbs_size_list.append(
                     get_minimum_num_micro_batch_size(
-                        [len(t) for t in rollout_data["tokens"][i : i + local_batch_size]],
+                        [len(t) for t in rollout_data["tokens"][start : start + local_batch_size]],
                         max_tokens,
                     )
                 )
@@ -430,12 +477,18 @@ class FSDPTrainRayActor(TrainRayActor):
             dist.all_reduce(num_microbatches, op=dist.ReduceOp.MAX, group=self.dp_group)
             num_microbatches = num_microbatches.tolist()
         else:
-            num_microbatches = [self.args.global_batch_size // (self.args.micro_batch_size * self.dp_size)] * (
-                len(tokens) // local_batch_size
-            )
+            num_microbatches = [
+                max(1, math.ceil(local_batch_size / max(1, self.args.micro_batch_size)))
+                for local_batch_size in local_batch_sizes
+            ]
 
         start = 0
-        for mbs_size in num_microbatches:
+        for global_batch_size, local_batch_size, mbs_size in zip(
+            global_batch_sizes,
+            local_batch_sizes,
+            num_microbatches,
+            strict=True,
+        ):
             end = start + local_batch_size
             packed_batches.extend(
                 pack_sequences(
@@ -455,8 +508,16 @@ class FSDPTrainRayActor(TrainRayActor):
                         else None
                     ),
                     num_packs=mbs_size,
+                    bayes_loss_weights=(
+                        rollout_data["bayes_loss_weights"][start:end]
+                        if "bayes_loss_weights" in rollout_data
+                        else None
+                    ),
                 )
             )
+            for packed_batch in packed_batches[-mbs_size:]:
+                packed_batch["_bayes_global_batch_size"] = int(global_batch_size)
+                packed_batch["_bayes_weighted_loss"] = "bayes_loss_weights" in rollout_data
             start = end
         grad_accum = list(accumulate(num_microbatches))
 
@@ -543,6 +604,24 @@ class FSDPTrainRayActor(TrainRayActor):
             # partition, while the rollout splitter intentionally preserves
             # the global raw-reward list for other backends.
             rollout_data["raw_reward"] = raw_rewards
+            grouping_report = rollout_data.get("bayes_grouping_report")
+            if isinstance(grouping_report, dict):
+                self.bayestool_questions_seen += int(grouping_report.get("question_count", 0) or 0)
+
+            # Save a global rollout score for checkpoint selection.  The value
+            # is deliberately labelled as a training score; final checkpoint
+            # selection still uses the independent fixed 200-question eval.
+            score_stats = torch.tensor(
+                [float(sum(raw_rewards)), float(len(raw_rewards))],
+                dtype=torch.float64,
+                device=torch.cuda.current_device(),
+            )
+            dist.all_reduce(score_stats, op=dist.ReduceOp.SUM, group=self.dp_group)
+            self.last_rollout_score = (
+                float((score_stats[0] / score_stats[1].clamp_min(1.0)).item())
+                if dist.get_rank() == 0
+                else None
+            )
             group_ids = (
                 rollout_data.get("bayes_group_ids")
                 or rollout_data.get("sibling_group_ids")
@@ -554,22 +633,46 @@ class FSDPTrainRayActor(TrainRayActor):
             if len(sibling_weights) != len(raw_rewards):
                 sibling_weights = [1.0] * len(raw_rewards)
 
-            grouped: dict[str, list[int]] = {}
-            for index, group_id in enumerate(group_ids):
-                grouped.setdefault(str(group_id), []).append(index)
+            precomputed_advantages = rollout_data.get("bayes_advantages")
+            precomputed_baselines = rollout_data.get("bayes_sibling_baselines")
+            if precomputed_advantages is not None and len(precomputed_advantages) != local_count:
+                if partition is not None and len(partition) == local_count:
+                    precomputed_advantages = [precomputed_advantages[int(index)] for index in partition]
+            if precomputed_baselines is not None and len(precomputed_baselines) != local_count:
+                if partition is not None and len(partition) == local_count:
+                    precomputed_baselines = [precomputed_baselines[int(index)] for index in partition]
 
-            baselines = [0.0] * len(raw_rewards)
-            sibling_advantages = [0.0] * len(raw_rewards)
-            for indices in grouped.values():
-                weights = [max(0.0, float(sibling_weights[index])) for index in indices]
-                denominator = sum(weights) or float(len(indices))
-                baseline = sum(
-                    weight * float(raw_rewards[index])
-                    for index, weight in zip(indices, weights, strict=True)
-                ) / denominator
-                for index in indices:
-                    baselines[index] = baseline
-                    sibling_advantages[index] = float(raw_rewards[index]) - baseline
+            if precomputed_advantages is not None and len(precomputed_advantages) == local_count:
+                # The rollout manager computed this over all siblings before
+                # DP splitting.  This is the only correct FSDP path when a
+                # group is distributed one sibling per rank.
+                sibling_advantages = [float(value) for value in precomputed_advantages]
+                baselines = (
+                    [float(value) for value in precomputed_baselines]
+                    if precomputed_baselines is not None and len(precomputed_baselines) == local_count
+                    else [0.0] * local_count
+                )
+            else:
+                logger.warning(
+                    "BayesTool precomputed global advantages missing; using local fallback groups. "
+                    "This path is only compatible with a single-rank/debug rollout."
+                )
+                grouped: dict[str, list[int]] = {}
+                for index, group_id in enumerate(group_ids):
+                    grouped.setdefault(str(group_id), []).append(index)
+
+                baselines = [0.0] * len(raw_rewards)
+                sibling_advantages = [0.0] * len(raw_rewards)
+                for indices in grouped.values():
+                    weights = [max(0.0, float(sibling_weights[index])) for index in indices]
+                    denominator = sum(weights) or float(len(indices))
+                    baseline = sum(
+                        weight * float(raw_rewards[index])
+                        for index, weight in zip(indices, weights, strict=True)
+                    ) / denominator
+                    for index in indices:
+                        baselines[index] = baseline
+                        sibling_advantages[index] = float(raw_rewards[index]) - baseline
 
             advantages = []
             effective_loss_masks = []
@@ -771,6 +874,10 @@ class FSDPTrainRayActor(TrainRayActor):
         advantages = torch.cat([batch["advantages"] for batch in unpacked_batches], dim=0)
         loss_masks = [batch["loss_masks"].to(device=log_probs.device) for batch in unpacked_batches]
         response_lengths = [batch["response_lengths"] for batch in unpacked_batches]
+        has_bayes_weights = any("bayes_loss_weights" in batch for batch in unpacked_batches)
+        bayes_loss_weights = [
+            float(batch.get("bayes_loss_weights", 1.0)) for batch in unpacked_batches
+        ]
 
         advantages = advantages.to(device=log_probs.device)
         old_log_probs = old_log_probs.to(device=log_probs.device)
@@ -814,20 +921,35 @@ class FSDPTrainRayActor(TrainRayActor):
             pg_clipfrac = sum_of_token(pg_clipfrac, response_lengths, loss_masks)
             ppo_kl = sum_of_token(ppo_kl.abs(), response_lengths, loss_masks)
         else:
-            pg_loss = sum_of_sample_mean(pg_loss, response_lengths, loss_masks)
-            pg_clipfrac = sum_of_sample_mean(pg_clipfrac, response_lengths, loss_masks)
-            ppo_kl = sum_of_sample_mean(ppo_kl.abs(), response_lengths, loss_masks)
+            reducer = weighted_sum_of_sample_mean if has_bayes_weights else sum_of_sample_mean
+            if has_bayes_weights:
+                pg_loss = reducer(pg_loss, response_lengths, loss_masks, bayes_loss_weights)
+                pg_clipfrac = reducer(pg_clipfrac, response_lengths, loss_masks, bayes_loss_weights)
+                ppo_kl = reducer(ppo_kl.abs(), response_lengths, loss_masks, bayes_loss_weights)
+            else:
+                pg_loss = reducer(pg_loss, response_lengths, loss_masks)
+                pg_clipfrac = reducer(pg_clipfrac, response_lengths, loss_masks)
+                ppo_kl = reducer(ppo_kl.abs(), response_lengths, loss_masks)
 
         # Only compare rollout vs. train log probs when they originate from different stages.
         train_rollout_logprob_abs_diff = None
         if not self.args.use_rollout_logprobs and rollout_log_probs is not None:
             train_rollout_logprob_abs_diff = (old_log_probs - rollout_log_probs).abs()
-            train_rollout_logprob_abs_diff = sum_of_sample_mean(
-                train_rollout_logprob_abs_diff, response_lengths, loss_masks
-            ).detach()
+            if has_bayes_weights:
+                train_rollout_logprob_abs_diff = weighted_sum_of_sample_mean(
+                    train_rollout_logprob_abs_diff, response_lengths, loss_masks, bayes_loss_weights
+                ).detach()
+            else:
+                train_rollout_logprob_abs_diff = sum_of_sample_mean(
+                    train_rollout_logprob_abs_diff, response_lengths, loss_masks
+                ).detach()
 
         entropy = torch.cat([batch["entropy"] for batch in unpacked_batches], dim=0)
-        entropy_loss = sum_of_sample_mean(entropy, response_lengths, loss_masks)
+        entropy_loss = (
+            weighted_sum_of_sample_mean(entropy, response_lengths, loss_masks, bayes_loss_weights)
+            if has_bayes_weights
+            else sum_of_sample_mean(entropy, response_lengths, loss_masks)
+        )
 
         loss = pg_loss - self.args.entropy_coef * entropy_loss
 
@@ -842,7 +964,11 @@ class FSDPTrainRayActor(TrainRayActor):
                 kl_loss_type=self.args.kl_loss_type,
                 importance_ratio=importance_ratio,
             )
-            kl_loss = sum_of_sample_mean(kl, response_lengths, loss_masks)
+            kl_loss = (
+                weighted_sum_of_sample_mean(kl, response_lengths, loss_masks, bayes_loss_weights)
+                if has_bayes_weights
+                else sum_of_sample_mean(kl, response_lengths, loss_masks)
+            )
 
             loss = loss + self.args.kl_loss_coef * kl_loss
 
@@ -863,8 +989,18 @@ class FSDPTrainRayActor(TrainRayActor):
         if self.args.use_opsm:
             reported["opsm_clipfrac"] = opsm_clipfrac
 
-        # Scale loss for gradient accumulation
-        loss = loss * self.dp_size / self.args.global_batch_size
+        # BayesTool weights are normalized to sum to one within the complete
+        # question batch.  Multiply by DP size so the FSDP all-reduce produces
+        # the same objective as a single-process weighted sum.  Legacy PPO
+        # keeps its historical sample-count scaling.
+        current_global_batch_size = int(
+            packed_batch.get("_bayes_global_batch_size", self.args.global_batch_size)
+        )
+        loss = loss * (
+            self.dp_size
+            if has_bayes_weights
+            else self.dp_size / current_global_batch_size
+        )
         loss.backward()
 
         # Accumulate reported metrics (store tensors for later mean)
@@ -887,8 +1023,9 @@ class FSDPTrainRayActor(TrainRayActor):
             reduced_aggregated = [None] * self.dp_size
             dist.all_gather_object(reduced_aggregated, aggregated, group=self.dp_group)
             aggregated = {}
+            metric_denominator = 1.0 if has_bayes_weights else float(current_global_batch_size)
             for k in reported_accum.keys():
-                aggregated[k] = sum([r[k] for r in reduced_aggregated]) / (self.args.global_batch_size)
+                aggregated[k] = sum([r[k] for r in reduced_aggregated]) / metric_denominator
             reported_accum.clear()
             if dist.get_rank() == 0:
                 log_dict = {
@@ -1221,6 +1358,26 @@ def sum_of_sample_mean(x: torch.Tensor, response_lengths: list[int], loss_masks:
             for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
         ]
     )
+
+
+def weighted_sum_of_sample_mean(
+    x: torch.Tensor,
+    response_lengths: list[int],
+    loss_masks: list[torch.Tensor],
+    weights: list[float],
+) -> torch.Tensor:
+    """Weighted sequence means for question-normalized BayesTool loss."""
+
+    if len(response_lengths) != len(loss_masks) or len(weights) != len(response_lengths):
+        raise ValueError(
+            "response_lengths, loss_masks and BayesTool loss weights must have equal length"
+        )
+    result = x.new_zeros(())
+    for x_i, loss_mask_i, weight in zip(
+        x.split(response_lengths, dim=0), loss_masks, weights, strict=True
+    ):
+        result = result + float(weight) * (x_i * loss_mask_i).sum() / torch.clamp_min(loss_mask_i.sum(), 1)
+    return result
 
 
 @torch.no_grad()

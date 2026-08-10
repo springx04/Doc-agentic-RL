@@ -76,6 +76,7 @@ def pack_sequences(
     multimodal_train_inputs: list[dict] | None = None,
     max_tokens_per_gpu: int | None = None,
     num_packs: int | None = None,
+    bayes_loss_weights: list[float] | None = None,
 ) -> list[dict]:
     """
     Pack sequences into dense batches with cumulative sequence lengths.
@@ -92,6 +93,7 @@ def pack_sequences(
         multimodal_train_inputs: List of dict of multimodal tensors for training per sequence
         max_tokens_per_gpu: Maximum tokens per GPU pack
         num_packs: Explicit number of packs to create
+        bayes_loss_weights: Optional question-level loss weight per sequence
 
     Returns:
         List of packed batches with tokens, masks, cu_seqlens, rewards, raw_rewards, response_lengths, advantages, returns
@@ -157,6 +159,8 @@ def pack_sequences(
                 flat_rollout_log_probs, dtype=torch.float32, device=torch.cuda.current_device()
             ),
         }
+        if bayes_loss_weights is not None:
+            packed_batch["bayes_loss_weights"] = [float(bayes_loss_weights[i]) for i in indices]
 
         # Collect and add multimodal training tensors for this partition
         if multimodal_train_inputs:
@@ -223,6 +227,10 @@ def unpack_sequences(packed_batch: dict) -> list[dict]:
         # Copy any additional attributes that might exist in the packed batch
         for key, value in packed_batch.items():
             if key not in instance:
+                if isinstance(key, str) and key.startswith("_bayes_"):
+                    # Per-packed-batch scheduling metadata is consumed by the
+                    # actor and is not a per-sequence field.
+                    continue
                 # Skip multimodal_num_items - it's metadata
                 if key == "multimodal_num_items":
                     continue

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -73,6 +74,54 @@ def _write_checkpoint_metadata(path: Path, metadata: dict[str, Any]) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(metadata, indent=2, sort_keys=True))
     tmp_path.replace(path)
+
+
+def _prune_bayestool_checkpoints(base_dir: Path, actor: Any) -> None:
+    """Keep a bounded BayesTool checkpoint history after a successful save.
+
+    The real-data BayesTool runner saves model-only checkpoints.  Retaining
+    every rollout is unnecessary and quickly exhausts the remote volume, so
+    keep the newest ``N`` checkpoints and the highest-scoring checkpoint.  The
+    deletion scope is restricted to direct ``iter_*`` children of the
+    configured checkpoint directory.
+    """
+
+    if not getattr(actor.args, "bayestool_enable", False):
+        return
+    retention = max(0, int(getattr(actor.args, "bayestool_checkpoint_retention", 2) or 0))
+    base_resolved = base_dir.resolve()
+    candidates = []
+    for path in base_dir.glob("iter_*"):
+        if not path.is_dir() or path.parent.resolve() != base_resolved:
+            continue
+        try:
+            step = int(path.name.removeprefix("iter_"))
+        except ValueError:
+            continue
+        metadata = _read_checkpoint_metadata(path / "meta.json")
+        candidates.append((step, path, metadata))
+    if not candidates:
+        return
+
+    candidates.sort(key=lambda item: item[0])
+    keep = {path for _, path, _ in candidates[-retention:]} if retention else set()
+    scored = [
+        (float(metadata["rollout_score"]), path)
+        for _, path, metadata in candidates
+        if isinstance(metadata.get("rollout_score"), (int, float))
+    ]
+    if scored:
+        keep.add(max(scored, key=lambda item: item[0])[1])
+
+    for _, path, _ in candidates:
+        if path in keep:
+            continue
+        resolved = path.resolve()
+        if resolved.parent != base_resolved or not resolved.name.startswith("iter_"):
+            logger.error("Refusing to prune checkpoint outside configured directory: %s", resolved)
+            continue
+        logger.info("[FSDP] Pruning old BayesTool checkpoint %s", resolved)
+        shutil.rmtree(resolved)
 
 
 def _is_dcp_checkpoint(path: Path) -> bool:
@@ -207,6 +256,17 @@ def finalize_load(actor: Any, checkpoint_payload: dict[str, Any] | None) -> None
     if metadata:
         actor.global_step = int(metadata.get("global_step", actor.global_step))
         actor.micro_step = int(metadata.get("micro_step", actor.micro_step))
+        if hasattr(actor, "bayestool_questions_seen"):
+            actor.bayestool_questions_seen = int(
+                metadata.get("bayestool_questions_seen", actor.bayestool_questions_seen)
+            )
+            interval = max(1, int(getattr(actor.args, "bayestool_checkpoint_interval_questions", 100) or 100))
+            actor.bayestool_next_checkpoint_question = int(
+                metadata.get(
+                    "bayestool_next_checkpoint_question",
+                    actor.bayestool_questions_seen + interval,
+                )
+            )
         next_rollout = metadata.get("next_rollout_id")
         if next_rollout is not None:
             actor.args.start_rollout_id = next_rollout
@@ -278,10 +338,22 @@ def save(actor: Any, iteration: int) -> None:
             "world_size": dist.get_world_size(),
             "timestamp": time.time(),
         }
+        if getattr(actor.args, "bayestool_enable", False):
+            metadata.update(
+                {
+                    "bayestool_questions_seen": int(getattr(actor, "bayestool_questions_seen", 0)),
+                    "bayestool_next_checkpoint_question": int(
+                        getattr(actor, "bayestool_next_checkpoint_question", 0)
+                    ),
+                    "rollout_score": getattr(actor, "last_rollout_score", None),
+                    "score_kind": "training_raw_reward",
+                }
+            )
         _write_checkpoint_metadata(checkpoint_dir / "meta.json", metadata)
 
         tracker_file = base_dir / "latest_checkpointed_iteration.txt"
         tracker_file.write_text(str(step_id))
         logger.info(f"[FSDP] Saved checkpoint to {checkpoint_dir}")
+        _prune_bayestool_checkpoints(base_dir, actor)
 
     dist.barrier()

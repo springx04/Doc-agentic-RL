@@ -41,6 +41,17 @@ from .belief import (
     extract_observation_features,
 )
 from .decision import DecisionController, BayesQHead, q_feature_vectors
+from .grouping import (
+    ALLOWED_GROUP_SIZES,
+    DEFAULT_POLICY_VERSION,
+    WORLD_SLOT_ROLES,
+    QuestionRolloutPlan,
+    RealizationPlan,
+    compute_hierarchical_loss_weights,
+    make_question_rollout_plan,
+    make_runtime_state_digest,
+    validate_bayestool_question_records,
+)
 
 __all__ = [
     "BayesToolConfig",
@@ -71,6 +82,15 @@ __all__ = [
     "DecisionController",
     "BayesQHead",
     "q_feature_vectors",
+    "WORLD_SLOT_ROLES",
+    "ALLOWED_GROUP_SIZES",
+    "DEFAULT_POLICY_VERSION",
+    "QuestionRolloutPlan",
+    "RealizationPlan",
+    "make_question_rollout_plan",
+    "make_runtime_state_digest",
+    "validate_bayestool_question_records",
+    "compute_hierarchical_loss_weights",
     "CANONICAL_REPLAY_SCHEMA_VERSION",
     "export_canonical_replay",
     "validate_canonical_replay",

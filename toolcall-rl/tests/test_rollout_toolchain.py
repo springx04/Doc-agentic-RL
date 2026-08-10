@@ -462,6 +462,111 @@ def test_bayestool_branch_uses_shared_prefix_and_real_candidate_tokens(monkeypat
         module._BAYES_BRANCH_CHECKPOINTS.pop(child.metadata["bayestool_branch_resume_id"], None)
 
 
+def test_explicit_plan_force_branch_constructs_exact_k_even_when_gate_would_skip(monkeypatch):
+    module, FakeSample = _load_generator(monkeypatch)
+    FakeSample.Status.PENDING = "pending"
+    from bayestool.config import default_config
+    from bayestool.grouping import make_question_rollout_plan
+
+    def action(tool_name: str) -> dict[str, object]:
+        return {
+            "kind": "tool",
+            "tool": tool_name,
+            "arguments": {"document_path": "/workspace/a.pdf", "page_number": 1},
+        }
+
+    raw = {
+        name: module._bayestool_action_text(action(name))
+        for name in ("render_page", "extract_table", "ocr_region", "detect_layout")
+    }
+    candidates = [
+        {
+            "key": module.canonical_action_key(action(name)),
+            "action": action(name),
+            "raw": raw[name],
+            "token_ids": [100 + index],
+            "log_probs": [-0.1],
+            "source": "test",
+        }
+        for index, name in enumerate(raw)
+    ]
+    config = replace(
+        default_config(enabled=True),
+        default_group_size=4,
+        max_action_candidates=4,
+        max_siblings=4,
+        branch_probability_when_eligible=0.0,
+    )
+    belief = module.BeliefRuntime(config, document_digest="doc", seed=9)
+    sample = _sample(FakeSample, "Question")
+    sample.index = 3
+    sample.status = FakeSample.Status.PENDING
+    sample.metadata.update(
+        {
+            "question_rollout_plan": make_question_rollout_plan("q", group_size=4).to_dict(),
+            "decision_group_size": 4,
+            "question_id": "q",
+            "world_slot_role": "healthy",
+            "variant_id": "base",
+        }
+    )
+    checkpoint = module._capture_bayestool_branch_checkpoint(
+        prompt_token_ids=[1, 2],
+        context_token_ids=[1, 2, 3],
+        context_image_data=[],
+        context_segments=[],
+        response="prefix",
+        response_token_ids=[3],
+        loss_masks=[1],
+        rollout_log_probs=[-0.1],
+        current_images=[],
+        multimodal_train_inputs_buffer=[],
+        execution_trace=[],
+        action_log={"actions": []},
+        generation_steps=[],
+        step_action_spans=[],
+        navigation_state={"question_type": "table", "remaining_tool_budget": 5},
+        world_runtime=None,
+        belief_runtime=belief,
+        bayes_document_digest="doc",
+        bayes_coupling_id="coupling",
+        world_sample_index=0,
+        turn=0,
+        tool_call_count=0,
+        max_tool_steps=8,
+        config=config,
+    )
+
+    async def fake_generate(args, child, sampling_params, evaluation=False):
+        return child
+
+    monkeypatch.setattr(module, "generate", fake_generate)
+    children, event = asyncio.run(
+        module._launch_bayestool_branches(
+            args=SimpleNamespace(),
+            state=SimpleNamespace(tokenizer=None),
+            url="http://router/generate",
+            sample=sample,
+            sampling_params={"max_new_tokens": 32},
+            evaluation=False,
+            checkpoint=checkpoint,
+            current_text=raw["render_page"],
+            current_token_ids=[100],
+            current_log_probs=[-0.1],
+            im_end_id=None,
+            decision_controller=module.DecisionController(config, seed=2),
+            bayes_config=config,
+            candidates_override=candidates,
+            force_branch=True,
+        )
+    )
+    assert event["force_branch"] is True
+    assert event["target_group_size"] == 4
+    assert len(children) == 3
+    for child in children:
+        module._BAYES_BRANCH_CHECKPOINTS.pop(child.metadata["bayestool_branch_resume_id"], None)
+
+
 def test_bayestool_filter_and_q_checkpoints_load_into_rollout_worker(monkeypatch, tmp_path):
     import torch
 

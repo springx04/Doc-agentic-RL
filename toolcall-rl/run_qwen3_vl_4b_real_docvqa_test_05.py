@@ -64,10 +64,31 @@ def _configure() -> None:
 def _training_argv() -> list[str]:
     argv = _BASE_TRAINING_ARGV()
     argv.remove("--disable-rewards-normalization")
+    # The legacy launcher formula ties global_batch_size to the unexpanded
+    # primary count.  BayesTool's explicit manifest owns optimizer batching;
+    # remove that option before the strict argument validator sees it.
+    if "--num-steps-per-rollout" in argv:
+        index = argv.index("--num-steps-per-rollout")
+        del argv[index : index + 2]
     _replace_value(argv, "--rollout-batch-size", os.environ.get("OPENCLAW_BAYESTOOL_ROLLOUT_BATCH_SIZE", "2"))
-    # Four mandatory world slots x four independent root siblings.  The old
-    # 4x2 layout could not form a valid K=4 decision group.
-    samples_per_prompt = os.environ.get("OPENCLAW_BAYESTOOL_SAMPLES_PER_PROMPT", "16")
+    # Four mandatory realization roles x K independent continuations.  The
+    # legacy replica fields below are compatibility metadata only.
+    group_size = int(os.environ.get("OPENCLAW_BAYESTOOL_GROUP_SIZE", "4"))
+    realization_count = int(os.environ.get("OPENCLAW_BAYESTOOL_REALIZATIONS", "4"))
+    if group_size not in {4, 8} or not 4 <= realization_count <= 6:
+        raise ValueError(
+            f"invalid BayesTool plan defaults: realization_count={realization_count}, K={group_size}"
+        )
+    samples_per_prompt = os.environ.get(
+        "OPENCLAW_BAYESTOOL_SAMPLES_PER_PROMPT",
+        str(realization_count),
+    )
+    if int(samples_per_prompt) != realization_count:
+        raise ValueError(
+            "OPENCLAW_BAYESTOOL_SAMPLES_PER_PROMPT must equal the explicit "
+            f"realization count ({realization_count}); K siblings are expanded "
+            "from each primary checkpoint, not requested as primary samples."
+        )
     eval_samples_per_prompt = os.environ.get("OPENCLAW_BAYESTOOL_EVAL_SAMPLES_PER_PROMPT", "1")
     _replace_value(argv, "--n-samples-per-prompt", samples_per_prompt)
     _replace_value(argv, "--n-samples-per-eval-prompt", eval_samples_per_prompt)
@@ -100,15 +121,16 @@ def _training_argv() -> list[str]:
     argv.extend(
         [
             "--bayestool-enable",
-            "--bayestool-worlds-per-prompt", os.environ.get("OPENCLAW_BAYESTOOL_WORLDS_PER_PROMPT", "4"),
-            "--bayestool-replicas-per-world", os.environ.get("OPENCLAW_BAYESTOOL_REPLICAS_PER_WORLD", "4"),
+            "--bayestool-group-size", str(group_size),
+            "--bayestool-worlds-per-prompt", os.environ.get("OPENCLAW_BAYESTOOL_WORLDS_PER_PROMPT", str(realization_count)),
+            "--bayestool-replicas-per-world", os.environ.get("OPENCLAW_BAYESTOOL_REPLICAS_PER_WORLD", "1"),
             "--bayestool-questions-per-step", os.environ.get("OPENCLAW_BAYESTOOL_QUESTIONS_PER_STEP", "2"),
             "--bayestool-max-questions-per-step", os.environ.get("OPENCLAW_BAYESTOOL_MAX_QUESTIONS_PER_STEP", "8"),
             "--bayestool-stage", stage,
             "--bayestool-branch-probability", os.environ.get("OPENCLAW_BAYESTOOL_BRANCH_PROBABILITY", "1.0"),
             "--bayestool-decision-regret-threshold", os.environ.get("OPENCLAW_BAYESTOOL_REGRET_THRESHOLD", "-1.0"),
-            "--bayestool-max-action-candidates", "4",
-            "--bayestool-max-siblings", "4",
+            "--bayestool-max-action-candidates", str(group_size),
+            "--bayestool-max-siblings", str(group_size),
             "--bayestool-branch-horizon", "3",
             "--bayestool-checkpoint-interval-questions",
             os.environ.get("OPENCLAW_BAYESTOOL_CHECKPOINT_INTERVAL_QUESTIONS", "100"),
@@ -203,7 +225,12 @@ def _validate() -> dict[str, Any]:
             "rewards_normalization": True,
             "gradient_checkpointing": os.environ.get("OPENCLAW_BAYESTOOL_GRADIENT_CHECKPOINTING", "1") == "1",
             "rollout_batch_size": int(os.environ.get("OPENCLAW_BAYESTOOL_ROLLOUT_BATCH_SIZE", "2")),
-            "samples_per_prompt": int(os.environ.get("OPENCLAW_BAYESTOOL_SAMPLES_PER_PROMPT", "16")),
+            "samples_per_prompt": int(
+                os.environ.get(
+                    "OPENCLAW_BAYESTOOL_SAMPLES_PER_PROMPT",
+                    os.environ.get("OPENCLAW_BAYESTOOL_REALIZATIONS", "4"),
+                )
+            ),
             "eval_samples_per_prompt": int(os.environ.get("OPENCLAW_BAYESTOOL_EVAL_SAMPLES_PER_PROMPT", "1")),
             "global_batch_size": int(os.environ.get("OPENCLAW_BAYESTOOL_GLOBAL_BATCH_SIZE", "32")),
             "num_rollout": int(os.environ.get("OPENCLAW_BAYESTOOL_NUM_ROLLOUT", "1")),

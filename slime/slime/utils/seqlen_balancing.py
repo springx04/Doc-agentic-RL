@@ -232,6 +232,53 @@ def build_fsdp_modality_aligned_order(
     return result
 
 
+def build_fsdp_modality_aligned_order_for_batches(
+    modality_flags: list[bool],
+    batch_sizes: list[int],
+    dp_size: int,
+) -> tuple[list[int], list[int]]:
+    """Align visual/text lanes without crossing question-level batches.
+
+    The legacy helper treats one rollout as one fixed-size batch and can move
+    records from adjacent questions across an optimizer boundary.  BayesTool
+    supplies a manifest of complete question batches instead.  This helper
+    applies the same modality alignment independently to each manifest entry
+    and returns the padded sizes that the FSDP actor must consume.
+    """
+
+    if dp_size <= 0:
+        raise ValueError(f"dp_size must be positive, got {dp_size}")
+    if sum(batch_sizes) != len(modality_flags):
+        raise ValueError(
+            f"batch_sizes must cover every sample: sum={sum(batch_sizes)} samples={len(modality_flags)}"
+        )
+    order: list[int] = []
+    aligned_sizes: list[int] = []
+    cursor = 0
+    for batch_size in batch_sizes:
+        if batch_size <= 0 or batch_size % dp_size != 0:
+            raise ValueError(
+                f"BayesTool batch size must be positive and divisible by dp_size: "
+                f"batch_size={batch_size} dp_size={dp_size}"
+            )
+        indices = list(range(cursor, cursor + batch_size))
+        cursor += batch_size
+        visual = [index for index in indices if modality_flags[index]]
+        text = [index for index in indices if not modality_flags[index]]
+        if not visual or not text:
+            order.extend(indices)
+            aligned_sizes.append(batch_size)
+            continue
+        aligned_visual = ((len(visual) + dp_size - 1) // dp_size) * dp_size
+        aligned_text = ((len(text) + dp_size - 1) // dp_size) * dp_size
+        order.extend(visual)
+        order.extend([-1] * (aligned_visual - len(visual)))
+        order.extend(text)
+        order.extend([-2] * (aligned_text - len(text)))
+        aligned_sizes.append(aligned_visual + aligned_text)
+    return order, aligned_sizes
+
+
 def get_fsdp_modality_aligned_partitions(
     num_samples: int,
     dp_size: int,
