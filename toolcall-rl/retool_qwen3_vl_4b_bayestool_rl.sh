@@ -42,9 +42,18 @@ else
 fi
 
 # Resolve the Python and Ray executables from the same runtime environment.
-# Non-interactive server jobs do not necessarily activate the conda env, and
-# falling back to /opt/conda/bin/python3 would mix incompatible packages.
-PYTHON_BIN=${PYTHON_BIN:-${PYTHON:-python3}}
+# Non-interactive server jobs do not necessarily activate the conda env, so
+# prefer the project-adjacent runtime before falling back to PATH.  The path
+# remains configurable for other deployments.
+OPENCLAW_ENV_DIR=${OPENCLAW_ENV_DIR:-"${PROJECT_DIR}/../envs/openclaw-rl-qwen3vl"}
+PYTHON_BIN=${PYTHON_BIN:-${PYTHON:-}}
+if [[ -z "${PYTHON_BIN}" ]]; then
+    if [[ -x "${OPENCLAW_ENV_DIR}/bin/python" ]]; then
+        PYTHON_BIN="${OPENCLAW_ENV_DIR}/bin/python"
+    else
+        PYTHON_BIN=python3
+    fi
+fi
 if [[ "${PYTHON_BIN}" != */* ]]; then
     PYTHON_BIN="$(command -v "${PYTHON_BIN}")"
 fi
@@ -313,6 +322,8 @@ if [[ "${TRAIN_BACKEND}" == "fsdp" ]]; then
     PERF_ARGS=(
         --gradient-checkpointing
         --attn-implementation "${FSDP_ATTN_IMPLEMENTATION}"
+        --use-dynamic-batch-size
+        --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
     )
     OPTIMIZER_ARGS=(
         --optimizer adam
