@@ -165,6 +165,17 @@ def _training_argv() -> list[str]:
 
 
 def _validate() -> dict[str, Any]:
+    # Ray appends a timestamp/pid session directory and the plasma socket to
+    # this path.  Check the worst-case shape before starting Ray so a long run
+    # name fails in preflight instead of leaving a half-created output tree.
+    ray_socket_suffix = "/session_YYYY-MM-DD_HH-MM-SS_ffffff_99999999/sockets/plasma_store"
+    ray_temp_text = str(REAL_RAY_TEMP_DIR)
+    if len(ray_temp_text) + len(ray_socket_suffix) >= 107:
+        raise RuntimeError(
+            "OPENCLAW_BAYESTOOL_RAY_TEMP_DIR is too long for Ray's AF_UNIX "
+            f"socket path ({len(ray_temp_text) + len(ray_socket_suffix)} bytes); "
+            "use a short directory such as /workspace/data/.ray/bt-r8k4-100"
+        )
     required_model_paths = (
         base.DOCLING_ARTIFACTS_DIR / "docling-project--docling-layout-heron",
         base.DOCLING_ARTIFACTS_DIR / "docling-project--docling-models",
