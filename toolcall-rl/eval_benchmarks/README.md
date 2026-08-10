@@ -31,8 +31,10 @@ git -C toolcall-rl/eval_benchmarks/vendors clone --depth 1 https://github.com/Jo
 
 hf download VLR-CVC/DocVQA-2026 val.parquet --repo-type dataset \
   --local-dir "$BENCH_ROOT/raw/docvqa2026"
+sha256sum "$BENCH_ROOT/raw/docvqa2026/val.parquet"  # cfdcf75a3929881e5ff21f917c314005a6c1727430e8b8662f34dd9f4b82124f
 hf download dengchao/LongDocURL LongDocURL_public.jsonl pdf_files.tar.gz \
   --repo-type dataset --local-dir "$BENCH_ROOT/raw/longdocurl"
+sha256sum "$BENCH_ROOT/raw/longdocurl/pdf_files.tar.gz"  # 0cfc0984417f7a3d309c68a9afd9243768bf5767b1132860846ab4a5d940d8ab
 mkdir -p "$BENCH_ROOT/documents/longdocurl"
 tar -xzf "$BENCH_ROOT/raw/longdocurl/pdf_files.tar.gz" -C "$BENCH_ROOT/documents/longdocurl"
 hf download lmms-lab/MP-DocVQA --repo-type dataset \
@@ -41,9 +43,11 @@ curl -L 'https://zenodo.org/records/7763635/files/2023-03-23_DUDE_gt_test_PUBLIC
   -o "$BENCH_ROOT/raw/dude/2023-03-23_DUDE_gt_test_PUBLIC.json"
 hf download jordyvl/DUDE_loader data/DUDE_train-val-test_binaries.tar.gz \
   --repo-type dataset --local-dir "$BENCH_ROOT/raw/dude"
+sha256sum "$BENCH_ROOT/raw/dude/data/DUDE_train-val-test_binaries.tar.gz"  # 1506384a93022a2da6b180270345a6928ea7347842eaa2d2e177190c4fd29cae
 ```
 
-Before the DUDE archive, verify at least 45 GB free. `prepare_dude.py` streams
+Before downloading the DUDE archive, run `df -h "$BENCH_ROOT"` and require at
+least 45 GB free. `prepare_dude.py` streams
 only validation PDFs from the archive and supports `--delete-archive` after a
 successful extraction. It never uses `tar.extractall`.
 
@@ -74,9 +78,11 @@ bash toolcall-rl/eval_benchmarks/run_eval_only.sh \
 The wrapper forces eval-only (`num_rollout=0`) and one sample per question. It
 refuses to overwrite an existing `eval_0.pt` unless `--overwrite` is explicit,
 checks the eval JSONL row count for the validated launcher, and fails if the
-required rollout artifact is absent. The launcher path can be
+required rollout artifact is absent. The default bridge wraps the project's
+real-data Qwen3-VL launcher with `baseline_eval`'s explicit `num_rollout=0`
+and `lr_decay_iters=1` controls. The launcher path can be
 supplied with `--launcher` or `OPENCLAW_EVAL_LAUNCHER`; the default is the
-project's validated `run_qwen3_vl_4b_real_docvqa_test_05.py` bridge.
+project's `eval_benchmarks/run_qwen3_vl_eval_launcher.py` bridge.
 
 After a rollout, export and score each benchmark independently:
 

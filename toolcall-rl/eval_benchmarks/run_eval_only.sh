@@ -13,7 +13,7 @@ EVAL_DATA=
 OUTPUT_DIR=
 MODEL=
 OVERWRITE=0
-LAUNCHER=${OPENCLAW_EVAL_LAUNCHER:-${REPO_ROOT}/toolcall-rl/run_qwen3_vl_4b_real_docvqa_test_05.py}
+LAUNCHER=${OPENCLAW_EVAL_LAUNCHER:-${REPO_ROOT}/toolcall-rl/eval_benchmarks/run_qwen3_vl_eval_launcher.py}
 
 usage() {
   cat >&2 <<'EOF'
