@@ -693,14 +693,12 @@ async def generate_rollout_async(
     # In the explicit BayesTool plan, n_samples_per_prompt is the number of
     # primary realization trajectories (R); each primary is completed to K
     # records by shared-prefix continuations.  Keep the progress indicator
-    # aligned with the actual expanded output while preserving the legacy
-    # worlds x replicas sampler's old total.
+    # aligned with the explicit plan; legacy worlds x replicas fields are not
+    # consulted to determine rollout or grouping semantics.
     nominal_expansion = 1
     if (
         bool(getattr(args, "bayestool_enable", False))
         and getattr(args, "advantage_estimator", "") == "bayes_grpo"
-        and int(getattr(args, "n_samples_per_prompt", 0) or 0)
-        == int(getattr(args, "bayestool_worlds_per_prompt", 0) or 0)
     ):
         nominal_expansion = int(getattr(args, "bayestool_default_group_size", 4) or 4)
     pbar = tqdm(

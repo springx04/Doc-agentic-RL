@@ -1155,6 +1155,10 @@ async def _launch_bayestool_branches(
                 "bayestool_branch_id": f"{branch_group_id}:{child_number}",
                 "bayestool_branch_parent_index": parent_index,
                 "bayestool_branch_prefix_hash": checkpoint["prefix_hash"],
+                "selected_decision_event": str(
+                    checkpoint.get("selected_decision_event")
+                    or f"branch:{checkpoint['prefix_hash'][:32]}"
+                ),
                 "bayestool_branch_shared_prefix": True,
                 "bayestool_branch_shared_prefix_tokens": len(checkpoint["context_token_ids"]),
                 "bayestool_branch_action_key": candidate["key"],
@@ -5009,6 +5013,19 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                 # the prompt-local realization index before constructing the
                 # world; K-1 siblings are expanded from its checkpoint later.
                 if branch_resume is None:
+                    configured_primary_count = getattr(args, "n_samples_per_prompt", None)
+                    if (
+                        not evaluation
+                        and configured_primary_count is not None
+                        and int(configured_primary_count) > 0
+                        and int(configured_primary_count) != bayes_question_plan.group_count
+                    ):
+                        raise ValueError(
+                            "BayesTool n_samples_per_prompt must equal the explicit "
+                            "QuestionRolloutPlan realization count; legacy world/replica "
+                            f"settings cannot remap it ({configured_primary_count}!="
+                            f"{bayes_question_plan.group_count})"
+                        )
                     primary_count = int(
                         getattr(args, "n_samples_per_prompt", bayes_question_plan.group_count)
                         or bayes_question_plan.group_count
@@ -5597,6 +5614,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                 # fallback.  It is captured after Bayes candidate selection so
                 # the primary action and its log-probs are exactly the parent
                 # continuation that will be compared with K-1 siblings.
+                pre_action_checkpoint["selected_decision_event"] = "root"
                 root_branch_candidate = {
                     "checkpoint": pre_action_checkpoint,
                     "current_text": cur_response,
@@ -5910,6 +5928,17 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
             )
 
         if selected_checkpoint is not None:
+            selected_prefix_hint = str(selected_checkpoint["checkpoint"].get("prefix_hash", ""))
+            root_prefix_hint = str(
+                root_branch_candidate["checkpoint"].get("prefix_hash", "")
+                if root_branch_candidate is not None
+                else ""
+            )
+            selected_checkpoint["checkpoint"]["selected_decision_event"] = (
+                "root"
+                if selected_prefix_hint == root_prefix_hint
+                else f"branch:{selected_prefix_hint[:32]}"
+            )
             try:
                 children, branch_event = await _launch_bayestool_branches(
                     args=args,
@@ -6370,11 +6399,17 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                 default=str,
             ).encode("utf-8")
         ).hexdigest()
+        selected_event_hint = str(diagnostic_metadata.get("selected_decision_event") or "")
         branch_prefix_hash = str(
             diagnostic_metadata.get("bayestool_branch_prefix_hash")
             or diagnostic_metadata.get("branch_prefix_hash")
             or ""
         )
+        if selected_event_hint == "root":
+            # Root fallback children carry a checkpoint prefix for replay
+            # diagnostics, but that prefix is not a new decision node.  Keep
+            # them in the parent's root group identity.
+            branch_prefix_hash = ""
         decision_event_id = (
             f"branch:{branch_prefix_hash[:32]}" if branch_prefix_hash else "root"
         )
@@ -6405,6 +6440,43 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
             diagnostic_metadata.get("selected_decision_event")
             or (f"branch:{branch_prefix_hash[:32]}" if branch_prefix_hash else "root")
         )
+        # Freeze the selected node back into the per-question manifest before
+        # serializing the sample.  Parent and branch children therefore carry
+        # the same selected event, prefix and runtime digest; a plan that only
+        # describes the initial root state cannot silently pass grouping
+        # validation after a middle-node branch was selected.
+        if bayes_question_plan is not None and 0 <= world_slot < bayes_question_plan.group_count:
+            realization = bayes_question_plan.realizations[world_slot]
+            bayes_question_plan = replace(
+                bayes_question_plan,
+                realizations=tuple(
+                    replace(
+                        item,
+                        selected_decision_event=(
+                            selected_decision_event
+                            if index == world_slot
+                            else item.selected_decision_event
+                        ),
+                        decision_prefix_hash=(
+                            decision_prefix_hash
+                            if index == world_slot
+                            else item.decision_prefix_hash
+                        ),
+                        runtime_state_digest=(
+                            frozen_runtime_digest
+                            if index == world_slot
+                            else item.runtime_state_digest
+                        ),
+                    )
+                    for index, item in enumerate(bayes_question_plan.realizations)
+                ),
+            )
+            diagnostic_metadata["question_rollout_plan"] = bayes_question_plan.to_dict()
+        slot_weight = float(
+            dict(bayes_question_plan.slot_weights).get(world_slot_role, 0.25)
+            if bayes_question_plan is not None
+            else 0.25
+        )
         group_metadata = dict(diagnostic_metadata)
         group_metadata.update(
             {
@@ -6424,6 +6496,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                 "coupling_id": bayes_coupling_id,
                 "world_slot_role": world_slot_role,
                 "variant_id": variant_id,
+                "slot_weight": slot_weight,
                 "policy_version": policy_version,
                 "decision_group_size": decision_group_size,
             }
@@ -6542,6 +6615,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         sample.metadata["replica_id"] = int(world_runtime.spec.replica_id)
         sample.metadata["world_slot_role"] = world_slot_role
         sample.metadata["variant_id"] = variant_id
+        sample.metadata["slot_weight"] = slot_weight
         sample.metadata["policy_version"] = policy_version
         sample.metadata["decision_group_size"] = decision_group_size
         sample.metadata["sibling_group_id"] = sibling_group_id

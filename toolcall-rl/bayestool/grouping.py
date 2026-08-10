@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
@@ -99,8 +100,11 @@ class RealizationPlan:
             raise ValueError(f"decision group K must be 4 or 8, got {self.k!r}")
         if not self.variant_id:
             raise ValueError("variant_id must be non-empty")
-        if float(self.slot_weight) < 0.0:
-            raise ValueError("slot_weight must be non-negative")
+        slot_weight = float(self.slot_weight)
+        if not math.isfinite(slot_weight) or slot_weight < 0.0:
+            raise ValueError("slot_weight must be a finite non-negative number")
+        if not str(self.selected_decision_event).strip():
+            raise ValueError("selected_decision_event must be non-empty")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -138,14 +142,29 @@ class QuestionRolloutPlan:
             raise ValueError(f"required world slot roles are missing: {sorted(missing)}")
         if len({(item.world_slot_role, item.variant_id) for item in self.realizations}) != len(self.realizations):
             raise ValueError("a question cannot contain duplicate role/variant realizations")
+        if not 1 <= int(self.max_records) <= 48:
+            raise ValueError(f"max_records must be in [1, 48], got {self.max_records!r}")
         if sum(int(item.k) for item in self.realizations) > int(self.max_records):
             raise ValueError("question realization groups exceed the 48-record safety limit")
         weights = dict(self.slot_weights)
-        if any(role not in weights for role in WORLD_SLOT_ROLES):
-            raise ValueError("slot_weights must contain all four required roles")
+        if set(weights) != set(WORLD_SLOT_ROLES):
+            raise ValueError("slot_weights must contain exactly the four required roles")
+        for role in WORLD_SLOT_ROLES:
+            weight = float(weights[role])
+            if not math.isfinite(weight) or weight < 0.0:
+                raise ValueError(f"slot weight for {role!r} must be finite and non-negative")
         total = sum(float(weights[role]) for role in WORLD_SLOT_ROLES)
-        if total <= 0.0:
-            raise ValueError("required world slot weights must have positive total")
+        if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-6):
+            raise ValueError(f"slot weights must sum to one, got {total}")
+        for realization in self.realizations:
+            expected = float(weights[realization.world_slot_role])
+            if not math.isclose(float(realization.slot_weight), expected, rel_tol=0.0, abs_tol=1e-6):
+                raise ValueError(
+                    f"realization slot weight disagrees with plan for {realization.world_slot_role!r}: "
+                    f"{realization.slot_weight} != {expected}"
+                )
+            if realization.policy_version != self.policy_version:
+                raise ValueError("all realizations must use the question policy_version")
 
     @property
     def group_count(self) -> int:
@@ -299,7 +318,17 @@ def _group_report(items: Sequence[tuple[int, Any]], allowed: frozenset[int]) -> 
     prefixes = {str(metadata_value(row, "decision_prefix_hash", "")) for row in metadata}
     runtimes = {str(metadata_value(row, "runtime_state_digest", "")) for row in metadata}
     policies = {str(metadata_value(row, "policy_version", "")) for row in metadata}
+    initial_inputs = {str(metadata_value(row, "initial_input_hash", "")) for row in metadata}
     roles = {slot_role_from_metadata(row) for row in metadata}
+    variants = {str(metadata_value(row, "variant_id", "base")) for row in metadata}
+    declared_group_sizes: set[int] = set()
+    for row in metadata:
+        value = metadata_value(row, "decision_group_size", None)
+        if value is not None and str(value).strip():
+            try:
+                declared_group_sizes.add(int(value))
+            except (TypeError, ValueError):
+                errors.append("invalid_declared_group_size")
     variants_by_role: dict[str, set[str]] = defaultdict(set)
     for row in metadata:
         variants_by_role[slot_role_from_metadata(row)].add(str(metadata_value(row, "variant_id", "base")))
@@ -317,8 +346,14 @@ def _group_report(items: Sequence[tuple[int, Any]], allowed: frozenset[int]) -> 
         errors.append("runtime_state_not_frozen")
     if len(policies) != 1 or "" in policies:
         errors.append("policy_version_not_frozen")
+    if len(initial_inputs) != 1 or "" in initial_inputs:
+        errors.append("initial_input_not_frozen")
     if len(roles) != 1 or "" in roles:
         errors.append("world_slot_role_missing")
+    if len(variants) != 1 or "" in variants:
+        errors.append("variant_not_frozen")
+    if declared_group_sizes and declared_group_sizes != {len(items)}:
+        errors.append("declared_group_size_mismatch")
     identities = [_record_sample_identity(record, index) for index, record in items]
     if len(set(identities)) != len(identities):
         errors.append("duplicate_independent_sample")
@@ -337,7 +372,10 @@ def _group_report(items: Sequence[tuple[int, Any]], allowed: frozenset[int]) -> 
         "decision_prefix_hashes": sorted(prefixes),
         "runtime_state_digests": sorted(runtimes),
         "policy_versions": sorted(policies),
+        "initial_input_hashes": sorted(initial_inputs),
         "world_slot_roles": sorted(roles),
+        "variants": sorted(variants),
+        "declared_group_sizes": sorted(declared_group_sizes),
         "variants_by_role": {role: sorted(values) for role, values in variants_by_role.items()},
         "sample_identities": identities,
         "valid": not errors,
@@ -432,6 +470,79 @@ def validate_bayestool_question_records(
     }
 
 
+def validate_question_rollout_plan_records(
+    records: Sequence[Any],
+    plan: QuestionRolloutPlan | Mapping[str, Any],
+    *,
+    max_records: int = 48,
+) -> dict[str, Any]:
+    """Validate records against the explicit per-question realization plan.
+
+    The generic validator checks group-local identity.  This companion check
+    verifies the stronger manifest contract: exactly one group for every
+    ``(world_slot_role, variant_id)`` realization and exactly the declared K
+    records in each group.  It is intentionally read-only and never repairs a
+    partial question with records from another question.
+    """
+
+    parsed_plan = plan if isinstance(plan, QuestionRolloutPlan) else QuestionRolloutPlan.from_mapping(plan)
+    report = validate_bayestool_question_records(
+        records,
+        allowed_group_sizes=tuple(sorted(ALLOWED_GROUP_SIZES)),
+        max_records=min(int(max_records), int(parsed_plan.max_records), 48),
+    )
+    errors: list[str] = []
+    active_records = [
+        record
+        for record in records
+        if not bool(_record_metadata(record).get("dummy_removed_sample"))
+        and not bool(_record_metadata(record).get("exclude_from_group_statistics"))
+    ]
+    question_ids = {question_id_from_metadata(_record_metadata(record)) for record in active_records}
+    if question_ids != {parsed_plan.question_id}:
+        errors.append("plan_question_id_mismatch")
+    if len(active_records) > int(parsed_plan.max_records):
+        errors.append("plan_record_limit_exceeded")
+
+    groups: dict[str, list[Any]] = defaultdict(list)
+    for record in active_records:
+        groups[_group_id(_record_metadata(record))].append(record)
+    expected = {
+        (item.world_slot_role, item.variant_id): int(item.k)
+        for item in parsed_plan.realizations
+    }
+    actual: dict[tuple[str, str], tuple[str, int]] = {}
+    for group_id, group_records in groups.items():
+        metadata = _record_metadata(group_records[0])
+        pair = (slot_role_from_metadata(metadata), str(metadata_value(metadata, "variant_id", "base")))
+        if pair in actual:
+            errors.append(f"duplicate_realization_group:{pair[0]}:{pair[1]}")
+        actual[pair] = (group_id, len(group_records))
+    if set(actual) != set(expected):
+        missing = sorted(set(expected) - set(actual))
+        extra = sorted(set(actual) - set(expected))
+        if missing:
+            errors.append(f"missing_plan_realizations:{missing}")
+        if extra:
+            errors.append(f"unexpected_plan_realizations:{extra}")
+    for pair, expected_k in expected.items():
+        if pair in actual and actual[pair][1] != expected_k:
+            errors.append(
+                f"plan_group_size_mismatch:{pair[0]}:{pair[1]}:{actual[pair][1]}!={expected_k}"
+            )
+    return {
+        **report,
+        "plan_valid": not errors,
+        "plan_errors": errors,
+        "expected_realizations": {f"{role}:{variant}": k for (role, variant), k in expected.items()},
+        "actual_realizations": {
+            f"{role}:{variant}": {"group_id": group_id, "size": size}
+            for (role, variant), (group_id, size) in actual.items()
+        },
+        "valid": bool(report.get("valid")) and not errors,
+    }
+
+
 def compute_hierarchical_loss_weights(
     records: Sequence[Any],
     *,
@@ -447,6 +558,34 @@ def compute_hierarchical_loss_weights(
     weights_by_role = {role: 0.25 for role in WORLD_SLOT_ROLES}
     if slot_weights:
         weights_by_role.update({str(key): float(value) for key, value in slot_weights.items()})
+    else:
+        # Prefer the frozen manifest carried by the records when a caller did
+        # not pass an override.  This keeps non-uniform future slot weights
+        # faithful to the question plan instead of silently reverting to four
+        # equal slots.
+        manifest_weights: dict[str, float] = {}
+        for _, record in enumerate(records):
+            metadata = _record_metadata(record)
+            raw_plan = metadata.get("question_rollout_plan")
+            if not isinstance(raw_plan, Mapping):
+                continue
+            raw_slot_weights = raw_plan.get("slot_weights")
+            if isinstance(raw_slot_weights, Mapping):
+                for role in WORLD_SLOT_ROLES:
+                    if role in raw_slot_weights:
+                        value = float(raw_slot_weights[role])
+                        previous = manifest_weights.get(role)
+                        if previous is not None and not math.isclose(previous, value, rel_tol=0.0, abs_tol=1e-6):
+                            raise ValueError(f"conflicting BayesTool slot weights for role {role!r}")
+                        manifest_weights[role] = value
+        if manifest_weights:
+            weights_by_role.update(manifest_weights)
+    if set(weights_by_role) != set(WORLD_SLOT_ROLES):
+        raise ValueError("BayesTool slot weights must contain exactly the four required roles")
+    if any(not math.isfinite(value) or value < 0.0 for value in weights_by_role.values()):
+        raise ValueError("BayesTool slot weights must be finite and non-negative")
+    if not math.isclose(sum(weights_by_role.values()), 1.0, rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError(f"BayesTool slot weights must sum to one, got {weights_by_role}")
     active = [
         (index, record)
         for index, record in enumerate(records)
@@ -455,6 +594,11 @@ def compute_hierarchical_loss_weights(
     ]
     questions = sorted({question_id_from_metadata(_record_metadata(record)) for _, record in active})
     q_count = max(1, int(question_count if question_count is not None else len(questions)))
+    if questions and question_count is not None and q_count != len(questions):
+        raise ValueError(
+            "question_count must equal the active questions in the manifest batch: "
+            f"declared={q_count} actual={len(questions)}"
+        )
     groups: dict[str, list[tuple[int, Any]]] = defaultdict(list)
     for index, record in active:
         groups[_group_id(_record_metadata(record))].append((index, record))
@@ -494,14 +638,29 @@ def compute_hierarchical_loss_weights(
     for key, value in sums_by_slot.items():
         if abs(value - expected_question * float(weights_by_role.get(key.rsplit(":", 1)[-1], 0.0))) > 1e-6:
             raise AssertionError(f"slot weight is not normalized: {key} -> {value}")
+    group_weight_sums = {
+        group_id: sum(result[index] for index, _ in items) for group_id, items in groups.items()
+    }
+    group_expected_weights: dict[str, float] = {}
+    for group_id, items in groups.items():
+        metadata = _record_metadata(items[0][1])
+        question = question_id_from_metadata(metadata)
+        role = slot_role_from_metadata(metadata)
+        variant_count = len(variants_by_question_slot[(question, role)])
+        expected = (1.0 / q_count) * float(weights_by_role[role]) / max(1, variant_count)
+        group_expected_weights[group_id] = expected
+        if abs(group_weight_sums[group_id] - expected) > 1e-6:
+            raise AssertionError(
+                f"group weight is not invariant to K: {group_id} -> "
+                f"{group_weight_sums[group_id]} expected {expected}"
+            )
     return result, {
         "question_count": q_count,
         "question_weight_sums": dict(sums_by_question),
         "slot_weight_sums": dict(sums_by_slot),
         "slot_weights": dict(weights_by_role),
-        "group_weight_sums": {
-            group_id: sum(result[index] for index, _ in items) for group_id, items in groups.items()
-        },
+        "group_weight_sums": group_weight_sums,
+        "group_expected_weight_sums": group_expected_weights,
     }
 
 
@@ -536,6 +695,7 @@ __all__ = [
     "question_id_from_metadata",
     "slot_role_from_metadata",
     "validate_bayestool_question_records",
+    "validate_question_rollout_plan_records",
     "compute_hierarchical_loss_weights",
     "make_runtime_state_digest",
 ]

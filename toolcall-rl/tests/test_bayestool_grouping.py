@@ -14,6 +14,7 @@ from bayestool.grouping import (
     compute_hierarchical_loss_weights,
     make_question_rollout_plan,
     validate_bayestool_question_records,
+    validate_question_rollout_plan_records,
 )
 from bayestool.training import make_bayestool_decision_group_id
 from bayestool.world import WorldRuntime, sample_tool_world
@@ -60,6 +61,28 @@ def test_explicit_plan_sizes_cover_r4k4_and_r6k8():
     assert make_question_rollout_plan(
         "q", group_size=8, extra_variants=["v1", "v2"]
     ).record_count == 48
+
+
+def test_manifest_validation_requires_exact_realization_and_k_contract():
+    plan4, records4 = _records("manifest-r4", group_size=4)
+    report4 = validate_question_rollout_plan_records(records4, plan4)
+    assert report4["valid"]
+    assert report4["expected_realizations"]
+
+    plan6, records6 = _records(
+        "manifest-r6",
+        group_size=8,
+        extra_variants=(("local_degradation", "v1"), ("change", "v2")),
+    )
+    assert plan6.group_count == 6
+    assert plan6.record_count == 48
+    assert validate_question_rollout_plan_records(records6, plan6)["valid"]
+
+    # A record from another realization cannot silently fill a missing group.
+    records6[-1]["metadata"]["variant_id"] = "wrong-variant"
+    invalid = validate_question_rollout_plan_records(records6, plan6)
+    assert not invalid["valid"]
+    assert invalid["violations"] or invalid["plan_errors"]
 
 
 def test_primary_realization_index_maps_four_required_world_roles():
@@ -159,6 +182,27 @@ def test_hierarchical_weights_are_invariant_to_k_and_variant_count():
     weights_variant, report_variant = compute_hierarchical_loss_weights(records_variant)
     assert sum(weights_variant) == pytest.approx(1.0)
     assert report_variant["slot_weight_sums"]["qv:local_degradation"] == pytest.approx(0.25)
+    values = list(report_variant["group_weight_sums"].values())
+    assert sum(value == pytest.approx(0.125) for value in values) == 2
+    assert sum(value == pytest.approx(0.25) for value in values) == 3
+
+
+def test_group_identity_rejects_mixed_runtime_or_prefix():
+    _, records = _records("identity", group_size=4)
+    records[1]["metadata"]["runtime_state_digest"] = "runtime:other"
+    report = validate_bayestool_question_records(records)
+    assert not report["valid"]
+    assert any("runtime_state_not_frozen" in item.get("errors", []) for item in report["violations"])
+
+
+def test_multiple_questions_share_a_manifest_step_but_keep_question_mass_separate():
+    _, left = _records("step-q1", group_size=4)
+    _, right = _records("step-q2", group_size=4)
+    weights, report = compute_hierarchical_loss_weights(left + right, question_count=2)
+    assert sum(weights) == pytest.approx(1.0)
+    assert report["question_weight_sums"]["step-q1"] == pytest.approx(0.5)
+    assert report["question_weight_sums"]["step-q2"] == pytest.approx(0.5)
+    assert all(value == pytest.approx(0.125) for value in report["group_weight_sums"].values())
 
 
 def test_question_validator_rejects_cross_question_and_missing_role():

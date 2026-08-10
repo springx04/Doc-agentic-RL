@@ -1,4 +1,5 @@
 import itertools
+import json
 import logging
 import multiprocessing
 import os
@@ -42,16 +43,20 @@ from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
 
 try:
     from bayestool.grouping import (
+        QuestionRolloutPlan,
         WORLD_SLOT_ROLES,
         compute_hierarchical_loss_weights,
         slot_role_from_metadata,
         validate_bayestool_question_records,
+        validate_question_rollout_plan_records,
     )
 except ImportError:  # pragma: no cover - baseline Slime runs without BayesTool
+    QuestionRolloutPlan = None
     WORLD_SLOT_ROLES = ("healthy", "local_degradation", "shared_family_fault", "change")
     compute_hierarchical_loss_weights = None
     slot_role_from_metadata = None
     validate_bayestool_question_records = None
+    validate_question_rollout_plan_records = None
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -102,6 +107,16 @@ def _bayes_decision_group_id(sample: Sample) -> str:
     return f"unpaired:{_bayes_question_id(sample)}:{sample.index}"
 
 
+def _bayes_metadata_value(metadata: Mapping[str, Any], key: str, default: Any = "") -> Any:
+    """Read strict Bayes metadata without assuming a nested mapping exists."""
+
+    nested = metadata.get("bayestool") if isinstance(metadata.get("bayestool"), Mapping) else {}
+    value = metadata.get(key)
+    if value is None or value == "":
+        value = nested.get(key, default)
+    return default if value is None else value
+
+
 def _bayes_group_is_valid(samples: list[Sample], indices: list[int]) -> tuple[bool, list[str]]:
     """Validate one decision group before it can contribute policy loss."""
 
@@ -110,29 +125,25 @@ def _bayes_group_is_valid(samples: list[Sample], indices: list[int]) -> tuple[bo
         errors.append(f"group_size={len(indices)}")
     metadata = [samples[index].metadata if isinstance(samples[index].metadata, dict) else {} for index in indices]
     questions = {_bayes_question_id(samples[index]) for index in indices}
-    worlds = {str(row.get("latent_world_id") or (row.get("bayestool") or {}).get("latent_world_id") or "") for row in metadata}
-    events = {
-        str(row.get("selected_decision_event") or (row.get("bayestool") or {}).get("selected_decision_event") or "")
-        for row in metadata
-    }
-    prefixes = {str(row.get("decision_prefix_hash") or (row.get("bayestool") or {}).get("decision_prefix_hash") or "") for row in metadata}
+    worlds = {str(_bayes_metadata_value(row, "latent_world_id", "")) for row in metadata}
+    events = {str(_bayes_metadata_value(row, "selected_decision_event", "")) for row in metadata}
+    prefixes = {str(_bayes_metadata_value(row, "decision_prefix_hash", "")) for row in metadata}
+    initial_inputs = {str(_bayes_metadata_value(row, "initial_input_hash", "")) for row in metadata}
     roles = {
-        str(
-            row.get("world_slot_role")
-            or (row.get("bayestool") or {}).get("world_slot_role")
-            or (slot_role_from_metadata(row) if slot_role_from_metadata is not None else "")
-            or ""
-        )
+        str(slot_role_from_metadata(row) if slot_role_from_metadata is not None else _bayes_metadata_value(row, "world_slot_role", ""))
         for row in metadata
     }
-    variants = {str(row.get("variant_id") or (row.get("bayestool") or {}).get("variant_id") or "base") for row in metadata}
-    runtimes = {str(row.get("runtime_state_digest") or (row.get("bayestool") or {}).get("runtime_state_digest") or "") for row in metadata}
-    policies = {str(row.get("policy_version") or (row.get("bayestool") or {}).get("policy_version") or "") for row in metadata}
-    declared_k = {
-        int(row.get("decision_group_size"))
-        for row in metadata
-        if row.get("decision_group_size") is not None
-    }
+    variants = {str(_bayes_metadata_value(row, "variant_id", "base")) for row in metadata}
+    runtimes = {str(_bayes_metadata_value(row, "runtime_state_digest", "")) for row in metadata}
+    policies = {str(_bayes_metadata_value(row, "policy_version", "")) for row in metadata}
+    declared_k: set[int] = set()
+    for row in metadata:
+        value = _bayes_metadata_value(row, "decision_group_size", None)
+        if value is not None:
+            try:
+                declared_k.add(int(value))
+            except (TypeError, ValueError):
+                errors.append("invalid_declared_group_size")
     if len(questions) != 1:
         errors.append("cross_question")
     if len(worlds) != 1 or "" in worlds:
@@ -141,6 +152,8 @@ def _bayes_group_is_valid(samples: list[Sample], indices: list[int]) -> tuple[bo
         errors.append("selected_decision_event_not_frozen")
     if len(prefixes) != 1 or "" in prefixes:
         errors.append("cross_decision_prefix")
+    if len(initial_inputs) != 1 or "" in initial_inputs:
+        errors.append("initial_input_not_frozen")
     if len(roles) != 1 or "" in roles:
         errors.append("world_slot_role_missing")
     if len(variants) != 1:
@@ -155,12 +168,12 @@ def _bayes_group_is_valid(samples: list[Sample], indices: list[int]) -> tuple[bo
         errors.append("group_size_not_allowed")
     sample_ids = {
         str(
-            row.get("sample_id")
-            or row.get("trajectory_id")
-            or row.get("rollout_index")
-            or row.get("sample_index")
+            _bayes_metadata_value(row, "sample_id", "")
+            or _bayes_metadata_value(row, "trajectory_id", "")
+            or _bayes_metadata_value(row, "rollout_index", "")
+            or _bayes_metadata_value(row, "sample_index", "")
             or samples[index].index
-            or row.get("rollout_id")
+            or _bayes_metadata_value(row, "rollout_id", "")
         )
         for index, row in zip(indices, metadata, strict=True)
     }
@@ -169,6 +182,62 @@ def _bayes_group_is_valid(samples: list[Sample], indices: list[int]) -> tuple[bo
     if any(_sample_excluded_from_rl(samples[index]) for index in indices):
         errors.append("infrastructure_invalid")
     return not errors, errors
+
+
+def _validate_bayes_question_plan(
+    samples: list[Sample],
+    indices: list[int],
+    question_id: str,
+) -> dict[str, Any]:
+    """Validate one question against the producer's frozen realization plan."""
+
+    errors: list[str] = []
+    if QuestionRolloutPlan is None or validate_question_rollout_plan_records is None:
+        return {"valid": False, "errors": ["question_plan_validator_unavailable"]}
+    active = [samples[index] for index in indices if not _sample_excluded_from_rl(samples[index])]
+    raw_plans: list[Mapping[str, Any]] = []
+    fingerprints: set[str] = set()
+    for sample in active:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        raw_plan = _bayes_metadata_value(metadata, "question_rollout_plan", None)
+        if not isinstance(raw_plan, Mapping):
+            errors.append("missing_question_rollout_plan")
+            continue
+        raw_plans.append(raw_plan)
+        # Each realization is finalized by its own primary/branch rollout,
+        # so selected event/prefix/digest fields may legitimately differ
+        # between serialized copies of the same question plan.  The structural
+        # manifest (roles, variants, K, latent worlds, policy and slot weights)
+        # must remain identical; group-local metadata below checks the actual
+        # selected node and frozen runtime digest.
+        structural_plan = json.loads(json.dumps(raw_plan, ensure_ascii=False, default=str))
+        for realization in structural_plan.get("realizations", []):
+            if isinstance(realization, dict):
+                for key in ("selected_decision_event", "decision_prefix_hash", "runtime_state_digest"):
+                    realization.pop(key, None)
+        fingerprints.add(json.dumps(structural_plan, ensure_ascii=False, sort_keys=True, default=str))
+    if len(fingerprints) > 1:
+        errors.append("question_rollout_plan_not_frozen")
+    if not raw_plans:
+        return {"valid": False, "errors": errors or ["missing_question_rollout_plan"]}
+    try:
+        plan = QuestionRolloutPlan.from_mapping(raw_plans[0])
+    except (TypeError, ValueError, KeyError) as exc:
+        return {"valid": False, "errors": [*errors, f"invalid_question_rollout_plan:{exc}"]}
+    if plan.question_id != question_id:
+        errors.append(f"question_plan_id_mismatch:{plan.question_id}!={question_id}")
+    records = [sample for sample in active]
+    plan_report = validate_question_rollout_plan_records(records, plan, max_records=48)
+    if not plan_report.get("valid"):
+        errors.extend(str(value) for value in plan_report.get("plan_errors", []))
+        if not plan_report.get("valid") and not plan_report.get("plan_errors"):
+            errors.append("question_plan_record_validation_failed")
+    return {
+        "valid": not errors and bool(plan_report.get("valid")),
+        "errors": errors,
+        "plan": plan,
+        "report": plan_report,
+    }
 
 
 def _prepare_bayes_question_batches(
@@ -206,25 +275,18 @@ def _prepare_bayes_question_batches(
 
     ready_questions: list[tuple[str, list[int]]] = []
     skipped_questions: list[dict[str, Any]] = []
+    question_plans_validated = 0
     for question_id, indices in questions.items():
         question_groups = {_bayes_decision_group_id(samples[index]) for index in indices}
         missing = sorted(question_groups - valid_groups)
         role_variant_pairs = {
             (
                 str(
-                    (samples[index].metadata or {}).get("world_slot_role")
-                    or ((samples[index].metadata or {}).get("bayestool") or {}).get("world_slot_role")
-                    or (
-                        slot_role_from_metadata(samples[index].metadata or {})
-                        if slot_role_from_metadata is not None
-                        else ""
-                    )
+                    slot_role_from_metadata(samples[index].metadata or {})
+                    if slot_role_from_metadata is not None
+                    else _bayes_metadata_value(samples[index].metadata or {}, "world_slot_role", "")
                 ),
-                str(
-                    (samples[index].metadata or {}).get("variant_id")
-                    or ((samples[index].metadata or {}).get("bayestool") or {}).get("variant_id")
-                    or "base"
-                ),
+                str(_bayes_metadata_value(samples[index].metadata or {}, "variant_id", "base")),
             )
             for index in indices
         }
@@ -243,6 +305,11 @@ def _prepare_bayes_question_batches(
             question_errors.append("missing_required_world_slot_role")
         if len(question_groups) != len(role_variant_pairs):
             question_errors.append("group_count_not_equal_realizations")
+        plan_validation = _validate_bayes_question_plan(samples, indices, question_id)
+        if not plan_validation["valid"]:
+            question_errors.extend(plan_validation["errors"])
+        else:
+            question_plans_validated += 1
         if question_errors:
             skipped_questions.append(
                 {
@@ -250,6 +317,7 @@ def _prepare_bayes_question_batches(
                     "group_count": len(question_groups),
                     "invalid_groups": missing,
                     "errors": question_errors,
+                    "plan_report": plan_validation.get("report", {}),
                 }
             )
             continue
@@ -275,6 +343,7 @@ def _prepare_bayes_question_batches(
             "valid_group_count": len(valid_groups),
             "violations": violations,
             "skipped_questions": skipped_questions,
+            "question_plans_validated": question_plans_validated,
             "no_ready_questions": True,
         }
 
@@ -307,6 +376,7 @@ def _prepare_bayes_question_batches(
         "valid_group_count": len(valid_groups),
         "violations": violations,
         "skipped_questions": skipped_questions,
+        "question_plans_validated": question_plans_validated,
     }
     return reordered, batch_sizes, report
 

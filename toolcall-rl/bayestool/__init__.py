@@ -51,6 +51,7 @@ from .grouping import (
     make_question_rollout_plan,
     make_runtime_state_digest,
     validate_bayestool_question_records,
+    validate_question_rollout_plan_records,
 )
 
 __all__ = [
@@ -90,6 +91,7 @@ __all__ = [
     "make_question_rollout_plan",
     "make_runtime_state_digest",
     "validate_bayestool_question_records",
+    "validate_question_rollout_plan_records",
     "compute_hierarchical_loss_weights",
     "CANONICAL_REPLAY_SCHEMA_VERSION",
     "export_canonical_replay",
