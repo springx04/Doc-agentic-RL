@@ -98,6 +98,14 @@ fi
 # to the text-only qwen3-4B model definition.
 source "${SLIME_DIR}/scripts/models/qwen3-vl-4B.sh"
 
+# The Qwen3-VL model definition above is consumed by Megatron-Bridge.  The
+# FSDP actor builds the model directly from the HF config and its parser does
+# not accept Megatron architecture flags, so keep MODEL_ARGS only for the
+# explicit Megatron path (which BayesTool currently rejects at validation).
+if [[ "${TRAIN_BACKEND}" == "fsdp" ]]; then
+    MODEL_ARGS=()
+fi
+
 HF_CKPT=${HF_CKPT:-${DEFAULT_MODEL_DIR}}
 REF_LOAD=${REF_LOAD:-${HF_CKPT}}
 SAVE_CKPT=${SAVE_CKPT:-${PROJECT_DIR}/outputs/qwen3-vl-4b-bayestool-rl}
@@ -162,7 +170,7 @@ fi
 # The defaults below are the full training configuration.  The overrides are
 # intentionally environment-based so server smoke runs can bound work without
 # creating a second, simplified training implementation.
-SAVE_INTERVAL=${SAVE_INTERVAL:-20}
+SAVE_INTERVAL=${SAVE_INTERVAL:-1000000}
 NUM_ROLLOUT=${NUM_ROLLOUT:-3000}
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-8}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-32}
@@ -194,6 +202,7 @@ SGLANG_MEM_FRACTION_STATIC=${SGLANG_MEM_FRACTION_STATIC:-0.6}
 # and keeps packed training semantics intact; use FlashAttention explicitly
 # after installing and validating its CUDA extension.
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-unfused}
+FSDP_ATTN_IMPLEMENTATION=${FSDP_ATTN_IMPLEMENTATION:-sdpa}
 NVTE_DEBUG=${NVTE_DEBUG:-0}
 NVTE_DEBUG_LEVEL=${NVTE_DEBUG_LEVEL:-0}
 
@@ -297,35 +306,58 @@ if [[ -n "${BAYESTOOL_SESSION_STATE_PROBABILITIES:-}" ]]; then
     BAYESTOOL_ARGS+=(--bayestool-session-state-probabilities "${BAYESTOOL_SESSION_STATE_PROBABILITIES}")
 fi
 
-PERF_ARGS=(
-    --tensor-model-parallel-size "${TENSOR_MODEL_PARALLEL_SIZE}"
-    --pipeline-model-parallel-size 1
-    --context-parallel-size 1
-    --expert-model-parallel-size 1
-    --expert-tensor-parallel-size 1
-    --use-dynamic-batch-size
-    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
-    --recompute-granularity full
-    --recompute-method uniform
-    --recompute-num-layers 1
-    --attention-dropout 0.0
-    --hidden-dropout 0.0
-    --accumulate-allreduce-grads-in-fp32
-    --attention-softmax-in-fp32
-    --attention-backend "${ATTENTION_BACKEND}"
-)
+if [[ "${TRAIN_BACKEND}" == "fsdp" ]]; then
+    # These flags are declared by FSDPArgs or the common slime parser.  Do not
+    # put Megatron-only parallelism, attention, or optimizer-offload flags in
+    # this branch: argparse must fail before Ray starts if the backend changes.
+    PERF_ARGS=(
+        --gradient-checkpointing
+        --attn-implementation "${FSDP_ATTN_IMPLEMENTATION}"
+    )
+    OPTIMIZER_ARGS=(
+        --optimizer adam
+        --lr 1e-6
+        --lr-decay-style constant
+        --weight-decay 0.1
+        --adam-beta1 0.9
+        --adam-beta2 0.98
+    )
+else
+    PERF_ARGS=(
+        --tensor-model-parallel-size "${TENSOR_MODEL_PARALLEL_SIZE}"
+        --pipeline-model-parallel-size 1
+        --context-parallel-size 1
+        --expert-model-parallel-size 1
+        --expert-tensor-parallel-size 1
+        --use-dynamic-batch-size
+        --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+        --recompute-granularity full
+        --recompute-method uniform
+        --recompute-num-layers 1
+        --attention-dropout 0.0
+        --hidden-dropout 0.0
+        --accumulate-allreduce-grads-in-fp32
+        --attention-softmax-in-fp32
+        --attention-backend "${ATTENTION_BACKEND}"
+    )
+    OPTIMIZER_ARGS=(
+        --optimizer adam
+        --lr 1e-6
+        --lr-decay-style constant
+        --weight-decay 0.1
+        --adam-beta1 0.9
+        --adam-beta2 0.98
+        --optimizer-cpu-offload
+        --overlap-cpu-optimizer-d2h-h2d
+        --use-precision-aware-optimizer
+    )
+fi
 
-OPTIMIZER_ARGS=(
-    --optimizer adam
-    --lr 1e-6
-    --lr-decay-style constant
-    --weight-decay 0.1
-    --adam-beta1 0.9
-    --adam-beta2 0.98
-    --optimizer-cpu-offload
-    --overlap-cpu-optimizer-d2h-h2d
-    --use-precision-aware-optimizer
-)
+# Model-only checkpoints are sufficient for the staged probe and final
+# evaluation, and avoid duplicating the 4B optimizer state on every save.
+if [[ "${SAVE_OPTIMIZER:-0}" != "1" ]]; then
+    CKPT_ARGS+=(--no-save-optim)
+fi
 
 SGLANG_ARGS=(
     --rollout-num-gpus-per-engine "${ROLLOUT_NUM_GPUS_PER_ENGINE}"
