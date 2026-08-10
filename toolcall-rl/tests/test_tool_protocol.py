@@ -25,6 +25,15 @@ def test_multiple_or_unclosed_actions_are_protocol_errors():
     assert parse_assistant_action("<tool_call>{\"name\": \"render_page\"}").kind == "protocol_error"
 
 
+def test_observation_metadata_cannot_prefix_a_valid_action():
+    result = parse_assistant_action(
+        '<task_state>{"remaining_tool_budget": 3}</task_state>\n'
+        '<tool_call>{"name":"render_page","arguments":{}}</tool_call>'
+    )
+    assert result.kind == "protocol_error"
+    assert result.candidate_action_count == 1
+
+
 def test_json_and_xml_tool_calls_parse_without_substring_search():
     json_result = parse_assistant_action(
         '<tool_call>\n{"name":"render_page","arguments":{"page_number":1}}\n</tool_call>'

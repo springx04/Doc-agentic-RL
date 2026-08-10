@@ -101,6 +101,21 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
+_STRICT_ASSISTANT_ACTION_RULE = (
+    "Assistant output follows a strict action protocol. Every assistant turn must contain exactly one "
+    "complete action and no other text: use <tool_call>...</tool_call> for one tool call, "
+    "<final>...</final> for a grounded answer, or <abstain>...</abstain> when evidence is insufficient. "
+    "Do not emit analysis, explanations, Markdown, code fences, or extra tags. "
+    "<task_state>, <tool_belief>, <tool_state>, <tool_result>, and <interpreter> are read-only "
+    "observation metadata; never copy or output them in an assistant turn."
+)
+
+_OBSERVATION_PROTOCOL_RULE = (
+    "Observation metadata is read-only. Never copy <task_state>, <tool_belief>, <tool_state>, "
+    "<tool_result>, or <interpreter> into an assistant turn. Reply with exactly one complete "
+    "<tool_call>...</tool_call>, <final>...</final>, or <abstain>...</abstain> action and no other text."
+)
+
 _PRM_SEMAPHORE: asyncio.Semaphore | None = None
 _PRM_TOKENIZER: Any = None
 _BAYES_CLEAN_RESULT_TASKS: dict[str, asyncio.Task] = {}
@@ -273,6 +288,7 @@ def format_conversation_with_tools(
             "When the available evidence remains unreliable after the budget is used, you may instead "
             "emit exactly one <abstain>reason</abstain> action; do not abstain when reliable evidence supports an answer."
         )
+    system_content = f"{str(system_content).rstrip()}\n\n{_STRICT_ASSISTANT_ACTION_RULE}"
 
     messages_to_render: list[dict[str, Any]] = [
         {"role": "system", "content": system_content},
@@ -297,7 +313,7 @@ def format_conversation_with_tools(
         else:
             rendered.append(
                 "# Tools\n\n"
-                "You may call one or more functions to assist with the user query.\n\n"
+                "You may call one function per assistant turn to assist with the user query.\n\n"
                 "You are provided with function signatures within <tools></tools> XML tags:\n"
                 "<tools>"
             )
@@ -318,8 +334,8 @@ def format_conversation_with_tools(
             )
         else:
             rendered.append(
-                "For each function call, return a json object with function name and arguments within "
-                "<tool_call></tool_call> XML tags:\n"
+                "If you choose to call a function, return exactly one JSON object with its name and arguments "
+                "within <tool_call></tool_call> XML tags and no suffix text:\n"
                 "<tool_call>\n"
                 "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
                 "</tool_call>"
@@ -2442,6 +2458,7 @@ def _navigation_status_text(navigation_state: dict[str, Any]) -> str:
     visited = sorted({int(page) for page in navigation_state.get("visited_pages", [])})
     unvisited = sorted({int(page) for page in navigation_state.get("unvisited_pages", [])})
     lines = [
+        _OBSERVATION_PROTOCOL_RULE,
         "Document navigation state:",
         f"Document page count: {page_count_text}",
         f"Visited pages: {visited}",
@@ -2982,6 +2999,7 @@ def _final_guard_observation(reason: str, navigation_state: dict[str, Any]) -> s
         "Final answer blocked by evidence guard.\n"
         f"Reason: {reason}\n"
         f"{_navigation_status_text(navigation_state)}\n"
+        f"{_OBSERVATION_PROTOCOL_RULE}\n"
         "Continue with the next appropriate tool call. Do not output None or "
         "not found until all relevant pages are checked or the search budget is exhausted.\n"
         "</interpreter>"

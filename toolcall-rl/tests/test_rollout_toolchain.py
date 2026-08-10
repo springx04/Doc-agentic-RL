@@ -249,6 +249,25 @@ def test_tool_prompt_preserves_qwen_role_boundaries_and_function_schema(monkeypa
     assert prompt.endswith("<|im_start|>assistant\n")
 
 
+def test_tool_prompt_marks_bayestool_state_read_only_and_enforces_one_action(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+
+    prompt = module.format_conversation_with_tools(
+        "Document path: fixture.pdf\nQuestion: What is shown?",
+        tools=[],
+        system_prompt="Inspect the document with the available tools.",
+        tool_call_format="json",
+    )
+
+    assert "exactly one complete action and no other text" in prompt
+    assert "read-only observation metadata" in prompt
+    assert "never copy or output them" in prompt
+
+    status = module._navigation_status_text({"visited_pages": [], "unvisited_pages": []})
+    assert "Observation metadata is read-only" in status
+    assert "<task_state>" in status
+
+
 def test_multi_action_and_placeholder_are_logged_without_execution(monkeypatch):
     module, _ = _load_generator(monkeypatch)
 
