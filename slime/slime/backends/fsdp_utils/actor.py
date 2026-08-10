@@ -27,6 +27,7 @@ from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 
 from . import checkpoint
 from .data_packing import pack_sequences, unpack_sequences
+from .device_utils import scatter_selected_values
 from .lr_scheduler import get_lr_scheduler
 from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor
 
@@ -1190,10 +1191,8 @@ class FSDPTrainRayActor(TrainRayActor):
                 # positions are zero but never contribute because their masks
                 # are zero.  The vector is tiny compared with the logits.
                 packed_length = max(0, int(packed_sequence["tokens"].numel()) - 1)
-                log_probs = torch.zeros(packed_length, dtype=torch.float32, device=model_device)
-                entropy = torch.zeros_like(log_probs)
-                log_probs.index_copy_(0, positions, selected_log_probs.float())
-                entropy.index_copy_(0, positions, selected_entropy.float())
+                log_probs = scatter_selected_values(positions, selected_log_probs, packed_length)
+                entropy = scatter_selected_values(positions, selected_entropy, packed_length)
                 return log_probs, entropy
 
         model_args = self._get_model_inputs_args(packed_sequence)
