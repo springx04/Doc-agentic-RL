@@ -157,7 +157,9 @@ import importlib.metadata as metadata
 import json
 import os
 import re
-from pathlib import PurePosixPath
+import shutil
+import subprocess
+from pathlib import Path, PurePosixPath
 
 import torch
 
@@ -167,7 +169,59 @@ try:
 except metadata.PackageNotFoundError as exc:
     raise SystemExit("sgl-kernel is not installed in the selected Python runtime") from exc
 
-package_files = [str(path).replace("\\", "/") for path in (distribution.files or ())]
+package_files = [Path(distribution.locate_file(path)) for path in (distribution.files or ())]
+common_ops_files = sorted(
+    {
+        path
+        for path in package_files
+        if re.search(r"common_ops(?:\.|$)", PurePosixPath(path).name)
+    },
+    key=lambda path: path.stat().st_size if path.is_file() else 0,
+    reverse=True,
+)
+cuobjdump = shutil.which("cuobjdump")
+architecture_probe_cache = {}
+
+
+def binary_has_architecture(path, architecture):
+    cache_key = (str(path), architecture)
+    if cache_key in architecture_probe_cache:
+        return architecture_probe_cache[cache_key]
+    if cuobjdump is None or not path.is_file():
+        architecture_probe_cache[cache_key] = False
+        return False
+
+    pattern = re.compile(
+        rf"\barch\s*=\s*sm_?{re.escape(architecture.removeprefix('sm'))}(?:[a-z])?\b"
+    )
+    process = subprocess.Popen(
+        [cuobjdump, "--dump-ptx", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    found = False
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            if pattern.search(line):
+                found = True
+                process.terminate()
+                break
+        if process.poll() is None:
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+    architecture_probe_cache[cache_key] = found
+    return found
+
+
 visible_gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
 required_gpu_count = int(os.environ.get("NUM_GPUS", "1"))
 if visible_gpu_count < required_gpu_count:
@@ -181,13 +235,13 @@ missing_architectures = []
 for index in range(required_gpu_count):
     major, minor = torch.cuda.get_device_capability(index)
     architecture = f"sm{major}{minor}"
-    common_ops = sorted(
+    compatible_common_ops = [
         path
-        for path in package_files
-        if f"/{architecture}/" in f"/{path}"
-        and re.search(r"common_ops(?:\.|$)", PurePosixPath(path).name)
-    )
-    if not common_ops:
+        for path in common_ops_files
+        if f"/{architecture}/" in f"/{path.as_posix()}"
+        or binary_has_architecture(path, architecture)
+    ]
+    if not compatible_common_ops:
         missing_architectures.append(architecture)
     gpu_report.append(
         {
@@ -195,7 +249,8 @@ for index in range(required_gpu_count):
             "name": torch.cuda.get_device_name(index),
             "compute_capability": f"{major}.{minor}",
             "architecture": architecture,
-            "common_ops": common_ops,
+            "common_ops": [str(path) for path in common_ops_files],
+            "compatible_common_ops": [str(path) for path in compatible_common_ops],
         }
     )
 if missing_architectures:
