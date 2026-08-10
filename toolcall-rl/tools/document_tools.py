@@ -23,6 +23,11 @@ from io import StringIO
 from pathlib import Path
 from typing import Any
 
+try:
+    from .ocr_runtime import prepare_headless_ocr_runtime
+except ImportError:  # pragma: no cover - compatibility with direct module loading
+    from ocr_runtime import prepare_headless_ocr_runtime
+
 
 DOC_TOOL_SPECS: dict[str, dict[str, Any]] = {}
 
@@ -643,6 +648,7 @@ def _prepare_docling_runtime() -> None:
 def _get_docling_converter() -> Any:
     global _DOCLING_CONVERTER
     if _DOCLING_CONVERTER is None:
+        prepare_headless_ocr_runtime()
         _assert_docling_torch_runtime()
         _prepare_docling_runtime()
         artifacts_path = os.environ.get("OPENCLAW_DOCLING_ARTIFACTS_PATH") or os.environ.get("DOCLING_ARTIFACTS_PATH")
@@ -1949,6 +1955,7 @@ def _run_ocr(
     engine: str,
     region_meta: dict[str, Any] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
+    prepare_headless_ocr_runtime()
     requested = (engine or "auto").lower()
     errors: list[str] = []
     # Production runs are offline.  PaddleOCR/EasyOCR are optional only when

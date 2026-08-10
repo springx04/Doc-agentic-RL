@@ -302,6 +302,28 @@ def test_auto_ocr_does_not_fall_through_to_network_easyocr(monkeypatch, tmp_path
     assert "easyocr" not in document_tools._OCR_ENGINES
 
 
+def test_ocr_prepares_headless_runtime_before_backend_import(monkeypatch, tmp_path):
+    image_path = tmp_path / "headless-canary.png"
+    Image.new("RGB", (32, 32), "white").save(image_path)
+    calls: list[bool] = []
+
+    class WorkingRapidOCR:
+        def __call__(self, path):
+            return [[[[0, 0], [1, 0], [1, 1], [0, 1]], ["LOCAL-OCR", 0.99]]]
+
+    monkeypatch.setattr(
+        document_tools,
+        "prepare_headless_ocr_runtime",
+        lambda: calls.append(True),
+    )
+    monkeypatch.setitem(document_tools._OCR_ENGINES, "rapidocr", WorkingRapidOCR())
+    engine, lines = document_tools._run_ocr(image_path, lang="en", engine="rapidocr")
+
+    assert calls == [True]
+    assert engine == "rapidocr"
+    assert lines[0]["text"] == "LOCAL-OCR"
+
+
 def test_auto_ocr_uses_only_provisioned_local_fallbacks(monkeypatch, tmp_path):
     image_path = tmp_path / "offline-fallback.png"
     Image.new("RGB", (32, 32), "white").save(image_path)

@@ -45,6 +45,35 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 PYTHON_ENV_BIN="$(dirname -- "$(readlink -f "${PYTHON_BIN}")")"
 export PATH="${PYTHON_ENV_BIN}:${PATH}"
+
+# cv2 used by the offline OCR backends is a GUI-enabled wheel.  The server
+# image already contains its GL dependencies under /opt/conda; expose those
+# existing files to the launcher and Ray workers without installing anything.
+OCR_LIBRARY_DIR=${OPENCLAW_OCR_LIBRARY_DIR:-}
+OCR_LIBRARY_CANDIDATES=()
+if [[ -n "${CONDA_PREFIX:-}" ]]; then
+    OCR_LIBRARY_CANDIDATES+=("${CONDA_PREFIX}/lib")
+fi
+OCR_LIBRARY_CANDIDATES+=(
+    "/opt/conda/lib"
+    "/opt/conda/pkgs/libgl-1.7.0-ha4b6fd6_2/lib"
+    "/opt/conda/pkgs/libglib-2.86.0-h1fed272_0/lib"
+)
+if [[ -z "${OCR_LIBRARY_DIR}" ]]; then
+    for candidate in "${OCR_LIBRARY_CANDIDATES[@]}"; do
+        if [[ -f "${candidate}/libGL.so.1" && -f "${candidate}/libgthread-2.0.so.0" ]]; then
+            OCR_LIBRARY_DIR="${candidate}"
+            break
+        fi
+    done
+fi
+if [[ -n "${OCR_LIBRARY_DIR}" && -d "${OCR_LIBRARY_DIR}" ]]; then
+    export OPENCLAW_OCR_LIBRARY_DIR="${OCR_LIBRARY_DIR}"
+    export LD_LIBRARY_PATH="${OCR_LIBRARY_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+export OPENCLAW_OCR_OFFLINE=${OPENCLAW_OCR_OFFLINE:-1}
+export OPENCLAW_OCR_ALLOW_EASYOCR_DOWNLOAD=0
+export OPENCLAW_OCR_AUTO_BACKENDS=${OPENCLAW_OCR_AUTO_BACKENDS:-rapidocr,rapidocr_torch,paddleocr,easyocr}
 RAY_BIN=${RAY_BIN:-"${PYTHON_ENV_BIN}/ray"}
 if [[ ! -x "${RAY_BIN}" ]]; then
     RAY_BIN="$(command -v ray || true)"
@@ -305,6 +334,11 @@ RUNTIME_ENV_JSON="{
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
     \"PYTORCH_CUDA_ALLOC_CONF\": \"${PYTORCH_CUDA_ALLOC_CONF}\",
+    \"LD_LIBRARY_PATH\": \"${LD_LIBRARY_PATH:-}\",
+    \"OPENCLAW_OCR_LIBRARY_DIR\": \"${OPENCLAW_OCR_LIBRARY_DIR:-}\",
+    \"OPENCLAW_OCR_OFFLINE\": \"${OPENCLAW_OCR_OFFLINE}\",
+    \"OPENCLAW_OCR_ALLOW_EASYOCR_DOWNLOAD\": \"0\",
+    \"OPENCLAW_OCR_AUTO_BACKENDS\": \"${OPENCLAW_OCR_AUTO_BACKENDS}\",
     \"NVTE_DEBUG\": \"${NVTE_DEBUG}\",
     \"NVTE_DEBUG_LEVEL\": \"${NVTE_DEBUG_LEVEL}\"
   }

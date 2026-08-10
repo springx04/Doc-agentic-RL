@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from tools.ocr_runtime import prepare_headless_ocr_runtime
+
 
 WORKSPACE = Path("/workspace/data").resolve()
 PROJECT = (WORKSPACE / "OpenClaw-RL").resolve()
@@ -49,6 +51,11 @@ CUDA_DEVICES = os.environ.get(
     "OPENCLAW_CUDA_VISIBLE_DEVICES",
     ",".join(str(index) for index in range(GPU_COUNT)),
 )
+
+
+# Prepare this before Ray workers inherit the environment.  The helper only
+# uses libraries already present on the host and never installs dependencies.
+prepare_headless_ocr_runtime()
 
 
 def _utc_now() -> str:
@@ -395,7 +402,7 @@ def run() -> dict[str, Any]:
         "OPENCLAW_DOCLING_RAPIDOCR_BACKEND": os.environ.get("OPENCLAW_DOCLING_RAPIDOCR_BACKEND", "onnxruntime"),
         "OPENCLAW_OCR_AUTO_BACKENDS": os.environ.get(
             "OPENCLAW_OCR_AUTO_BACKENDS",
-            "rapidocr,rapidocr_torch",
+            "rapidocr,rapidocr_torch,paddleocr,easyocr",
         ),
         "OPENCLAW_OCR_OFFLINE": "1",
         "OPENCLAW_OCR_ALLOW_EASYOCR_DOWNLOAD": "0",

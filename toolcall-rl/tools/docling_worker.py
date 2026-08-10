@@ -16,6 +16,11 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+try:
+    from .ocr_runtime import prepare_headless_ocr_runtime
+except ImportError:  # pragma: no cover - worker is launched as a script
+    from ocr_runtime import prepare_headless_ocr_runtime
+
 
 def _bootstrap_paths() -> None:
     runtime = os.environ.get("OPENCLAW_DOC_TOOL_RUNTIME_PATH")
@@ -68,6 +73,7 @@ def _rapidocr_options(RapidOcrOptions: Any) -> Any:
 
 def main() -> None:
     _bootstrap_paths()
+    prepare_headless_ocr_runtime()
     os.environ.setdefault("CONDA_AUTO_ACTIVATE_BASE", "false")
     os.environ.setdefault("CONDA_CHANGEPS1", "false")
     multiprocessing.set_executable(sys.executable)
