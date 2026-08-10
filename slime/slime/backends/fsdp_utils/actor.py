@@ -29,6 +29,7 @@ from . import checkpoint
 from .data_packing import pack_sequences, unpack_sequences
 from .device_utils import scatter_selected_values
 from .lr_scheduler import get_lr_scheduler
+from .optimizer_utils import build_fsdp_adamw
 from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor
 
 logger = logging.getLogger(__name__)
@@ -128,13 +129,14 @@ class FSDPTrainRayActor(TrainRayActor):
         )
 
         if args.optimizer == "adam":
-            self.optimizer = torch.optim.AdamW(
+            self.optimizer = build_fsdp_adamw(
                 optim_params,
                 lr=args.lr,
                 betas=(args.adam_beta1, args.adam_beta2),
                 eps=args.adam_eps,
                 weight_decay=args.weight_decay,
             )
+            logger.info("FSDP AdamW configured with foreach=False and fused=False for bounded optimizer memory")
         else:
             raise ValueError(f"Unsupported optimizer: {args.optimizer}. Supported options: 'adam'")
 
