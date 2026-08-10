@@ -621,18 +621,31 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         if group_ids is None:
             group_ids = rollout_data.get("group_indices")
         sibling_weights = rollout_data.get("bayes_sibling_weights") or [1.0] * len(raw_rewards)
-        grouped: dict[str, list[int]] = {}
-        for index, group_id in enumerate(group_ids):
-            grouped.setdefault(str(group_id), []).append(index)
-        sibling_advantages = [0.0] * len(raw_rewards)
-        baselines = [0.0] * len(raw_rewards)
-        for indices in grouped.values():
-            weights = [max(0.0, float(sibling_weights[index])) for index in indices]
-            denominator = sum(weights) or float(len(indices))
-            baseline = sum(weight * float(raw_rewards[index]) for index, weight in zip(indices, weights, strict=True)) / denominator
-            for index in indices:
-                sibling_advantages[index] = float(raw_rewards[index]) - baseline
-                baselines[index] = baseline
+        precomputed_advantages = rollout_data.get("bayes_advantages")
+        precomputed_baselines = rollout_data.get("bayes_sibling_baselines")
+        if precomputed_advantages is not None and len(precomputed_advantages) == len(raw_rewards):
+            sibling_advantages = [float(value) for value in precomputed_advantages]
+            baselines = (
+                [float(value) for value in precomputed_baselines]
+                if precomputed_baselines is not None and len(precomputed_baselines) == len(raw_rewards)
+                else [0.0] * len(raw_rewards)
+            )
+        else:
+            logger.warning(
+                "BayesTool global advantages are unavailable in Megatron loss; using the received partition."
+            )
+            grouped: dict[str, list[int]] = {}
+            for index, group_id in enumerate(group_ids):
+                grouped.setdefault(str(group_id), []).append(index)
+            sibling_advantages = [0.0] * len(raw_rewards)
+            baselines = [0.0] * len(raw_rewards)
+            for indices in grouped.values():
+                weights = [max(0.0, float(sibling_weights[index])) for index in indices]
+                denominator = sum(weights) or float(len(indices))
+                baseline = sum(weight * float(raw_rewards[index]) for index, weight in zip(indices, weights, strict=True)) / denominator
+                for index in indices:
+                    sibling_advantages[index] = float(raw_rewards[index]) - baseline
+                    baselines[index] = baseline
         rewards = torch.tensor(sibling_advantages, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         advantages = [r for r in returns]

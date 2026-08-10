@@ -36,8 +36,29 @@ _RELAXED_FINAL_RE = re.compile(
     r"<final>(?P<body>.*?)</final>",
     re.IGNORECASE | re.DOTALL,
 )
-_ACTION_MARKER_RE = re.compile(r"</?\s*(?:tool_call|final)\b", re.IGNORECASE)
+_ABSTAIN_RE = re.compile(r"^\s*<abstain>(?P<body>.*?)</abstain>\s*$", re.IGNORECASE | re.DOTALL)
+_ACTION_MARKER_RE = re.compile(r"</?\s*(?:tool_call|final|abstain)\b", re.IGNORECASE)
+# Slightly widen the slope for partial ANLS credit without changing the
+# correctness ceiling or the minimum reward for an unanswered task.
 ACCURACY_REWARD_SCALE = 2.2
+
+
+def extract_abstention(response: str, metadata: dict[str, Any] | None = None) -> tuple[str, bool]:
+    """Return ``(reason, protocol_validity)`` for an explicit abstention."""
+
+    candidate = response or ""
+    if isinstance(metadata, dict):
+        final_action = metadata.get("final_action")
+        raw_generation_text = metadata.get("raw_generation_text")
+        if isinstance(final_action, str) and final_action.strip():
+            candidate = final_action
+        elif isinstance(raw_generation_text, str) and raw_generation_text.strip():
+            candidate = raw_generation_text
+    match = _ABSTAIN_RE.fullmatch(candidate)
+    if match is None:
+        return "", False
+    reason = match.group("body").strip()
+    return reason, bool(reason)
 
 
 def extract_final_answer(response: str, metadata: dict[str, Any] | None = None) -> tuple[str, bool]:
@@ -133,7 +154,9 @@ def normalize_answer(value: Any) -> str:
         return ""
     if not isinstance(value, str):
         value = json.dumps(value, ensure_ascii=False, sort_keys=True)
-    text = unicodedata.normalize("NFKC", value).casefold().replace("’", "'")
+    # Keep the source ASCII-safe so remote patch/sync transports cannot
+    # corrupt the curly apostrophe literal before Python compiles the file.
+    text = unicodedata.normalize("NFKC", value).casefold().replace("\u2019", "'")
     text = re.sub(r"(?<=\d),(?=\d)", "", text)
     text = "".join(
         ch if (ch.isalnum() or ch in ".+-/%") else " "
@@ -408,8 +431,47 @@ def compute_document_reward(
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute a GRPO-friendly reward in [-1, 1] and evaluation metrics."""
+    abstention_reason, abstention_format_ok = extract_abstention(response, metadata)
     prediction, format_ok = extract_final_answer(response, metadata)
     answers, metric = parse_label(label, metadata)
+    if abstention_format_ok:
+        navigation = metadata.get("navigation_state", {}) if isinstance(metadata.get("navigation_state", {}), dict) else {}
+        bayes_meta = metadata.get("bayestool", {}) if isinstance(metadata.get("bayestool", {}), dict) else {}
+        stop_meta = bayes_meta.get("stop_decision", metadata.get("stop_decision", {}))
+        if not isinstance(stop_meta, dict):
+            stop_meta = {}
+        evidence_sufficient = bool(metadata.get("evidence_sufficient", navigation.get("evidence_sufficient", False)))
+        answer_risk = float(stop_meta.get("stop_risk", metadata.get("answer_risk", 1.0)) or 0.0)
+        justified = bool(
+            not evidence_sufficient
+            and (
+                stop_meta.get("mode") == "abstain"
+                or answer_risk >= 0.35
+                or metadata.get("search_budget_exhausted")
+                or navigation.get("search_budget_exhausted")
+            )
+        )
+        # A reasonable refusal is safer than an unsupported fabricated answer,
+        # but remains below a correct evidence-backed final answer.  A refusal
+        # when reliable evidence is already available is explicitly penalized.
+        abstention_score = -0.15 if justified else -0.35
+        return {
+            "score": abstention_score,
+            "acc": 0.0,
+            "exact_acc": 0.0,
+            "quality": 0.0,
+            "format": 1.0,
+            "answer_correctness": 0.0,
+            "answer_conciseness": 1.0,
+            "format_validity": 1.0,
+            "raw_anls": 0.0,
+            "pred": "",
+            "metric": metric,
+            "abstention": True,
+            "abstention_reason": abstention_reason,
+            "abstention_justified": justified,
+            "abstention_necessary": justified,
+        }
     # ``quality`` is deliberately independent from protocol validity.  A
     # single final span wrapped in explanatory prose is still semantically
     # scoreable; the format component below records the protocol violation.
@@ -438,4 +500,8 @@ def compute_document_reward(
         "raw_anls": raw_anls,
         "pred": prediction,
         "metric": metric,
+        "abstention": False,
+        "abstention_reason": "",
+        "abstention_justified": False,
+        "abstention_necessary": False,
     }

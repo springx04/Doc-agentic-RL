@@ -40,3 +40,9 @@ def test_json_and_xml_tool_calls_parse_without_substring_search():
     )
     assert xml_result.kind == "tool_call"
     assert xml_result.value["arguments"]["page_number"] == 1
+
+
+def test_abstention_is_a_strict_terminal_action():
+    assert parse_assistant_action("<abstain>evidence is inconsistent</abstain>").kind == "abstain"
+    assert parse_assistant_action("<abstain></abstain>").kind == "protocol_error"
+    assert parse_assistant_action("prefix <abstain>reason</abstain>").kind == "protocol_error"

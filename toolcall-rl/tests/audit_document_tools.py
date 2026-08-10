@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 TOOLCALL_DIR = ROOT / "toolcall-rl"
 STUDIO_DIR = TOOLCALL_DIR / "tool_studio"
 RUNTIME_DIR = STUDIO_DIR / "runtime"
-PDF_PATH = Path(r"C:\Users\30738\Desktop\project\agent\paper\ToolRL.pdf")
+PDF_PATH = ROOT / "docs" / "ToolRL.pdf"
 REPORT_PATH = STUDIO_DIR / "outputs" / "full_tool_audit_report.json"
 
 

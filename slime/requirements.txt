@@ -1,6 +1,28 @@
 accelerate
 blobfile
 datasets
+megatron-bridge==0.3.1  # official Qwen3-VL bridge compatible with the pinned Transformers 4.x server environment
+megatron-core==0.16.1  # bridge-compatible core; keep repository megatron/training on PYTHONPATH
+# The server uses CUDA 12.8; the bridge imports TE unconditionally.  The
+# torch extension may need to be built from source when a matching wheel is
+# unavailable, with the server's cuDNN include/lib paths exported.
+transformer-engine==2.12.0
+transformer-engine-cu12==2.12.0
+transformer-engine-torch==2.12.0
+# Transformer Engine imports this compatibility package on the server.
+importlib-metadata>=6.0
+# Apex must be source-built with CUDA extensions; the unrelated PyPI `apex`
+# wheel is not a substitute. Run ../third_party/install_apex_cuda.sh.
+# FlashAttention is a CUDA-arch-specific optional accelerator for packed THD
+# attention. The target Transformer Engine 2.12.0 accepts flash-attn==2.8.3
+# (not 2.8.3.post1). Install it with ../third_party/install_flash_attn_cuda.sh
+# using --no-deps; the exact Transformer Engine unfused backend is the default
+# and remains the complete fallback when this extension is unavailable.
+onnx==1.22.0
+onnxscript==0.7.1
+onnx-ir==0.2.1
+ml-dtypes==0.5.4
+nvdlfw-inspect==0.2.2
 httpx[http2]
 mcp[cli]
 memray  # needed for debugging (but is lightweight), we can put it to dev mode when using pyproject.toml

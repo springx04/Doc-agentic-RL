@@ -1,7 +1,8 @@
 """Strict parsing for assistant tool-call and final-answer turns.
 
 The rollout protocol is deliberately small: one assistant turn contains one
-complete ``<tool_call>...</tool_call>`` or ``<final>...</final>`` action.  Both
+complete ``<tool_call>...</tool_call>``, ``<final>...</final>`` or
+``<abstain>...</abstain>`` action.  All three
 actions must occupy the whole turn; reward evaluation may separately recover a
 single final span to distinguish semantic correctness from protocol validity.
 This module never searches for a usable tool call inside arbitrary prose.  That
@@ -17,9 +18,10 @@ from dataclasses import dataclass
 from typing import Any
 
 
-_ACTION_TAG_RE = re.compile(r"<\s*(tool_call|final)\b[^>]*>", re.IGNORECASE)
-_ACTION_MARKER_RE = re.compile(r"</?\s*(tool_call|final)\b", re.IGNORECASE)
+_ACTION_TAG_RE = re.compile(r"<\s*(tool_call|final|abstain)\b[^>]*>", re.IGNORECASE)
+_ACTION_MARKER_RE = re.compile(r"</?\s*(tool_call|final|abstain)\b", re.IGNORECASE)
 _FINAL_RE = re.compile(r"\s*<final>(?P<body>.*?)</final>\s*\Z", re.IGNORECASE | re.DOTALL)
+_ABSTAIN_RE = re.compile(r"\s*<abstain>(?P<body>.*?)</abstain>\s*\Z", re.IGNORECASE | re.DOTALL)
 _TOOL_RE = re.compile(r"\s*<tool_call>(?P<body>.*?)</tool_call>\s*\Z", re.IGNORECASE | re.DOTALL)
 _FUNCTION_RE = re.compile(
     r"\s*<function=(?P<name>[A-Za-z_][\w.-]*)>"
@@ -45,7 +47,7 @@ class ParsedAction:
 
     @property
     def is_action(self) -> bool:
-        return self.kind in {"tool_call", "final"}
+        return self.kind in {"tool_call", "final", "abstain"}
 
 
 def count_candidate_actions(text: str | None) -> int:
@@ -104,7 +106,7 @@ def _parse_xml_tool_body(body: str) -> tuple[dict[str, Any] | None, str | None]:
 def parse_assistant_action(text: str | None) -> ParsedAction:
     """Parse one assistant action while preserving malformed raw text.
 
-    Tool calls and final answers must occupy the whole turn.  A completely
+    Tool calls, final answers, and abstentions must occupy the whole turn.  A completely
     tag-free turn is reported as ``no_action`` so callers can distinguish an
     empty model response from an action syntax error.  A final span embedded
     in prose is deliberately a protocol error; reward code can still score
@@ -134,6 +136,18 @@ def parse_assistant_action(text: str | None) -> ParsedAction:
         if not value:
             return ParsedAction("protocol_error", candidate_action_count=1, reason="final answer is empty", raw=raw)
         return ParsedAction("final", value=value, candidate_action_count=1, raw=raw)
+
+    abstain_match = _ABSTAIN_RE.fullmatch(raw)
+    if abstain_match is not None:
+        value = abstain_match.group("body").strip()
+        if not value:
+            return ParsedAction(
+                "protocol_error",
+                candidate_action_count=1,
+                reason="abstention reason is empty",
+                raw=raw,
+            )
+        return ParsedAction("abstain", value=value, candidate_action_count=1, raw=raw)
 
     tool_match = _TOOL_RE.fullmatch(raw)
     if tool_match is not None:

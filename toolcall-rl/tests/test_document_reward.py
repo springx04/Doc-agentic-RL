@@ -21,6 +21,22 @@ def test_missing_final_tag_gets_minimum_reward():
     assert result["format"] == 0.0
 
 
+def test_abstention_reward_distinguishes_unsupported_and_unnecessary_refusal():
+    justified = compute_document_reward(
+        "<abstain>the available observations are contradictory</abstain>",
+        "2024",
+        {"evidence_sufficient": False, "bayestool": {"stop_decision": {"mode": "abstain"}}},
+    )
+    unnecessary = compute_document_reward(
+        "<abstain>I will not answer</abstain>",
+        "2024",
+        {"evidence_sufficient": True},
+    )
+    assert justified["abstention"] is True
+    assert justified["abstention_justified"] is True
+    assert justified["score"] > unnecessary["score"]
+
+
 def test_semantically_correct_final_span_inside_prose_keeps_positive_correctness():
     result = compute_document_reward("Explanation: the answer is <final>Bengaluru</final>.", "Bengaluru")
     assert result["answer_correctness"] == 1.0
@@ -88,6 +104,15 @@ def test_manifest_record_is_converted_to_document_task(tmp_path):
     assert "<final>" in item["prompt"]
     assert json.loads(item["label"])["answers"] == ["Annual report"]
     assert item["metadata"]["task_id"] == "q1"
+
+
+def test_pdf_path_manifest_is_converted_to_document_task(tmp_path):
+    item = transform_record(
+        {"id": "q-pdf", "pdf_path": "train/pdfs/train_000000.pdf", "question": "What is shown?", "answers": ["A"]},
+        document_root=tmp_path,
+    )
+    assert str(tmp_path / "train/pdfs/train_000000.pdf") in item["prompt"]
+    assert item["metadata"]["task_id"] == "q-pdf"
 
 
 def test_answer_page_metadata_is_preserved(tmp_path):

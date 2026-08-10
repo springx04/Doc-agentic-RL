@@ -40,6 +40,32 @@ def _page_range(value: Any) -> tuple[int, int] | None:
     return page, page
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _ocr_languages() -> list[str]:
+    value = os.environ.get("OPENCLAW_DOCLING_OCR_LANG", "en")
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _rapidocr_options(RapidOcrOptions: Any) -> Any:
+    engine = os.environ.get("OPENCLAW_DOCLING_OCR_ENGINE", "rapidocr").strip().lower()
+    if engine != "rapidocr":
+        raise RuntimeError(
+            "OpenClaw Docling OCR is restricted to the offline RapidOCR backend; "
+            f"got {engine!r}"
+        )
+    return RapidOcrOptions(
+        lang=_ocr_languages(),
+        backend=os.environ.get("OPENCLAW_DOCLING_RAPIDOCR_BACKEND", "onnxruntime").strip().lower(),
+        print_verbose=False,
+    )
+
+
 def main() -> None:
     _bootstrap_paths()
     os.environ.setdefault("CONDA_AUTO_ACTIVATE_BASE", "false")
@@ -52,12 +78,18 @@ def main() -> None:
         os.environ["DOCLING_ARTIFACTS_PATH"] = str(artifacts)
 
     from docling.datamodel.base_models import InputFormat
-    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions
     from docling.document_converter import DocumentConverter, ImageFormatOption, PdfFormatOption
 
     options = None
     if artifacts:
-        pipeline_options = PdfPipelineOptions(artifacts_path=str(artifacts))
+        pipeline_options = PdfPipelineOptions(
+            artifacts_path=str(artifacts),
+            ocr_options=_rapidocr_options(RapidOcrOptions),
+        )
+        if _env_flag("OPENCLAW_DOCLING_DISABLE_OCR_TABLE"):
+            pipeline_options.do_ocr = False
+            pipeline_options.do_table_structure = False
         options = {
             InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
             InputFormat.IMAGE: ImageFormatOption(pipeline_options=pipeline_options),

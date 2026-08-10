@@ -7,8 +7,10 @@ from argparse import Namespace
 from collections.abc import Callable, Sequence
 from functools import partial
 from pathlib import Path
+from typing import Any
 
 import torch
+import torch.distributed as dist
 from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
@@ -27,7 +29,7 @@ from slime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
-from .loss import loss_function
+from .loss import bayestool_auxiliary_loss_function, loss_function
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
 logger = logging.getLogger(__name__)
@@ -296,6 +298,296 @@ def forward_only(
     return rollout_data
 
 
+def _normalise_bayestool_aux_bundles(
+    rollout_data: dict[str, Any],
+    args: Namespace,
+) -> list[dict[str, Any]]:
+    """Read tokenized Bayes bundles without turning them into labels.
+
+    A bundle is kept as one unit here.  The auxiliary data iterator later
+    gives every bundle one complete microbatch, padding only with masked dummy
+    rows.  This is what prevents the four switch sequences (or all pre-inv
+    candidates) from being split across ranks or microbatches.
+    """
+
+    raw_records = rollout_data.get("bayes_aux_records") or []
+    bundles: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    switch_count = 0
+    preinv_count = 0
+    max_switch = max(0, int(getattr(args, "bayestool_max_switch_bundles_per_rank", 8) or 8))
+    max_preinv = max(0, int(getattr(args, "bayestool_max_preinv_bundles_per_rank", 8) or 8))
+
+    for sample_records in raw_records:
+        if not isinstance(sample_records, (list, tuple)):
+            continue
+        for record in sample_records:
+            if not isinstance(record, dict):
+                continue
+            kind = str(record.get("kind") or "")
+            if kind not in {"switch", "pre_invariance"}:
+                continue
+            if kind == "switch" and bool(getattr(args, "bayestool_without_switch_loss", False)):
+                continue
+            if kind == "pre_invariance" and bool(getattr(args, "bayestool_without_pre_invariance", False)):
+                continue
+            if kind == "switch" and switch_count >= max_switch:
+                continue
+            if kind == "pre_invariance" and preinv_count >= max_preinv:
+                continue
+            bundle_id = str(
+                record.get("switch_bundle_id")
+                or record.get("preinv_bundle_id")
+                or record.get("bundle_id")
+                or ""
+            )
+            if not bundle_id:
+                bundle_id = f"{kind}:{len(bundles)}"
+            if bundle_id in seen:
+                continue
+            tokenized = record.get("tokenized") or record.get("tokenized_sequences") or []
+            if not isinstance(tokenized, (list, tuple)):
+                continue
+            sequences: list[dict[str, Any]] = []
+            for sequence in tokenized:
+                if not isinstance(sequence, dict):
+                    continue
+                raw_ids = sequence.get("sequence_ids") or sequence.get("tokens")
+                if raw_ids is None:
+                    prompt_ids = sequence.get("prompt_ids") or []
+                    action_ids = sequence.get("action_ids") or []
+                    raw_ids = list(prompt_ids) + list(action_ids)
+                try:
+                    token_ids = [int(value) for value in raw_ids]
+                except (TypeError, ValueError):
+                    continue
+                if not token_ids:
+                    continue
+                try:
+                    response_start = int(sequence.get("response_start", len(sequence.get("prompt_ids") or [])))
+                except (TypeError, ValueError):
+                    response_start = 0
+                response_start = max(0, min(response_start, len(token_ids) - 1))
+                response_length = len(token_ids) - response_start
+                if response_length <= 0:
+                    continue
+                meta = {
+                    "bundle_id": bundle_id,
+                    "kind": kind,
+                    "loss_weight": float(record.get("loss_weight", 1.0) or 1.0),
+                    "world": sequence.get("world"),
+                    "preferred": sequence.get("preferred"),
+                    "candidate_index": sequence.get("candidate_index"),
+                    "dummy": False,
+                }
+                sequences.append(
+                    {
+                        "tokens": token_ids,
+                        "loss_mask": [1] * response_length,
+                        "total_length": len(token_ids),
+                        "response_length": response_length,
+                        "meta": meta,
+                    }
+                )
+            expected = 4 if kind == "switch" else 2
+            if len(sequences) < expected:
+                continue
+            seen.add(bundle_id)
+            bundles.append(
+                {
+                    "bundle_id": bundle_id,
+                    "kind": kind,
+                    "sequences": sequences,
+                }
+            )
+            if kind == "switch":
+                switch_count += 1
+            else:
+                preinv_count += 1
+    return bundles
+
+
+def _all_reduce_max_int(value: int, *, device: torch.device) -> int:
+    if not dist.is_available() or not dist.is_initialized():
+        return int(value)
+    tensor = torch.tensor([int(value)], dtype=torch.int64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX, group=mpu.get_data_parallel_group(with_context_parallel=False))
+    return int(tensor.item())
+
+
+def _build_bayestool_auxiliary_iterators(
+    args: Namespace,
+    data_iterator: Sequence[DataIterator],
+) -> tuple[list[DataIterator], int, int] | None:
+    """Build one atomic auxiliary microbatch per tokenized bundle."""
+
+    if not data_iterator:
+        return None
+    bundles = _normalise_bayestool_aux_bundles(data_iterator[0].rollout_data, args)
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    bundle_count = _all_reduce_max_int(len(bundles), device=device)
+    local_max_rows = max((len(bundle["sequences"]) for bundle in bundles), default=0)
+    max_rows = _all_reduce_max_int(local_max_rows, device=device)
+    configured_rows = max(4, int(getattr(args, "bayestool_aux_micro_batch_size", 4) or 4))
+    rows_per_bundle = max(configured_rows, max_rows, 4)
+    rows_per_bundle = ((rows_per_bundle + 3) // 4) * 4
+    if bundle_count <= 0:
+        return None
+
+    flattened: list[torch.Tensor] = []
+    loss_masks: list[list[int]] = []
+    total_lengths: list[int] = []
+    response_lengths: list[int] = []
+    sequence_meta: list[dict[str, Any]] = []
+    microbatch_indices: list[list[int]] = []
+
+    def append_sequence(sequence: dict[str, Any], *, dummy: bool = False) -> None:
+        index = len(flattened)
+        token_ids = [int(value) for value in sequence.get("tokens", [0, 0])]
+        response_length = max(1, int(sequence.get("response_length", 1)))
+        if len(token_ids) < response_length + 1:
+            token_ids = token_ids[:1] + [0] * response_length
+        flattened.append(torch.tensor(token_ids, dtype=torch.long))
+        loss_masks.append(torch.tensor([0 if dummy else 1] * response_length, dtype=torch.int))
+        total_lengths.append(len(token_ids))
+        response_lengths.append(response_length)
+        meta = dict(sequence.get("meta") or {})
+        meta["dummy"] = bool(dummy)
+        sequence_meta.append(meta)
+        return index
+
+    for bundle_index in range(bundle_count):
+        if bundle_index < len(bundles):
+            sequences = list(bundles[bundle_index]["sequences"])
+        else:
+            sequences = []
+        indices: list[int] = []
+        for sequence in sequences[:rows_per_bundle]:
+            indices.append(append_sequence(sequence))
+        while len(indices) < rows_per_bundle:
+            indices.append(append_sequence({}, dummy=True))
+        microbatch_indices.append(indices)
+
+    max_seq_len = max(total_lengths, default=2)
+    aux_data = {
+        "tokens": flattened,
+        "loss_masks": loss_masks,
+        "total_lengths": total_lengths,
+        "response_lengths": response_lengths,
+        "max_seq_lens": [max_seq_len] * len(flattened),
+        "multimodal_train_inputs": [None] * len(flattened),
+        "bayes_aux_sequence_meta": sequence_meta,
+    }
+    iterators = [
+        DataIterator(aux_data, micro_batch_size=None, micro_batch_indices=microbatch_indices)
+        for _ in data_iterator
+    ]
+    return iterators, bundle_count, rows_per_bundle
+
+
+def _run_bayestool_auxiliary_forward(
+    args: Namespace,
+    rollout_id: int,
+    step_id: int,
+    data_iterator: Sequence[DataIterator],
+    model: Sequence[DDP],
+    num_microbatches: int,
+    forward_backward_func: Callable[..., Any],
+) -> dict[str, float]:
+    """Run the second forward/backward before the primary optimizer step."""
+
+    built = _build_bayestool_auxiliary_iterators(args, data_iterator)
+    if built is None:
+        return {}
+    aux_iterators, bundle_count, rows_per_bundle = built
+
+    def aux_forward_step(
+        aux_iterator: DataIterator,
+        aux_model: GPTModel,
+        return_schedule_plan: bool = False,
+    ) -> tuple[torch.Tensor, Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor, dict[str, Any]]]]:
+        batch = get_batch(
+            aux_iterator,
+            [
+                "tokens",
+                "multimodal_train_inputs",
+                "total_lengths",
+                "response_lengths",
+                "loss_masks",
+                "max_seq_lens",
+                "bayes_aux_sequence_meta",
+            ],
+            args.data_pad_size_multiplier,
+            args.qkv_format,
+        )
+        if return_schedule_plan:
+            output_tensor = aux_model.build_schedule_plan(
+                input_ids=batch["tokens"],
+                position_ids=None,
+                attention_mask=None,
+                labels=None,
+                packed_seq_params=batch["packed_seq_params"],
+                loss_mask=batch["full_loss_masks"],
+            )
+        else:
+            output_tensor = aux_model(
+                input_ids=batch["tokens"],
+                position_ids=None,
+                attention_mask=None,
+                labels=None,
+                packed_seq_params=batch["packed_seq_params"],
+                loss_mask=batch["full_loss_masks"],
+                fp32_output=False,
+            )
+
+        def aux_loss(output: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+            raw_loss, metrics = bayestool_auxiliary_loss_function(args, batch, output)
+            # Scale like the ordinary policy loss so the second forward is
+            # accumulated in the same optimizer step without a second
+            # optimizer/scheduler or a hidden reward normalization path.
+            if not args.calculate_per_token_loss:
+                raw_loss = raw_loss * len(aux_iterators[0].micro_batch_indices or []) / max(
+                    1, int(getattr(args, "global_batch_size", 1))
+                ) * mpu.get_data_parallel_world_size(with_context_parallel=True)
+            values = torch.stack(
+                [
+                    torch.tensor(float(bundle_count), device=raw_loss.device),
+                    metrics["bayes_aux_loss"].to(raw_loss.device),
+                    metrics["bayes_switch_loss"].to(raw_loss.device),
+                    metrics["bayes_preinv_loss"].to(raw_loss.device),
+                ]
+            )
+            return raw_loss, torch.tensor(1, device=raw_loss.device), {
+                "keys": ["bayes_aux_loss", "bayes_switch_loss", "bayes_preinv_loss"],
+                "values": values,
+            }
+
+        return output_tensor, aux_loss
+
+    losses_reduced = forward_backward_func(
+        forward_step_func=aux_forward_step,
+        data_iterator=aux_iterators,
+        model=model,
+        num_microbatches=bundle_count,
+        seq_length=args.seq_length,
+        micro_batch_size=rows_per_bundle,
+        decoder_seq_length=args.decoder_seq_length,
+        forward_only=False,
+    )
+    if not mpu.is_pipeline_last_stage(ignore_virtual=True) or not losses_reduced:
+        return {}
+    keys = losses_reduced[0]["keys"]
+    values = None
+    for item in losses_reduced:
+        values = item["values"] if values is None else values + item["values"]
+    dist.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
+    denominator = max(1.0, float(values[0].item()))
+    return {
+        key: float(value.item()) * mpu.get_context_parallel_world_size() / denominator
+        for key, value in zip(keys, values[1:], strict=True)
+    }
+
+
 def train_one_step(
     args: Namespace,
     rollout_id: int,
@@ -446,6 +738,23 @@ def train_one_step(
         forward_only=False,
     )
 
+    bayestool_aux_metrics = {}
+    aux_interval = max(1, int(getattr(args, "bayestool_aux_interval", 2) or 2))
+    if (
+        getattr(args, "bayestool_enable", False)
+        and args.advantage_estimator == "bayes_grpo"
+        and (int(rollout_id) % aux_interval == 0)
+    ):
+        bayestool_aux_metrics = _run_bayestool_auxiliary_forward(
+            args,
+            rollout_id,
+            step_id,
+            data_iterator,
+            model,
+            num_microbatches,
+            forward_backward_func,
+        )
+
     valid_step = True
     if not getattr(args, "check_for_nan_in_loss_and_grad", True):
         found_inf_flag = optimizer.prepare_grads()
@@ -495,6 +804,7 @@ def train_one_step(
         num_samples_or_tokens = values[0]
         for key, value in zip(keys, values[1:], strict=False):
             loss_reduced[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
+        loss_reduced.update(bayestool_aux_metrics)
         return loss_reduced, grad_norm
     return {}, grad_norm
 

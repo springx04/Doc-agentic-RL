@@ -85,26 +85,53 @@ python toolcall-rl/rl_data_preprocess.py \
   --check-files
 ```
 
-Common aliases such as `file_path`, `query`, `answer`, and `ground_truth` are
-accepted. Relative document paths can be prefixed using `--document-root`.
-Every referenced file must be mounted at the same path in rollout workers.
+Common aliases such as `pdf_path`, `file_path`, `query`, `answer`, and
+`ground_truth` are accepted. Relative document paths can be prefixed using
+`--document-root`. Every referenced file must be mounted at the same path in
+rollout workers.
+
+The project-local DocVQA source data is already under `data/`: `train.jsonl`
+contains 1,000 training questions over `data/train/pdfs/`, and `test.jsonl`
+contains 200 evaluation questions over `data/test/pdfs/`. Generate the default
+launcher inputs from those raw manifests with:
+
+```bash
+python toolcall-rl/rl_data_preprocess.py \
+  --input data/train.jsonl \
+  --output data/document-qa/train.jsonl \
+  --document-root "$(pwd)/data" \
+  --default-metric anls \
+  --check-files
+python toolcall-rl/rl_data_preprocess.py \
+  --input data/test.jsonl \
+  --output data/document-qa/eval.jsonl \
+  --document-root "$(pwd)/data" \
+  --default-metric anls \
+  --check-files
+```
+
+The Qwen3-VL BayesTool launcher uses these generated files by default; no
+external `/data_storage/wyj` dataset path is required.
 
 For optional document-tool SFT, input rows must contain a standard `messages`
 trajectory and can be converted with:
 
 ```bash
 python toolcall-rl/sft_data_processing.py \
-  --input /data/document_tool_sft.jsonl \
-  --output /data/document-tool-sft/train.parquet
+  --input data/document_tool_sft.jsonl \
+  --output data/document-tool-sft/train.parquet
 ```
 
-## Training
+## Legacy text-only training recipes
+
+The following recipes are retained for baseline comparison and require their
+own model/SFT artifacts. They are not the verified Qwen3-VL BayesTool path.
 
 Single-node Qwen3-4B GRPO:
 
 ```bash
-export PROMPT_DATA=/data/document_qa/train.jsonl
-export EVAL_DATA=/data/document_qa/eval.jsonl
+export PROMPT_DATA="$(pwd)/data/document-qa/train.jsonl"
+export EVAL_DATA="$(pwd)/data/document-qa/eval.jsonl"
 export HF_CKPT=/models/qwen3-4b-document-tool-sft
 export REF_LOAD=/models/qwen3-4b-document-tool-sft_torch_dist
 cd slime
@@ -114,8 +141,8 @@ bash ../toolcall-rl/retool_qwen3_4b_rl.sh
 PRM + step-wise RL:
 
 ```bash
-export PROMPT_DATA=/data/document_qa/train.jsonl
-export EVAL_DATA=/data/document_qa/eval.jsonl
+export PROMPT_DATA="$(pwd)/data/document-qa/train.jsonl"
+export EVAL_DATA="$(pwd)/data/document-qa/eval.jsonl"
 export PRM_MODEL_PATH=/models/document-prm
 cd slime
 bash ../toolcall-rl/retool_qwen3_4b_prm_rl.sh
@@ -200,6 +227,24 @@ python toolcall-rl/export_rollout_workflows.py --limit 20
 It writes Markdown and JSON workflow subsets to the run directory. They retain
 the prompt, model tool calls, tool-return text, final answer, media references,
 labels, and reward fields, while excluding tokens, masks, tensors, and vectors.
+
+For RL training, a completed Ray job is not sufficient evidence that learning
+occurred. Audit the retained launcher log and run directory explicitly:
+
+```bash
+python toolcall-rl/analyze_bayestool_training_log.py \
+  outputs/qwen3-vl-4b-bayestool-<run>/launcher.log \
+  --output-dir outputs/qwen3-vl-4b-bayestool-<run> \
+  --json-out outputs/qwen3-vl-4b-bayestool-<run>/rl_audit.json
+```
+
+The audit requires the reference-log-probability stage, actor log-probability
+stage, optimizer metrics, and checkpoint evidence. It separately checks reward
+variance, valid rollouts, tool activity, Bayes sibling/auxiliary metrics, loss,
+and gradient norm. Its strict `effective` classification is withheld when all
+rewards are identical, all samples are protocol failures, no tool action was
+executed, or the resulting policy update is numerically zero. A job that only
+proves the execution chain is classified as `chain_only`, not as successful RL.
 
 ## Method details
 
