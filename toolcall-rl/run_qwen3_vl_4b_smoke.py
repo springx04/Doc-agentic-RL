@@ -40,14 +40,14 @@ DOCUMENT_PROBE: Path | None = DOCUMENT
 OUTPUT_DIR = Path(
     os.environ.get(
         "OPENCLAW_SMOKE_OUTPUT_DIR",
-        str(PROJECT / "outputs" / "qwen3-vl-4b-openclaw-smoke-20260811-2gpu-r19"),
+        str(PROJECT / "outputs" / "qwen3-vl-4b-openclaw-smoke-20260811-2gpu-r20"),
     )
 ).resolve()
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
 RAY_TEMP_DIR = Path(
     os.environ.get(
         "OPENCLAW_SMOKE_RAY_TEMP_DIR",
-        str(WORKSPACE / ".ray" / "q3v4b-20260811-2gpu-r19"),
+        str(WORKSPACE / ".ray" / "q3v4b20"),
     )
 ).resolve()
 NUMA_RUNTIME_DIR = (WORKSPACE / "envs" / "openclaw-rl-qwen3vl-numa-20260717-01").resolve()
