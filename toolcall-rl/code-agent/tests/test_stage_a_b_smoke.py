@@ -14,7 +14,7 @@ def test_stage_a_and_b_execute_as_independent_code_stages(git_repo, tmp_path):
         output = tmp_path / "stage-a.json"
         stage_a = await run_stage_a([instance], repository_root=git_repo, output=output, seed=5)
         assert stage_a["environment"] == "code"
-        assert len(stage_a["instances"][0]["probe_rows"]) >= 12
+        assert len(stage_a["instances"][0]["probe_rows"]) >= 20
         assert output.exists() and output.with_name("belief_code.pt").exists()
 
         stage_b = await run_stage_b(

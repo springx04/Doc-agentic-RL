@@ -15,6 +15,7 @@ try:
     from .bayestool.schema import CodeWorldSamplingContext
     from .bayestool.world import CodeWorldRuntime
     from .bayestool.world_sampler import public_sampling_context, sample_required_worlds
+    from .bayestool.utility import compute_utility, failure_penalty, inefficiency_score, normalized_cost
     from .config import DEFAULT_CODE_CONFIG, CodeConfig, CODE_TOOL_NAMES, stable_hash
     from .data.leakage_guard import public_view
     from .env.evaluator import CleanEvaluator, EvaluatorRequest
@@ -27,6 +28,7 @@ except ImportError:  # pragma: no cover - direct PYTHONPATH execution
     from bayestool.schema import CodeWorldSamplingContext
     from bayestool.world import CodeWorldRuntime
     from bayestool.world_sampler import public_sampling_context, sample_required_worlds
+    from bayestool.utility import compute_utility, failure_penalty, inefficiency_score, normalized_cost
     from config import DEFAULT_CODE_CONFIG, CodeConfig, CODE_TOOL_NAMES, stable_hash
     from data.leakage_guard import public_view
     from env.evaluator import CleanEvaluator, EvaluatorRequest
@@ -229,6 +231,7 @@ class CodeRollout:
         failure_origin = "none"
         protocol_error = False
         invalid_action = False
+        world_injected_validation_failure = False
         started = time.perf_counter()
         candidate_patch = ""
         resolved = False
@@ -282,12 +285,19 @@ class CodeRollout:
                     if inspect.isawaitable(callback_result):
                         await callback_result
                 generation = _normalize_generation(await model_client.generate(messages, max_tokens=settings.max_new_tokens))
+                # Never synthesize token masks or log-probabilities: training
+                # must consume precisely the generation accounting emitted by
+                # the model client, or reject the sample as untrainable.
+                if generation.token_ids and (not generation.token_mask or not generation.token_logprobs):
+                    termination = "invalid_token_accounting"
+                    failure_origin = "real_infrastructure"
+                    break
                 parsed = parse_action(generation.text)
-                assistant = CodeMessage("assistant", generation.text, generation.token_ids, generation.token_mask or tuple(1 for _ in generation.token_ids), generation.token_logprobs)
+                assistant = CodeMessage("assistant", generation.text, generation.token_ids, generation.token_mask, generation.token_logprobs)
                 code_messages.append(assistant)
                 token_ids.extend(generation.token_ids)
-                loss_mask.extend(generation.token_mask or tuple(1 for _ in generation.token_ids))
-                log_probs.extend(generation.token_logprobs or tuple(0.0 for _ in generation.token_ids))
+                loss_mask.extend(generation.token_mask)
+                log_probs.extend(generation.token_logprobs)
                 messages.append({"role": "assistant", "content": generation.text})
                 if not parsed.is_valid:
                     termination = "protocol_error"
@@ -305,6 +315,14 @@ class CodeRollout:
                     termination = "budget_exhausted"
                     break
                 result, features, event = await runtime.execute_tool(parsed.tool_name or "", parsed.arguments or {})
+                invalid_action = invalid_action or result.failure_origin == "model_action"
+                if parsed.tool_name == "apply_patch" and result.status == "ok":
+                    world_injected_validation_failure = False
+                elif parsed.tool_name in {"run_tests", "run_checks"} and result.failure_origin == "world_injected":
+                    # The agent attempted validation, but the hidden world
+                    # denied/corrupted it.  It cannot make a final answer an
+                    # agent-attributable premature-stop failure.
+                    world_injected_validation_failure = True
                 family = event.public_context.get("family")
                 belief_snapshot = belief.update(parsed.tool_name or "", result, features=features, family=family)
                 events.append(event.visible_dict())
@@ -342,18 +360,45 @@ class CodeRollout:
             resolved = bool(evaluator_result.resolved)
             if evaluator_result.failure_origin == "real_infrastructure":
                 failure_origin = "real_infrastructure"
-        cost = min(1.0, len(events) / max(1, config.tool_budget))
-        failure_penalty = 0.35 if protocol_error or invalid_action else (0.15 if termination in {"budget_exhausted", "context_overflow"} else 0.0)
+        latency_ms = sum(float(event.get("latency_ms", 0.0) or 0.0) for event in events)
+        observation_chars = sum(len(str(event.get("output", "") or "")) for event in events)
+        cost = normalized_cost(
+            tool_calls=len(events),
+            latency_ms=latency_ms,
+            observation_chars=observation_chars,
+            validation_runtime_ms=task_state.validation_runtime_ms,
+            budget=config.tool_budget,
+        )
+        inefficiency = inefficiency_score(events)
+        failure_penalty_value = failure_penalty(
+            failure_origin="none",
+            protocol_error=protocol_error,
+            invalid_action=invalid_action,
+            premature_final=(
+                termination == "final"
+                and not task_state.evidence_sufficient
+                and not world_injected_validation_failure
+                and not resolved
+            ),
+            budget_exhausted=termination in {"budget_exhausted", "context_overflow"},
+        )
         task_quality = 1.0 if resolved else 0.0
-        utility = (2.0 * task_quality - 1.0) - 0.20 * cost - 0.20 * min(1.0, sum(1 for event in events if event.get("information_gain", 0.0) < 0.02) / max(1, len(events))) - 0.35 * failure_penalty
+        utility = compute_utility(
+            resolved=resolved,
+            cost=cost,
+            inefficiency=inefficiency,
+            failure_penalty_value=failure_penalty_value,
+        )
         valid = failure_origin != "real_infrastructure"
-        reward = CodeReward(task_quality, utility, cost, 0.0, failure_penalty, resolved, valid, failure_origin)
+        reward = CodeReward(task_quality, utility, cost, inefficiency, failure_penalty_value, resolved, valid, failure_origin)
         patch_hash = hashlib.sha256(candidate_patch.encode("utf-8")).hexdigest()
         public_metadata = {
             "environment": "code", "instance_id": instance_id, "data_source": data_source, "tool_budget": config.tool_budget,
             "tool_calls_used": len(events), "termination_reason": termination, "valid_for_rl": valid,
             "candidate_patch_sha256": patch_hash, "resolved": resolved, "belief_schema_version": config.belief_schema_version,
             "tool_schema_version": config.tool_schema_version, "world_schema_version": config.world_schema_version,
+            "cost": cost, "inefficiency": inefficiency, "failure_penalty": failure_penalty_value,
+            "policy_gradient_eligible": bool(token_ids) and len(token_ids) == len(loss_mask) == len(log_probs),
             "elapsed_ms": (time.perf_counter() - started) * 1000.0,
         }
         trainer_metadata = {

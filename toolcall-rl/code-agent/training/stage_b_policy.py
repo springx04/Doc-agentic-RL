@@ -12,19 +12,19 @@ try:
     from ..config import DEFAULT_CODE_CONFIG
     from ..env.client import LocalCodeEnvClient
     from ..rollout import generate_code_trajectory
-    from .common import ScriptedModelClient, default_sample, load_instances, repository_public_context, write_json
+    from .common import ScriptedModelClient, default_sample, evaluator_script_for_instance, load_instances, repository_public_context, write_json
 except ImportError:  # pragma: no cover
     from bayestool.world_sampler import public_sampling_context, sample_required_worlds
     from config import DEFAULT_CODE_CONFIG
     from env.client import LocalCodeEnvClient
     from rollout import generate_code_trajectory
-    from training.common import ScriptedModelClient, default_sample, load_instances, repository_public_context, write_json
+    from training.common import ScriptedModelClient, default_sample, evaluator_script_for_instance, load_instances, repository_public_context, write_json
 
 
 async def run_stage_b(instance: Any, *, repository_root: str | Path, model_client: Any, eval_script: str | None = None, seed: int = 0) -> dict[str, Any]:
     context = public_sampling_context(**repository_public_context(repository_root, tool_budget=DEFAULT_CODE_CONFIG.tool_budget))
     world = sample_required_worlds(instance_id=instance.public.instance_id, image_name=instance.public.image_name or "local", base_revision=instance.public.base_revision, context=context, rollout_seed=seed)[0]
-    result = await generate_code_trajectory(default_sample(instance), model_client, LocalCodeEnvClient(repository_root), DEFAULT_CODE_CONFIG, world=world, eval_script=eval_script, seed=seed, data_source=instance.public.data_source)
+    result = await generate_code_trajectory(default_sample(instance), model_client, LocalCodeEnvClient(repository_root), DEFAULT_CODE_CONFIG, world=world, eval_script=evaluator_script_for_instance(instance, eval_script), seed=seed, data_source=instance.public.data_source)
     return {"environment": "code", "stage": "B", "trajectory": result}
 
 

@@ -63,7 +63,13 @@ class CodeWorldRuntime:
         call_index = self.state.call_index
         public_context = self._public_context(tool_name, arguments)
         quality = quality_for_tool(self.world, tool_name, public_context, call_index)
-        corruption = corruption_for_call(self.world, tool_name, call_index, rng=random.Random(self.world.seed + call_index))
+        corruption = corruption_for_call(
+            self.world,
+            tool_name,
+            call_index,
+            public_context=public_context,
+            rng=random.Random(self.world.seed + call_index),
+        )
 
         # Availability and explicitly injected timeout/reject failures are
         # world observations.  They must not kill/close the actual lease.
@@ -79,6 +85,13 @@ class CodeWorldRuntime:
                 corruption = None
             elif corruption:
                 result = corrupt_result(result, corruption, seed=self.world.seed + call_index)
+
+        # The world affects the observed tool latency without sleeping or
+        # perturbing the real lease.  This retains deterministic local/remote
+        # execution while exposing the configured latency degradation to the
+        # belief and utility models.
+        if result.failure_origin != "real_infrastructure" and quality.latency_scale != 1.0:
+            result = result.__class__(**{**result.__dict__, "latency_ms": float(result.latency_ms) * quality.latency_scale})
 
         gain = information_gain(
             tool_name=tool_name,

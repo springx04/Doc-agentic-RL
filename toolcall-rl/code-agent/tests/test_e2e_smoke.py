@@ -26,6 +26,10 @@ def test_single_task_multiturn_patch_validate_and_clean_evaluate(git_repo, patch
         assert result["metadata"]["valid_for_rl"] is True
         assert result["metadata"]["resolved"] is True
         assert result["metadata"]["tool_calls_used"] == 4
+        assert result["metadata"]["cost"] > 0.0
+        assert result["metadata"]["inefficiency"] >= 0.0
+        assert result["metadata"]["failure_penalty"] == 0.0
+        assert result["metadata"]["policy_gradient_eligible"] is False
         assert result["trainer_only_metadata"]["world_slot_role"] == "healthy"
 
     asyncio.run(run())

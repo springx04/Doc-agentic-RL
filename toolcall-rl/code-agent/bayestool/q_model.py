@@ -94,6 +94,8 @@ def load_q_checkpoint(path: str | Path, model: CodeQModel | None = None) -> dict
     expected = q_checkpoint_metadata()
     if metadata.get("environment") != "code" or metadata.get("checkpoint_type") != "q" or metadata.get("schema_version") != expected["schema_version"]:
         raise ValueError("Code Q checkpoint environment/type/schema mismatch")
+    if metadata.get("feature_schema_hash") != expected["feature_schema_hash"] or metadata.get("tool_names") != expected["tool_names"]:
+        raise ValueError("Code Q checkpoint feature schema mismatch")
     if model is not None:
         model.weights = list(payload.get("weights") or model.weights)
         model.bias = float(payload.get("bias", model.bias))

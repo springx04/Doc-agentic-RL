@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -38,6 +38,12 @@ class CodeManifest:
             raise ValueError("Code manifest belief feature dimension mismatch")
         if self.group_size not in CODE_ALLOWED_GROUP_SIZES:
             raise ValueError("Code manifest group_size must be 4 or 8")
+        if not self.stage:
+            raise ValueError("Code manifest stage is required")
+        if not self.base_model:
+            raise ValueError("Code manifest base_model is required")
+        if not 1 <= self.tool_budget <= 30:
+            raise ValueError("Code manifest tool_budget must be in [1, 30]")
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
@@ -71,4 +77,42 @@ def validate_capabilities(manifest: CodeManifest, *, stage: str, required_checkp
             raise ValueError(f"stage {stage} requires Code checkpoints: {', '.join(missing)}")
 
 
-__all__ = ["CodeManifest", "validate_capabilities"]
+def load_and_validate_capabilities(path: str | Path, *, stage: str, required_checkpoints: bool = True) -> CodeManifest:
+    """Load a Code capability manifest and validate each referenced checkpoint.
+
+    Checkpoint paths are resolved relative to the capability manifest, so a
+    copied training bundle remains self-contained and cannot silently load a
+    similarly named checkpoint from the caller's current directory.
+    """
+
+    manifest_path = Path(path)
+    manifest = CodeManifest.load(manifest_path)
+    validate_capabilities(manifest, stage=stage, required_checkpoints=required_checkpoints)
+    if not required_checkpoints:
+        return manifest
+
+    try:
+        from ..bayestool.belief import load_belief_checkpoint
+        from ..bayestool.q_model import load_q_checkpoint
+        from ..bayestool.risk_model import load_risk_checkpoint
+    except ImportError:  # pragma: no cover
+        from bayestool.belief import load_belief_checkpoint
+        from bayestool.q_model import load_q_checkpoint
+        from bayestool.risk_model import load_risk_checkpoint
+
+    def resolve(value: str | None) -> str:
+        if not value:
+            raise ValueError("missing required Code checkpoint")
+        candidate = Path(value)
+        return str(candidate if candidate.is_absolute() else manifest_path.parent / candidate)
+
+    belief_path = resolve(manifest.belief_checkpoint)
+    q_path = resolve(manifest.q_checkpoint)
+    risk_path = resolve(manifest.risk_checkpoint)
+    load_belief_checkpoint(belief_path)
+    load_q_checkpoint(q_path)
+    load_risk_checkpoint(risk_path)
+    return replace(manifest, belief_checkpoint=belief_path, q_checkpoint=q_path, risk_checkpoint=risk_path)
+
+
+__all__ = ["CodeManifest", "load_and_validate_capabilities", "validate_capabilities"]

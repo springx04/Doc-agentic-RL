@@ -46,7 +46,22 @@ class SWEInstance:
 
     @classmethod
     def from_raw(cls, raw: Mapping[str, Any], *, data_source: str = "") -> "SWEInstance":
-        public_raw, private_raw = split_public_private(raw)
+        # ``preprocess`` writes a transport-safe manifest with public and
+        # evaluator-private fields nested under metadata.  Training entry
+        # points must be able to reload that exact format without ever moving
+        # evaluator labels into the public instance.
+        source = dict(raw)
+        nested_private: dict[str, Any] = {}
+        metadata = source.get("metadata")
+        if isinstance(metadata, Mapping) and isinstance(metadata.get("public_instance"), Mapping):
+            source = dict(metadata["public_instance"])
+            if raw.get("text") and not source.get("problem_statement"):
+                source["problem_statement"] = raw["text"]
+            private_value = metadata.get("evaluator_private")
+            if isinstance(private_value, Mapping):
+                nested_private = dict(private_value)
+        public_raw, private_raw = split_public_private(source)
+        private_raw = {**private_raw, **nested_private}
         instance_id = str(public_raw.get("instance_id") or public_raw.get("id") or public_raw.get("instance") or "")
         problem = str(public_raw.get("problem_statement") or public_raw.get("text") or public_raw.get("problem") or "")
         image = str(public_raw.get("image_name") or public_raw.get("docker_image") or public_raw.get("image") or "")

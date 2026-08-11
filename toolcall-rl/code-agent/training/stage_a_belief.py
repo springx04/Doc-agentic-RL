@@ -27,12 +27,27 @@ except ImportError:  # pragma: no cover
     from training.common import load_instances, repository_public_context, write_json
 
 
+def _probe_file(repository_root: str | Path) -> str | None:
+    """Pick one source file from public repository state for a safe read probe."""
+
+    root = Path(repository_root)
+    candidates = sorted(
+        path
+        for path in root.rglob("*")
+        if path.is_file() and ".git" not in path.parts and "__pycache__" not in path.parts and path.suffix in {".py", ".js", ".ts", ".go", ".rs", ".java", ".md"}
+    )
+    if not candidates:
+        return None
+    return candidates[0].relative_to(root).as_posix()
+
+
 async def run_probe(instance: SWEInstance, *, repository_root: str | Path, seed: int = 0) -> dict[str, Any]:
     context_values = repository_public_context(repository_root, tool_budget=DEFAULT_CODE_CONFIG.tool_budget)
     context = public_sampling_context(**context_values)
     worlds = sample_required_worlds(instance_id=instance.public.instance_id, image_name=instance.public.image_name or "local", base_revision=instance.public.base_revision, context=context, rollout_seed=seed)
     client = LocalCodeEnvClient(repository_root)
     rows = []
+    probe_file = _probe_file(repository_root)
     for world in worlds:
         lease = await client.allocate(world.image_name or "local", world.instance_id, cwd="/testbed", base_revision=world.base_revision)
         try:
@@ -46,7 +61,10 @@ async def run_probe(instance: SWEInstance, *, repository_root: str | Path, seed:
             ("search_code", {"query": instance.public.problem_statement.split()[0] if instance.public.problem_statement.split() else "", "path": ".", "glob": "*.py", "max_results": 10}),
             ("git_diff", {}),
             ("run_checks", {"check": "compile", "path": "."}),
+            ("run_tests", {"target": "", "args": "-q"}),
         ]
+        if probe_file:
+            probes.insert(2, ("read_file", {"path": probe_file, "start_line": 1, "end_line": 80}))
         for tool_name, arguments in probes:
             if not arguments.get("query") and tool_name == "search_code":
                 continue

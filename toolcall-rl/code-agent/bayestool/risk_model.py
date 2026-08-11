@@ -41,6 +41,8 @@ def load_risk_checkpoint(path: str | Path, model: CodeRiskModel | None = None) -
     expected = risk_checkpoint_metadata()
     if metadata.get("environment") != "code" or metadata.get("checkpoint_type") != "risk" or metadata.get("schema_version") != expected["schema_version"]:
         raise ValueError("Code Risk checkpoint environment/type/schema mismatch")
+    if metadata.get("feature_schema_hash") != expected["feature_schema_hash"]:
+        raise ValueError("Code Risk checkpoint feature schema mismatch")
     if model is not None:
         model.bias = float(payload.get("bias", model.bias))
         model.weights.update({str(key): float(value) for key, value in (payload.get("weights") or {}).items()})

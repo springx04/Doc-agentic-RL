@@ -282,7 +282,7 @@ def load_belief_checkpoint(path: str | Path, *, model: Any = None) -> dict[str, 
     expected = checkpoint_metadata()
     if metadata.get("environment") != "code" or metadata.get("checkpoint_type") != "belief":
         raise ValueError("Code Belief checkpoint environment/type mismatch")
-    if metadata.get("feature_dim") != expected["feature_dim"] or metadata.get("feature_schema_hash") != expected["feature_schema_hash"]:
+    if metadata.get("feature_dim") != expected["feature_dim"] or metadata.get("feature_schema_version") != expected["feature_schema_version"] or metadata.get("feature_schema_hash") != expected["feature_schema_hash"]:
         raise ValueError("Code Belief checkpoint feature schema mismatch")
     if model is not None and payload.get("model_state") is not None:
         model.load_state_dict(payload["model_state"])

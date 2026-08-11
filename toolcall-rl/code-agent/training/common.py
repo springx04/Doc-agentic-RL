@@ -66,8 +66,21 @@ def default_sample(instance: SWEInstance) -> dict[str, Any]:
     return instance.to_runtime_row()
 
 
+def evaluator_script_for_instance(instance: SWEInstance, override: str | None = None) -> str | None:
+    """Resolve evaluator-only commands without exposing them to the policy."""
+
+    if override and str(override).strip():
+        return str(override)
+    private = instance.evaluator_private.values
+    for key in ("eval_script", "test_command"):
+        value = private.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
 def choose_seed(seed: int, index: int) -> int:
     return random.Random(seed + index * 1009).randrange(0, 2**31 - 1)
 
 
-__all__ = ["ScriptedModelClient", "choose_seed", "default_sample", "load_instances", "make_local_client", "repository_public_context", "write_json"]
+__all__ = ["ScriptedModelClient", "choose_seed", "default_sample", "evaluator_script_for_instance", "load_instances", "make_local_client", "repository_public_context", "write_json"]

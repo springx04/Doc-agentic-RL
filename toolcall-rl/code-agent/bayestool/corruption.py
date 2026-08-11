@@ -29,10 +29,12 @@ CORRUPTIONS: dict[str, tuple[str, ...]] = {
 }
 
 
-def corruption_for_call(world: CodeWorldSpec, tool_name: str, call_index: int, *, rng: random.Random | None = None) -> str | None:
-    quality = quality_for_tool(world, tool_name, {}, call_index)
+def corruption_for_call(world: CodeWorldSpec, tool_name: str, call_index: int, *, public_context: dict[str, Any] | None = None, rng: random.Random | None = None) -> str | None:
+    quality = quality_for_tool(world, tool_name, public_context, call_index)
     generator = rng or random.Random(world.seed + call_index * 7919)
-    probability = max(0.0, min(0.9, 1.0 - quality.structure_fidelity))
+    # Structure and semantic accuracy are independent hidden quality axes;
+    # either can produce a corrupted policy observation.
+    probability = max(0.0, min(0.9, max(1.0 - quality.structure_fidelity, 1.0 - quality.semantic_accuracy)))
     if tool_name == "apply_patch":
         probability = max(0.0, min(0.75, 1.0 - quality.availability))
     if generator.random() >= probability:

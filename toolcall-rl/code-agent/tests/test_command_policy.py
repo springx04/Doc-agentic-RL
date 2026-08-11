@@ -9,6 +9,7 @@ def test_policy_routes_equivalent_commands():
     assert CodeCommandPolicy.classify("rg VALUE app.py") == CommandClass.SEARCH
     assert not CodeCommandPolicy.validate("pytest -q").allowed
     assert not CodeCommandPolicy.validate("git diff").allowed
+    assert not CodeCommandPolicy.validate("git push origin main").allowed
     assert not CodeCommandPolicy.validate("pip install x").allowed
     assert CodeCommandPolicy.validate("python -c \"print(1)\"").allowed
 
