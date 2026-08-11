@@ -318,9 +318,11 @@ if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi topo -m 2>/dev/null | gre
     HAS_NVLINK=1
 fi
 
-RUNTIME_PYTHONPATH="${MEGATRON_LM_PATH}:${SCRIPT_DIR}:${SLIME_DIR}"
+# Keep the local document-tool package ahead of Megatron-LM's unrelated
+# top-level ``tools`` package, or tool_sandbox will register no tools.
+RUNTIME_PYTHONPATH="${SCRIPT_DIR}:${SLIME_DIR}:${MEGATRON_LM_PATH}"
 if [[ -n "${SGLANG_SOURCE_DIR}" ]]; then
-    RUNTIME_PYTHONPATH="${SGLANG_SOURCE_DIR}:${RUNTIME_PYTHONPATH}"
+    RUNTIME_PYTHONPATH="${RUNTIME_PYTHONPATH}:${SGLANG_SOURCE_DIR}"
 fi
 
 "${RAY_BIN}" start --head --node-ip-address "${MASTER_ADDR}" --port "${RAY_PORT}" --num-gpus "${NUM_GPUS}" \

@@ -600,10 +600,42 @@ if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi topo -m 2>/dev/null | gre
     HAS_NVLINK=1
 fi
 
-RUNTIME_PYTHONPATH="${MEGATRON_LM_PATH}:${SCRIPT_DIR}:${SLIME_DIR}"
+# ``toolcall-rl/tools`` is a real package and must precede Megatron-LM's
+# unrelated top-level ``tools`` package.  Otherwise tool_sandbox imports the
+# wrong package and silently starts with an empty document-tool registry.
+RUNTIME_PYTHONPATH="${SCRIPT_DIR}:${SLIME_DIR}:${MEGATRON_LM_PATH}"
 if [[ -n "${SGLANG_SOURCE_DIR}" ]]; then
-    RUNTIME_PYTHONPATH="${SGLANG_SOURCE_DIR}:${RUNTIME_PYTHONPATH}"
+    RUNTIME_PYTHONPATH="${RUNTIME_PYTHONPATH}:${SGLANG_SOURCE_DIR}"
 fi
+
+# Do this before Ray/SGLang startup so a package-path regression cannot turn
+# every model tool call into an invalid rollout after spending GPU time.
+PYTHONPATH="${RUNTIME_PYTHONPATH}" "${PYTHON_BIN}" -B -c '
+import tool_sandbox
+
+required = {
+    "parse_document",
+    "render_page",
+    "crop_region",
+    "zoom_region",
+    "detect_layout",
+    "ocr_region",
+    "extract_table",
+    "chart_to_table",
+}
+registered = set(tool_sandbox.tool_registry.tools)
+missing = sorted(required - registered)
+if missing:
+    raise SystemExit(
+        "BayesTool document-tool registry is incomplete: "
+        f"missing={missing}; import_error={tool_sandbox.DOCUMENT_TOOL_IMPORT_ERROR!r}; "
+        f"tool_sandbox={tool_sandbox.__file__}"
+    )
+print(
+    "BayesTool document-tool registry ok: "
+    f"tools={sorted(registered)}; tool_sandbox={tool_sandbox.__file__}"
+)
+'
 
 "${RAY_BIN}" start --head --node-ip-address "${MASTER_ADDR}" --port "${RAY_PORT}" --num-gpus "${NUM_GPUS}" \
     --min-worker-port="${RAY_MIN_WORKER_PORT}" --max-worker-port="${RAY_MAX_WORKER_PORT}" \
