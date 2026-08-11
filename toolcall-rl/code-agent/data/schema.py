@@ -87,7 +87,23 @@ class SWEInstance:
         return {"text": self.public.problem_statement, "environment": "code", "metadata": {"environment": "code", "public_instance": self.public.to_dict()}}
 
     def to_manifest_row(self) -> dict[str, Any]:
-        return {"text": self.public.problem_statement, "environment": "code", "metadata": {"environment": "code", "public_instance": self.public.to_dict(), "evaluator_private": dict(self.evaluator_private.values)}}
+        public = self.public.to_dict()
+        # Keep the three routing fields convenient for data tooling while
+        # retaining one canonical policy-visible object.  They are duplicated
+        # rather than reconstructed from evaluator-private records so the
+        # split remains auditable after a JSONL has been copied elsewhere.
+        return {
+            "text": self.public.problem_statement,
+            "environment": "code",
+            "metadata": {
+                "environment": "code",
+                "instance_id": self.public.instance_id,
+                "data_source": self.public.data_source,
+                "image_name": self.public.image_name,
+                "public_instance": public,
+                "evaluator_private": dict(self.evaluator_private.values),
+            },
+        }
 
 
 __all__ = ["EvaluatorPrivate", "PublicInstance", "SWEInstance"]
