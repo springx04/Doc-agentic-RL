@@ -25,7 +25,7 @@ from slime.utils.types import Sample
 # Import tool sandbox functionality
 from document_reward import compute_document_reward, extract_final_answer
 from tool_sandbox import TOOL_CONFIGS, tool_registry
-from tool_protocol import ParsedAction, parse_assistant_action
+from tool_protocol import ParsedAction, normalize_tool_arguments, parse_assistant_action
 
 try:
     from bayestool.belief import BeliefRuntime
@@ -2554,9 +2554,34 @@ def _tool_arguments_for_navigation(
     arguments: dict[str, Any],
     navigation_state: dict[str, Any] | None,
 ) -> tuple[dict[str, Any], bool]:
-    if navigation_state is None or tool_name != "parse_document":
-        return arguments, False
     updated = dict(arguments)
+    auto_routed = False
+    normalized, normalization_reason = normalize_tool_arguments(tool_name, updated)
+    if normalized is not None:
+        updated = normalized
+    elif normalization_reason:
+        # The strict parser normally catches this before reaching navigation.
+        # Keep direct callers deterministic without turning a duplicate alias
+        # into a silently rewritten action.
+        return updated, False
+    if navigation_state is None:
+        return updated, False
+    if tool_name in {
+        "render_page",
+        "crop_region",
+        "zoom_region",
+        "parse_document",
+        "detect_layout",
+        "ocr_region",
+        "extract_table",
+        "chart_to_table",
+    } and not updated.get("document_path") and not updated.get("image_path"):
+        document_path = navigation_state.get("document_path")
+        if document_path:
+            updated["document_path"] = str(document_path)
+            auto_routed = True
+    if tool_name != "parse_document":
+        return updated, auto_routed
     requested = _requested_pages(updated)
     visited = {int(page) for page in navigation_state.get("parsed_pages", [])}
     unvisited = [int(page) for page in navigation_state.get("unvisited_pages", [])]
@@ -2575,7 +2600,7 @@ def _tool_arguments_for_navigation(
     if not requested and unvisited:
         updated["page_numbers"] = [unvisited[0]]
         return updated, True
-    return updated, False
+    return updated, auto_routed
 
 
 def _normalized_evidence(value: Any) -> str:

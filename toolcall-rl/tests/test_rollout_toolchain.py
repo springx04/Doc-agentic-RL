@@ -337,6 +337,50 @@ def test_multi_action_and_placeholder_are_logged_without_execution(monkeypatch):
     assert stats["protocol_error_count"] == 1
 
 
+def test_function_style_tool_call_executes_with_current_document_and_page_alias(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+    navigation = module._new_navigation_state(
+        "Document path: test.pdf\nQuestion: What is shown?"
+    )
+    navigation["page_count"] = 1
+    navigation["unvisited_pages"] = [1]
+    calls = []
+
+    async def fake_tool(name, arguments):
+        calls.append((name, dict(arguments)))
+        return json.dumps(
+            {
+                "status": "ok",
+                "tool": name,
+                "page_count": 1,
+                "returned_pages": [1],
+                "pages": [{"page_number": 1, "markdown": "## Page 1\n\nEvidence"}],
+                "document_has_unreturned_pages": False,
+                "content_truncated": False,
+            }
+        )
+
+    monkeypatch.setattr(module.tool_registry, "execute_tool", fake_tool)
+    trace = []
+    stats = {}
+    observation, done = asyncio.run(
+        module.execute_predictions(
+            '<tool_call>parse_document{"page":0}</tool_call>',
+            trace,
+            stats,
+            turn=1,
+            navigation_state=navigation,
+        )
+    )
+
+    assert done is False
+    assert observation.startswith("<interpreter>\n")
+    assert calls == [("parse_document", {"document_path": "test.pdf", "page_numbers": [1]})]
+    assert stats["protocol_error_count"] == 0
+    assert stats["executed_action_count"] == 1
+    assert trace[-1]["arguments"] == calls[0][1]
+
+
 def test_render_page_observation_is_nonempty_and_next_generation_receives_image(monkeypatch, tmp_path):
     render_path = tmp_path / "render.png"
     Image.new("RGB", (8, 8), "white").save(render_path)
