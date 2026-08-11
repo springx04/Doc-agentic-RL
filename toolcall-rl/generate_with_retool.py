@@ -48,6 +48,7 @@ try:
         make_runtime_state_digest,
         slot_role_from_metadata,
     )
+    from bayestool.identity import make_coupling_id
     from bayestool.schema import TaskStateView
     from bayestool.training import (
         attach_bayestool_utility,
@@ -90,6 +91,7 @@ except Exception:  # pragma: no cover - baseline rollout remains importable with
     make_question_rollout_plan = None  # type: ignore[assignment]
     make_runtime_state_digest = None  # type: ignore[assignment]
     slot_role_from_metadata = None  # type: ignore[assignment]
+    make_coupling_id = None  # type: ignore[assignment]
     document_hash = None  # type: ignore[assignment]
     CleanResultCache = None  # type: ignore[assignment]
     stable_seed = None  # type: ignore[assignment]
@@ -422,8 +424,13 @@ def _bayestool_runtime_identity(sample: Sample, task_prompt: str) -> tuple[str, 
     question_match = re.search(r"(?:^|\n)Question:\s*(.*?)(?:\n\s*\n|$)", task_prompt, re.IGNORECASE | re.DOTALL)
     question = question_match.group(1).strip() if question_match else task_prompt
     task_id = metadata.get("task_id", metadata.get("id", ""))
-    coupling_payload = "|".join((digest, str(question), str(task_id or "")))
-    computed_coupling_id = "coupling-" + hashlib.sha256(coupling_payload.encode("utf-8", "surrogatepass")).hexdigest()[:24]
+    if make_coupling_id is not None:
+        computed_coupling_id = make_coupling_id(digest, task_prompt, task_id)
+    else:
+        coupling_payload = "|".join((digest, str(question), str(task_id or "")))
+        computed_coupling_id = "coupling-" + hashlib.sha256(
+            coupling_payload.encode("utf-8", "surrogatepass")
+        ).hexdigest()[:24]
     preserve_meta_coupling = bool(metadata.get("meta_episode_id") or metadata.get("meta_episode_child"))
     coupling_id = str(metadata.get("coupling_id") or computed_coupling_id) if preserve_meta_coupling else computed_coupling_id
     return digest, coupling_id

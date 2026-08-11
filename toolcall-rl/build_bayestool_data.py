@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from collections import defaultdict
 from dataclasses import replace
@@ -17,6 +16,7 @@ from bayestool.grouping import (
     make_question_rollout_plan,
     select_extra_variants,
 )
+from bayestool.identity import make_coupling_id
 from bayestool.meta_episode import build_meta_episode
 from bayestool.world import document_hash, sample_tool_world, sample_world_type
 
@@ -33,7 +33,19 @@ def _read_records(path: Path) -> list[dict[str, Any]]:
     return [dict(item) for item in value]
 
 
-def coupling_id(record: dict[str, Any]) -> str:
+def _document_for_hash(document: str, document_root: str | Path | None = None) -> str:
+    """Resolve deployment paths to local bytes without rewriting metadata paths."""
+
+    if Path(document).is_file():
+        return document
+    if document_root:
+        candidate = Path(document_root) / Path(document).name
+        if candidate.is_file():
+            return str(candidate)
+    return document
+
+
+def coupling_id(record: dict[str, Any], *, document_root: str | Path | None = None) -> str:
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     document = str(
         record.get("document_path")
@@ -42,16 +54,16 @@ def coupling_id(record: dict[str, Any]) -> str:
         or record.get("file_path")
         or ""
     )
-    question = str(record.get("question") or record.get("query") or record.get("prompt") or "")
+    task_prompt = record.get("prompt") or record.get("question") or record.get("query") or ""
     task_id = str(record.get("id") or record.get("task_id") or "")
-    payload = f"{document_hash(document)}|{question}|{task_id}"
-    return "coupling-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+    return make_coupling_id(document_hash(_document_for_hash(document, document_root)), task_prompt, task_id)
 
 
 def build_manifest(
     records: list[dict[str, Any]],
     *,
     seed: int = 42,
+    document_root: str | Path | None = None,
     world_type_probabilities: Any = None,
     session_state_probabilities: Any = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -86,7 +98,7 @@ def build_manifest(
     rolling_schedulers: dict[tuple[float, float, float, int, int], K8RollingScheduler] = {}
     coupled: list[dict[str, Any]] = []
     for record_index, record in enumerate(records):
-        cid = coupling_id(record)
+        cid = coupling_id(record, document_root=document_root)
         metadata = dict(record.get("metadata") or {})
         document = (
             record.get("document_path")
@@ -95,6 +107,7 @@ def build_manifest(
             or metadata.get("document_path")
             or ""
         )
+        document_digest = document_hash(_document_for_hash(str(document), document_root))
         sampling_context = {
             "page_count": record.get("page_count", metadata.get("page_count")),
             "tool_argument_capabilities": record.get(
@@ -200,7 +213,7 @@ def build_manifest(
         plan = replace(plan, realizations=tuple(finalized_realizations), latent_ids_finalized=True)
         metadata.update({
             "coupling_id": cid,
-            "document_hash": document_hash(document),
+            "document_hash": document_digest,
             "question_id": question_id,
             "question_rollout_plan": plan.to_dict(),
             "bayestool_variant_selection": dict(variant_selection),
@@ -288,6 +301,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--meta-output", type=Path)
+    parser.add_argument(
+        "--document-root",
+        type=Path,
+        default=None,
+        help="Local PDF root used only to resolve deployment paths for content hashing.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--world-type-probabilities",
@@ -304,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     coupled, meta = build_manifest(
         records,
         seed=args.seed,
+        document_root=args.document_root,
         world_type_probabilities=args.world_type_probabilities,
         session_state_probabilities=args.session_state_probabilities,
     )
