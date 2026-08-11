@@ -117,9 +117,33 @@ def has_repetition(text: str):
         return False
 
 
+def nominal_rollout_samples_per_prompt(args) -> int:
+    """Return the planned training-record count for one original question.
+
+    Ordinary GRPO requests ``n_samples_per_prompt`` policy samples.  The
+    explicit BayesTool planner requests that many primary realizations and
+    then expands each realization into a K-sized decision group before the
+    actor sees it.  Keep scheduler/metric estimates aligned with that
+    manifest; replica compatibility fields are intentionally not consulted.
+    """
+
+    primary_count = int(getattr(args, "n_samples_per_prompt", 1) or 1)
+    if getattr(args, "advantage_estimator", "") != "bayes_grpo":
+        return primary_count
+    group_size = int(getattr(args, "bayestool_default_group_size", 4) or 4)
+    if group_size not in {4, 8}:
+        raise ValueError(f"BayesTool decision-group K must be 4 or 8, got {group_size}")
+    return primary_count * group_size
+
+
 def compute_rollout_step(args, rollout_id):
     if args.wandb_always_use_train_step:
-        return rollout_id * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+        return (
+            rollout_id
+            * args.rollout_batch_size
+            * nominal_rollout_samples_per_prompt(args)
+            // args.global_batch_size
+        )
     return rollout_id
 
 

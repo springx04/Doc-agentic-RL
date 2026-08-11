@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, urlparse
 
 APP_DIR = Path(__file__).resolve().parent
 TOOLCALL_DIR = APP_DIR.parent
+PROJECT_DIR = TOOLCALL_DIR.parent
 STATIC_DIR = APP_DIR / "static"
 OUTPUT_DIR = APP_DIR / "outputs"
 CACHE_DIR = APP_DIR / "cache"
@@ -252,7 +253,13 @@ def run_toolrl_reference_test(payload: dict[str, Any]) -> Iterator[str]:
     This is a reference verification flow, not a general-purpose language model.
     It exists to validate the real render/OCR tool path before RL training.
     """
-    document_path = Path(str(payload.get("document_path") or "")).expanduser()
+    raw_document_path = str(payload.get("document_path") or "").strip()
+    if not raw_document_path:
+        yield event("error", message="Document path is required for the offline reference test.")
+        return
+    document_path = Path(raw_document_path).expanduser()
+    if not document_path.is_absolute():
+        document_path = (PROJECT_DIR / document_path).resolve()
     problem = _ensure_reference_document(document_path)
     if problem:
         yield event("error", message=problem)

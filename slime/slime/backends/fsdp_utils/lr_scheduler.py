@@ -167,7 +167,21 @@ def get_lr_scheduler(args, optimizer: torch.optim.Optimizer) -> FSDPLRScheduler:
     Returns:
         FSDPLRScheduler: Initialized scheduler bound to ``optimizer``.
     """
-    args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    # BayesTool's n_samples_per_prompt counts primary realizations.  The
+    # explicit question plan expands each realization into a K-sized decision
+    # group before FSDP receives the manifest; using the primary count here
+    # would make the LR schedule decay several times too quickly (and was the
+    # source of misleading expected-step estimates in small runs).
+    planned_samples_per_prompt = int(getattr(args, "n_samples_per_prompt", 1) or 1)
+    if getattr(args, "advantage_estimator", "") == "bayes_grpo":
+        group_size = int(getattr(args, "bayestool_default_group_size", 4) or 4)
+        if group_size not in {4, 8}:
+            raise ValueError(f"BayesTool decision-group K must be 4 or 8, got {group_size}")
+        planned_samples_per_prompt *= group_size
+    args.train_iters = max(
+        1,
+        args.num_rollout * args.rollout_batch_size * planned_samples_per_prompt // args.global_batch_size,
+    )
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters
     lr_decay_steps = args.lr_decay_iters

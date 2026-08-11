@@ -13,13 +13,14 @@ the rollout workers because the tools open them locally.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable
 
 
 QUESTION_KEYS = ("question", "query", "instruction", "prompt")
-DOCUMENT_KEYS = ("document_path", "file_path", "document", "image_path")
+DOCUMENT_KEYS = ("document_path", "pdf_path", "file_path", "document", "image_path")
 ANSWER_KEYS = ("answers", "acceptable_answers", "answer", "ground_truth", "label")
 
 
@@ -58,6 +59,17 @@ def _resolve_document_path(raw_path: Any, document_root: Path | None) -> str:
     return str(path)
 
 
+def _document_hash(path: str) -> str:
+    candidate = Path(path)
+    if candidate.is_file():
+        digest = hashlib.sha256()
+        with candidate.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    return hashlib.sha256(path.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def transform_record(
     record: dict[str, Any],
     *,
@@ -92,6 +104,30 @@ def transform_record(
         metadata["page_count"] = metadata.get("num_pages")
     if task_id is not None:
         metadata["task_id"] = task_id
+    # BayesTool coupling identity is derived exclusively from document/task
+    # content, never from labels or answer metadata.  This keeps coupled
+    # worlds semantically identical while allowing answer annotations to be
+    # changed in an audit without changing the injected observation stream.
+    # Recompute these identities even when an upstream manifest already has
+    # fields with the same names.  Coupled-world identity must not inherit a
+    # label-dependent or stale value from an earlier preprocessing pass.
+    metadata["document_hash"] = _document_hash(document_path)
+    coupling_payload = "|".join(
+        (
+            str(metadata["document_hash"]),
+            str(question),
+            str(task_id or ""),
+        )
+    )
+    metadata["coupling_id"] = "coupling-" + hashlib.sha256(coupling_payload.encode("utf-8")).hexdigest()[:24]
+    meta_episode_id = record.get("meta_episode_id", metadata.get("meta_episode_id"))
+    if meta_episode_id is not None:
+        metadata["meta_episode_id"] = meta_episode_id
+    question_order = record.get("question_order", metadata.get("question_order"))
+    if question_order is not None:
+        metadata["question_order"] = int(question_order)
+    if isinstance(metadata.get("meta_questions"), list):
+        metadata["meta_questions"] = [dict(item) for item in metadata["meta_questions"] if isinstance(item, dict)]
 
     prompt = (
         f"Document path: {document_path}\n"

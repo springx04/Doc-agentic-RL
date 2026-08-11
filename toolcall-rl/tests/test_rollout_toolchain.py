@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 import importlib.util
 import json
 import sys
@@ -59,6 +60,32 @@ def _load_generator(monkeypatch):
     return module, FakeSample
 
 
+def test_world_injected_failure_is_a_valid_sendable_observation(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+
+    assert module._is_world_injected_observation(
+        {"failure_origin": "world_injected", "success": False}
+    )
+    assert module._is_world_injected_observation(
+        {
+            "success": False,
+            "world_event": {"failure_origin": "world_injected"},
+        }
+    )
+    assert not module._is_world_injected_observation(
+        {"failure_origin": "real_infrastructure", "success": False}
+    )
+    assert not module._is_world_injected_observation({"success": False})
+
+
+def test_bayestool_dvoi_mapping_is_reduced_only_for_branch_ranking(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+
+    assert module._bayestool_dvoi_score({"render_page": 0.25, "ocr_region": 0.7}) == 0.7
+    assert module._bayestool_dvoi_score({"invalid": "not-a-number"}) == 0.0
+    assert module._bayestool_dvoi_score(0.4) == 0.4
+
+
 def test_image_context_compaction_keeps_follow_up_generation_possible(monkeypatch):
     module, _ = _load_generator(monkeypatch)
     segments = [
@@ -77,6 +104,85 @@ def test_image_context_compaction_keeps_follow_up_generation_possible(monkeypatc
     assert len(context) <= 68
     assert context == [0, 1, 2, 3, 4]
     assert image_data == []
+
+
+def test_observation_compaction_preserves_assistant_turn_boundary(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+    observation = list(range(2, 202))
+    segments = [
+        {
+            "action_token_ids": [1],
+            "observation_token_ids": observation,
+            "observation_suffix_token_count": 4,
+            "image_data": [],
+        }
+    ]
+
+    context, image_data = module._compact_model_context(
+        [0], segments, max_context_length=100, reserve_tokens=32
+    )
+
+    # The fitted observation is 67 tokens: a prefix plus the four-token
+    # ``<|im_end|>...assistant`` suffix.  The next request must end at the
+    # assistant turn boundary, never in the middle of the observation.
+    assert len(context) == 68
+    assert context[-4:] == observation[-4:]
+    assert image_data == []
+
+
+def test_training_trajectory_cap_preserves_suffix_alignment(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+    response = list(range(30))
+    masks = [index % 2 for index in response]
+    log_probs = [float(index) for index in response]
+    segments = [
+        {
+            "action_token_start": 0,
+            "action_token_end": 2,
+            "response_token_start": 0,
+            "response_token_end": 8,
+            "multimodal_train_input_index": None,
+        },
+        {
+            "action_token_start": 8,
+            "action_token_end": 10,
+            "response_token_start": 8,
+            "response_token_end": 16,
+            "multimodal_train_input_index": None,
+        },
+        {
+            "action_token_start": 16,
+            "action_token_end": 18,
+            "response_token_start": 16,
+            "response_token_end": 24,
+            "multimodal_train_input_index": None,
+        },
+    ]
+    action_spans = [
+        {"token_start": 0, "token_end": 2},
+        {"token_start": 8, "token_end": 10},
+        {"token_start": 16, "token_end": 18},
+        {"token_start": 24, "token_end": 30},
+    ]
+
+    capped = module._cap_training_trajectory(
+        [100, 101, 102, 103],
+        response,
+        masks,
+        log_probs,
+        segments,
+        [],
+        action_spans,
+        max_sequence_length=22,
+    )
+
+    trimmed_response, trimmed_masks, trimmed_log_probs, _, metadata = capped
+    assert trimmed_response == response[16:]
+    assert trimmed_masks == masks[16:]
+    assert trimmed_log_probs == log_probs[16:]
+    assert metadata["response_start"] == 16
+    assert metadata["training_total_length"] == 18
+    assert metadata["fallback_tail_cut"] is False
 
 
 class _FakeTokenizer:
@@ -116,6 +222,90 @@ def _sample(FakeSample, prompt="What is shown on page 1?"):
     return sample
 
 
+def test_tool_prompt_preserves_qwen_role_boundaries_and_function_schema(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "render_page",
+            "description": "Render one page.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    prompt = module.format_conversation_with_tools(
+        "Document path: fixture.pdf\nQuestion: What is shown?",
+        tools=[tool],
+        system_prompt="Inspect the document with the available tools.",
+        tool_call_format="json",
+    )
+
+    assert prompt.startswith("<|im_start|>system\nInspect the document")
+    assert "<|im_start|>systemInspect" not in prompt
+    assert "<|im_start|>user\nDocument path: fixture.pdf" in prompt
+    assert "<|im_start|>userDocument path: fixture.pdf" not in prompt
+    assert "<tools>\n{\"type\": \"function\", \"function\":" in prompt
+    assert "</tool_call><|im_end|>\n" in prompt
+    assert "exactly the keys name and arguments" in prompt
+    assert prompt.endswith("<|im_start|>assistant\n")
+
+
+def test_tool_prompt_marks_bayestool_state_read_only_and_enforces_one_action(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+
+    prompt = module.format_conversation_with_tools(
+        "Document path: fixture.pdf\nQuestion: What is shown?",
+        tools=[],
+        system_prompt="Inspect the document with the available tools.",
+        tool_call_format="json",
+    )
+
+    assert "exactly one complete action and no other text" in prompt
+    assert "read-only observation metadata" in prompt
+    assert "never copy or output them" in prompt
+
+    status = module._navigation_status_text({"visited_pages": [], "unvisited_pages": []})
+    assert "read-only context" in status
+    assert "<task_state>" not in status
+    assert "<tool_belief>" not in status
+    assert "<tool_call>" not in status
+    assert "<final>" not in status
+
+
+def test_bayestool_observation_labels_do_not_expose_copyable_metadata_tags(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+
+    block = (
+        '<task_state>{"remaining_tool_budget":3}</task_state>\n'
+        '<tool_belief>{"change_probability":0.1}</tool_belief>'
+    )
+    sanitized = module._sanitize_observation_metadata_markup(block)
+
+    assert "Task State (read-only):" in sanitized
+    assert "Tool Belief (read-only):" in sanitized
+    assert "remaining_tool_budget" in sanitized
+    assert "<task_state>" not in sanitized
+    assert "</task_state>" not in sanitized
+    assert "<tool_belief>" not in sanitized
+    assert "</tool_belief>" not in sanitized
+
+
+def test_final_guard_observation_keeps_interpreter_boundary_without_metadata_tags(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+
+    observation = module._final_guard_observation(
+        "no document page has been inspected yet",
+        {"visited_pages": [], "unvisited_pages": []},
+    )
+
+    assert observation.startswith("<interpreter>\n")
+    assert observation.endswith("\n</interpreter>")
+    assert "<task_state>" not in observation
+    assert "<tool_belief>" not in observation
+    assert "<tool_call>" not in observation
+    assert "<final>" not in observation
+
+
 def test_multi_action_and_placeholder_are_logged_without_execution(monkeypatch):
     module, _ = _load_generator(monkeypatch)
 
@@ -145,6 +335,50 @@ def test_multi_action_and_placeholder_are_logged_without_execution(monkeypatch):
     assert stats["executed_action_count"] == 0
     assert stats["invalid_action_count"] == 1
     assert stats["protocol_error_count"] == 1
+
+
+def test_function_style_tool_call_executes_with_current_document_and_page_alias(monkeypatch):
+    module, _ = _load_generator(monkeypatch)
+    navigation = module._new_navigation_state(
+        "Document path: test.pdf\nQuestion: What is shown?"
+    )
+    navigation["page_count"] = 1
+    navigation["unvisited_pages"] = [1]
+    calls = []
+
+    async def fake_tool(name, arguments):
+        calls.append((name, dict(arguments)))
+        return json.dumps(
+            {
+                "status": "ok",
+                "tool": name,
+                "page_count": 1,
+                "returned_pages": [1],
+                "pages": [{"page_number": 1, "markdown": "## Page 1\n\nEvidence"}],
+                "document_has_unreturned_pages": False,
+                "content_truncated": False,
+            }
+        )
+
+    monkeypatch.setattr(module.tool_registry, "execute_tool", fake_tool)
+    trace = []
+    stats = {}
+    observation, done = asyncio.run(
+        module.execute_predictions(
+            '<tool_call>parse_document{"page":0}</tool_call>',
+            trace,
+            stats,
+            turn=1,
+            navigation_state=navigation,
+        )
+    )
+
+    assert done is False
+    assert observation.startswith("<interpreter>\n")
+    assert calls == [("parse_document", {"document_path": "test.pdf", "page_numbers": [1]})]
+    assert stats["protocol_error_count"] == 0
+    assert stats["executed_action_count"] == 1
+    assert trace[-1]["arguments"] == calls[0][1]
 
 
 def test_render_page_observation_is_nonempty_and_next_generation_receives_image(monkeypatch, tmp_path):
@@ -245,6 +479,243 @@ def test_empty_generation_keeps_backend_stop_token_diagnostics(monkeypatch):
     assert result.metadata["exclude_from_group_statistics"] is True
 
 
+def test_bayestool_branch_uses_shared_prefix_and_real_candidate_tokens(monkeypatch):
+    current = '<tool_call>{"name":"render_page","arguments":{"document_path":"/workspace/a.pdf","page_number":1}}</tool_call>'
+    alternate = '<tool_call>{"name":"extract_table","arguments":{"document_path":"/workspace/a.pdf","page_number":1}}</tool_call>'
+    third = '<tool_call>{"name":"ocr_region","arguments":{"document_path":"/workspace/a.pdf","page_number":1,"bbox":[0,0,1,1]}}</tool_call>'
+    tokenizer = _FakeTokenizer({(101,): current, (102,): alternate, (103,): third})
+    module, FakeSample = _load_generator(monkeypatch)
+    FakeSample.Status.PENDING = "pending"
+    state = SimpleNamespace(tokenizer=tokenizer)
+    responses = iter(
+        [
+            {"meta_info": {"finish_reason": {"type": "stop"}, "output_token_logprobs": [[-0.2, 102]]}},
+            {"meta_info": {"finish_reason": {"type": "stop"}, "output_token_logprobs": [[-0.3, 103]]}},
+        ]
+    )
+
+    async def fake_post(url, payload):
+        return next(responses)
+
+    async def fake_generate(args, child, sampling_params, evaluation=False):
+        child.metadata["fake_branch_generation"] = True
+        return child
+
+    monkeypatch.setattr(module, "post", fake_post)
+    monkeypatch.setattr(module, "generate", fake_generate)
+    from bayestool.config import default_config
+
+    config = replace(
+        default_config(enabled=True),
+        decision_regret_threshold=-1.0,
+        branch_probability_when_eligible=1.0,
+        max_action_candidates=3,
+        max_siblings=3,
+    )
+    belief = module.BeliefRuntime(config, document_digest="doc", seed=4)
+    sample = _sample(FakeSample, "Question")
+    sample.index = 7
+    sample.group_index = 2
+    sample.status = FakeSample.Status.PENDING
+    sample.metadata["sibling_group_id"] = "base-group"
+    checkpoint = module._capture_bayestool_branch_checkpoint(
+        prompt_token_ids=[1, 2],
+        context_token_ids=[1, 2, 3],
+        context_image_data=[],
+        context_segments=[],
+        response="prefix",
+        response_token_ids=[3],
+        loss_masks=[1],
+        rollout_log_probs=[-0.1],
+        current_images=[],
+        multimodal_train_inputs_buffer=[],
+        execution_trace=[],
+        action_log={"actions": []},
+        generation_steps=[],
+        step_action_spans=[],
+        navigation_state={"question_type": "table", "remaining_tool_budget": 5},
+        world_runtime=None,
+        belief_runtime=belief,
+        bayes_document_digest="doc",
+        bayes_coupling_id="coupling",
+        world_sample_index=0,
+        turn=0,
+        tool_call_count=0,
+        max_tool_steps=8,
+        config=config,
+    )
+    children, event = asyncio.run(
+        module._launch_bayestool_branches(
+            args=SimpleNamespace(),
+            state=state,
+            url="http://router/generate",
+            sample=sample,
+            sampling_params={"max_new_tokens": 32},
+            evaluation=False,
+            checkpoint=checkpoint,
+            current_text=current,
+            current_token_ids=[101],
+            current_log_probs=[-0.1],
+            im_end_id=999,
+            decision_controller=module.DecisionController(config, seed=1),
+            bayes_config=config,
+        )
+    )
+    assert event["branch_triggered"] is True
+    assert len(children) == 2
+    assert all(child.metadata["bayestool_branch_shared_prefix"] for child in children)
+    assert all(child.metadata["bayestool_branch_prefix_hash"] == checkpoint["prefix_hash"] for child in children)
+    assert all(child.metadata["fake_branch_generation"] for child in children)
+    assert all(child.metadata["bayestool_branch_action_key"] for child in children)
+    for child in children:
+        module._BAYES_BRANCH_CHECKPOINTS.pop(child.metadata["bayestool_branch_resume_id"], None)
+
+
+def test_explicit_plan_force_branch_constructs_exact_k_even_when_gate_would_skip(monkeypatch):
+    module, FakeSample = _load_generator(monkeypatch)
+    FakeSample.Status.PENDING = "pending"
+    from bayestool.config import default_config
+    from bayestool.grouping import make_question_rollout_plan
+
+    def action(tool_name: str) -> dict[str, object]:
+        return {
+            "kind": "tool",
+            "tool": tool_name,
+            "arguments": {"document_path": "/workspace/a.pdf", "page_number": 1},
+        }
+
+    raw = {
+        name: module._bayestool_action_text(action(name))
+        for name in ("render_page", "extract_table", "ocr_region", "detect_layout")
+    }
+    candidates = [
+        {
+            "key": module.canonical_action_key(action(name)),
+            "action": action(name),
+            "raw": raw[name],
+            "token_ids": [100 + index],
+            "log_probs": [-0.1],
+            "source": "test",
+        }
+        for index, name in enumerate(raw)
+    ]
+    config = replace(
+        default_config(enabled=True),
+        default_group_size=4,
+        max_action_candidates=4,
+        max_siblings=4,
+        branch_probability_when_eligible=0.0,
+    )
+    belief = module.BeliefRuntime(config, document_digest="doc", seed=9)
+    sample = _sample(FakeSample, "Question")
+    sample.index = 3
+    sample.status = FakeSample.Status.PENDING
+    sample.metadata.update(
+        {
+            "question_rollout_plan": make_question_rollout_plan("q", group_size=4).to_dict(),
+            "decision_group_size": 4,
+            "question_id": "q",
+            "world_slot_role": "healthy",
+            "variant_id": "base",
+        }
+    )
+    checkpoint = module._capture_bayestool_branch_checkpoint(
+        prompt_token_ids=[1, 2],
+        context_token_ids=[1, 2, 3],
+        context_image_data=[],
+        context_segments=[],
+        response="prefix",
+        response_token_ids=[3],
+        loss_masks=[1],
+        rollout_log_probs=[-0.1],
+        current_images=[],
+        multimodal_train_inputs_buffer=[],
+        execution_trace=[],
+        action_log={"actions": []},
+        generation_steps=[],
+        step_action_spans=[],
+        navigation_state={"question_type": "table", "remaining_tool_budget": 5},
+        world_runtime=None,
+        belief_runtime=belief,
+        bayes_document_digest="doc",
+        bayes_coupling_id="coupling",
+        world_sample_index=0,
+        turn=0,
+        tool_call_count=0,
+        max_tool_steps=8,
+        config=config,
+    )
+
+    async def fake_generate(args, child, sampling_params, evaluation=False):
+        return child
+
+    monkeypatch.setattr(module, "generate", fake_generate)
+    children, event = asyncio.run(
+        module._launch_bayestool_branches(
+            args=SimpleNamespace(),
+            state=SimpleNamespace(tokenizer=None),
+            url="http://router/generate",
+            sample=sample,
+            sampling_params={"max_new_tokens": 32},
+            evaluation=False,
+            checkpoint=checkpoint,
+            current_text=raw["render_page"],
+            current_token_ids=[100],
+            current_log_probs=[-0.1],
+            im_end_id=None,
+            decision_controller=module.DecisionController(config, seed=2),
+            bayes_config=config,
+            candidates_override=candidates,
+            force_branch=True,
+        )
+    )
+    assert event["force_branch"] is True
+    assert event["target_group_size"] == 4
+    assert len(children) == 3
+    for child in children:
+        module._BAYES_BRANCH_CHECKPOINTS.pop(child.metadata["bayestool_branch_resume_id"], None)
+
+
+def test_bayestool_filter_and_q_checkpoints_load_into_rollout_worker(monkeypatch, tmp_path):
+    import torch
+
+    module, _ = _load_generator(monkeypatch)
+    from bayestool.belief import ToolWorldFilterNetwork
+    from bayestool.config import default_config
+    from bayestool.decision import BayesQHead, Q_FEATURE_SCHEMA_VERSION
+
+    config = default_config(enabled=True)
+    belief_path = tmp_path / "belief.pt"
+    q_path = tmp_path / "qhead.pt"
+    torch.save(
+        {
+            "model_state": ToolWorldFilterNetwork(config).state_dict(),
+            "belief_model_version": "stage-a-test",
+        },
+        belief_path,
+    )
+    torch.save(
+        {
+            "model_state": BayesQHead().state_dict(),
+            "model_version": "q-test",
+            "q_feature_schema_version": Q_FEATURE_SCHEMA_VERSION,
+        },
+        q_path,
+    )
+
+    filter_model, filter_version, q_head, q_version = module._load_bayestool_models(
+        SimpleNamespace(
+            bayestool_belief_checkpoint=str(belief_path),
+            bayestool_q_checkpoint=str(q_path),
+        ),
+        config,
+    )
+    assert filter_model is not None
+    assert filter_version == "stage-a-test"
+    assert q_head is not None
+    assert q_version == "q-test"
+
+
 def test_simple_prompt_generation_diagnostics_survive_100_calls(monkeypatch):
     final_action = "<final>BURKE</final>"
     tokenizer = _FakeTokenizer({(101,): final_action})
@@ -280,8 +751,13 @@ def test_simple_prompt_generation_diagnostics_survive_100_calls(monkeypatch):
         assert step["raw_generation_text"] == final_action
         assert step["output_token_count"] > 0
         assert step["finish_reason"] == "stop"
-        assert result.rollout_status == "completed"
-    assert call_count == 100
+        assert result.rollout_status == "search_budget_exhausted"
+        assert result.metadata["premature_final"] is True
+    expected_turns = max(
+        int(module.TOOL_CONFIGS["max_turns"]),
+        int(module.TOOL_CONFIGS["max_tool_calls"]) + 2,
+    )
+    assert call_count == 100 * expected_turns
 
 
 def test_generate_render_crop_final_calls_backend_after_each_image_tool(monkeypatch, tmp_path):
@@ -396,6 +872,11 @@ def test_tool_and_generation_errors_are_excluded_from_rl(monkeypatch):
     assert reward["valid_for_rl"] is False
     assert reward["rollout_status"] == "generation_error"
     assert reward["score"] == 0.0
+
+    batched = asyncio.run(module.reward_func(SimpleNamespace(prm_enable=False), [result]))
+    assert isinstance(batched, list)
+    assert batched[0]["valid_for_rl"] is False
+    assert batched[0]["rollout_status"] == "generation_error"
 
 
 def test_evidence_sufficiency_turns_true_only_for_a_local_field_value(monkeypatch):
@@ -1038,6 +1519,33 @@ def test_final_before_first_document_read_is_blocked(monkeypatch):
     module, FakeSample = _load_generator(monkeypatch)
     actions = [
         "<final>None</final>",
+        '<tool_call>{"name":"parse_document","arguments":{"document_path":"test.pdf","page_numbers":[1]}}</tool_call>',
+        "<final>BURKE</final>",
+    ]
+
+    async def fake_tool(name, arguments):
+        return _page_result(1, page_count=1, markdown="Supplier: BURKE")
+
+    result, calls = _run_scripted_generate(
+        monkeypatch,
+        module,
+        FakeSample,
+        "Document path: test.pdf\nQuestion: Who is the supplier?",
+        actions,
+        fake_tool,
+    )
+
+    assert len(calls) == 3
+    assert result.rollout_status == "completed"
+    assert result.metadata["premature_final"] is True
+    assert result.metadata["visited_pages"] == [1]
+    assert result.metadata["final_supported_by_evidence"] is True
+
+
+def test_positive_final_before_first_document_read_is_blocked(monkeypatch):
+    module, FakeSample = _load_generator(monkeypatch)
+    actions = [
+        "<final>BURKE</final>",
         '<tool_call>{"name":"parse_document","arguments":{"document_path":"test.pdf","page_numbers":[1]}}</tool_call>',
         "<final>BURKE</final>",
     ]

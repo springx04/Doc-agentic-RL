@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import random
 from argparse import Namespace
@@ -12,7 +13,7 @@ from transformers import AutoConfig
 
 from slime.ray.train_actor import TrainRayActor
 from slime.utils import logging_utils, train_dump_utils, train_metric_utils
-from slime.utils.action_training import build_action_training_overrides
+from slime.utils.action_training import apply_action_training_overrides, build_action_training_overrides
 from slime.utils.data import get_minimum_num_micro_batch_size, process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.logging_utils import init_tracking
@@ -26,7 +27,9 @@ from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 
 from . import checkpoint
 from .data_packing import pack_sequences, unpack_sequences
+from .device_utils import scatter_selected_values
 from .lr_scheduler import get_lr_scheduler
+from .optimizer_utils import build_fsdp_adamw
 from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor
 
 logger = logging.getLogger(__name__)
@@ -126,13 +129,14 @@ class FSDPTrainRayActor(TrainRayActor):
         )
 
         if args.optimizer == "adam":
-            self.optimizer = torch.optim.AdamW(
+            self.optimizer = build_fsdp_adamw(
                 optim_params,
                 lr=args.lr,
                 betas=(args.adam_beta1, args.adam_beta2),
                 eps=args.adam_eps,
                 weight_decay=args.weight_decay,
             )
+            logger.info("FSDP AdamW configured with foreach=False and fused=False for bounded optimizer memory")
         else:
             raise ValueError(f"Unsupported optimizer: {args.optimizer}. Supported options: 'adam'")
 
@@ -141,6 +145,12 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.global_step = 0
         self.micro_step = 0
+        self.bayestool_questions_seen = 0
+        self.bayestool_next_checkpoint_question = max(
+            1,
+            int(getattr(args, "bayestool_checkpoint_interval_questions", 100) or 100),
+        )
+        self.last_rollout_score = None
 
         checkpoint_payload = checkpoint.load(self)
 
@@ -326,7 +336,24 @@ class FSDPTrainRayActor(TrainRayActor):
         if self.args.debug_rollout_only or self.args.save is None:
             return
 
+        # The train loop may call this hook every rollout so that checkpoint
+        # cadence is based on valid questions rather than on a fixed number of
+        # optimizer/rollout iterations.  Only the actual threshold crossing
+        # writes a model; the final rollout always forces one last checkpoint.
+        if (
+            getattr(self.args, "bayestool_enable", False)
+            and not force_sync
+            and self.bayestool_questions_seen < self.bayestool_next_checkpoint_question
+        ):
+            return
+
         assert not self.args.async_save, "FSDPTrainRayActor does not support async_save yet."
+        if getattr(self.args, "bayestool_enable", False):
+            interval = max(
+                1,
+                int(getattr(self.args, "bayestool_checkpoint_interval_questions", 100) or 100),
+            )
+            self.bayestool_next_checkpoint_question = self.bayestool_questions_seen + interval
         checkpoint.save(self, rollout_id)
 
     def _compute_log_prob(
@@ -371,13 +398,10 @@ class FSDPTrainRayActor(TrainRayActor):
                 for batch in self.prof.iterate_train_log_probs(
                     tqdm(packed_batches, desc=f"{store_prefix}log_probs", disable=dist.get_rank() != 0)
                 ):
-                    model_args = self._get_model_inputs_args(batch)
-                    logits = active_model(**model_args).logits.squeeze(0).float()
-                    log_probs_result, entropy_result = get_logprob_and_entropy(
-                        logits=logits,
-                        target_tokens=batch["tokens"],
-                        allow_compile=not self.args.true_on_policy_mode,
-                        temperature=self.args.rollout_temperature,
+                    log_probs_result, entropy_result = self._forward_log_probs(
+                        active_model,
+                        batch,
+                        compute_entropy=self.args.entropy_coef != 0.0,
                     )
                     batch[f"{store_prefix}log_probs"] = log_probs_result
                     if store_prefix == "":
@@ -414,18 +438,41 @@ class FSDPTrainRayActor(TrainRayActor):
 
         packed_batches = []
         mbs_size_list = []
-        local_batch_size = self.args.global_batch_size // self.dp_size
-        assert (
-            self.args.global_batch_size % self.dp_size == 0
-        ), f"global_batch_size {self.args.global_batch_size} is not divisible by dp_world_size {self.dp_size}"
-        # Use global_batch_size for splitting when max_tokens_per_gpu is enabled
+        manifest = rollout_data.get("bayes_batch_sizes")
+        if manifest:
+            global_batch_sizes = [int(value) for value in manifest]
+            if any(value <= 0 or value % self.dp_size for value in global_batch_sizes):
+                raise ValueError(
+                    f"BayesTool batch manifest must be positive and divisible by dp_size={self.dp_size}: {manifest}"
+                )
+            expected_local_samples = sum(global_batch_sizes) // self.dp_size
+            if expected_local_samples != len(tokens):
+                raise ValueError(
+                    f"BayesTool local manifest expects {expected_local_samples} samples, got {len(tokens)}"
+                )
+            local_batch_sizes = [value // self.dp_size for value in global_batch_sizes]
+        else:
+            global_batch_sizes = [self.args.global_batch_size] * (
+                len(tokens) // (self.args.global_batch_size // self.dp_size)
+            )
+            local_batch_sizes = [self.args.global_batch_size // self.dp_size] * len(global_batch_sizes)
+            assert (
+                self.args.global_batch_size % self.dp_size == 0
+            ), f"global_batch_size {self.args.global_batch_size} is not divisible by dp_world_size {self.dp_size}"
+
+        # Use the actual per-step local sizes for dynamic microbatching.  All
+        # ranks have the same manifest length, so the MAX reduction preserves
+        # identical collective rounds even when token lengths differ.
         if self.args.use_dynamic_batch_size:
             max_tokens = self.args.max_tokens_per_gpu
-
-            for i in range(0, len(tokens), local_batch_size):
+            for start, local_batch_size in zip(
+                [sum(local_batch_sizes[:index]) for index in range(len(local_batch_sizes))],
+                local_batch_sizes,
+                strict=True,
+            ):
                 mbs_size_list.append(
                     get_minimum_num_micro_batch_size(
-                        [len(t) for t in rollout_data["tokens"][i : i + local_batch_size]],
+                        [len(t) for t in rollout_data["tokens"][start : start + local_batch_size]],
                         max_tokens,
                     )
                 )
@@ -433,12 +480,18 @@ class FSDPTrainRayActor(TrainRayActor):
             dist.all_reduce(num_microbatches, op=dist.ReduceOp.MAX, group=self.dp_group)
             num_microbatches = num_microbatches.tolist()
         else:
-            num_microbatches = [self.args.global_batch_size // (self.args.micro_batch_size * self.dp_size)] * (
-                len(tokens) // local_batch_size
-            )
+            num_microbatches = [
+                max(1, math.ceil(local_batch_size / max(1, self.args.micro_batch_size)))
+                for local_batch_size in local_batch_sizes
+            ]
 
         start = 0
-        for mbs_size in num_microbatches:
+        for global_batch_size, local_batch_size, mbs_size in zip(
+            global_batch_sizes,
+            local_batch_sizes,
+            num_microbatches,
+            strict=True,
+        ):
             end = start + local_batch_size
             packed_batches.extend(
                 pack_sequences(
@@ -458,8 +511,16 @@ class FSDPTrainRayActor(TrainRayActor):
                         else None
                     ),
                     num_packs=mbs_size,
+                    bayes_loss_weights=(
+                        rollout_data["bayes_loss_weights"][start:end]
+                        if "bayes_loss_weights" in rollout_data
+                        else None
+                    ),
                 )
             )
+            for packed_batch in packed_batches[-mbs_size:]:
+                packed_batch["_bayes_global_batch_size"] = int(global_batch_size)
+                packed_batch["_bayes_weighted_loss"] = "bayes_loss_weights" in rollout_data
             start = end
         grad_accum = list(accumulate(num_microbatches))
 
@@ -529,7 +590,123 @@ class FSDPTrainRayActor(TrainRayActor):
             )
 
     def _train_core(self, rollout_id: int, rollout_data) -> None:
-        if self.args.advantage_estimator in ["grpo", "gspo"]:
+        if self.args.advantage_estimator == "bayes_grpo":
+            # Bayes-ARPO uses the raw complete-trajectory utility and a
+            # weighted sibling baseline.  The FSDP path does not call the
+            # Megatron advantage helper, so compute the same estimator here
+            # before packing the response-space tensors.
+            raw_rewards = list(rollout_data.get("raw_reward", rollout_data["rewards"]))
+            local_count = len(rollout_data["response_lengths"])
+            partition = rollout_data.get("_partition")
+            if len(raw_rewards) != local_count:
+                if partition is not None and len(partition) == local_count:
+                    raw_rewards = [raw_rewards[int(index)] for index in partition]
+                else:
+                    raw_rewards = list(rollout_data["rewards"])
+            # _packed_data expects raw_reward to be aligned with the local
+            # partition, while the rollout splitter intentionally preserves
+            # the global raw-reward list for other backends.
+            rollout_data["raw_reward"] = raw_rewards
+            grouping_report = rollout_data.get("bayes_grouping_report")
+            if isinstance(grouping_report, dict):
+                self.bayestool_questions_seen += int(grouping_report.get("question_count", 0) or 0)
+
+            # Save a global rollout score for checkpoint selection.  The value
+            # is deliberately labelled as a training score; final checkpoint
+            # selection still uses the independent fixed 200-question eval.
+            score_stats = torch.tensor(
+                [float(sum(raw_rewards)), float(len(raw_rewards))],
+                dtype=torch.float64,
+                device=torch.cuda.current_device(),
+            )
+            dist.all_reduce(score_stats, op=dist.ReduceOp.SUM, group=self.dp_group)
+            self.last_rollout_score = (
+                float((score_stats[0] / score_stats[1].clamp_min(1.0)).item())
+                if dist.get_rank() == 0
+                else None
+            )
+            group_ids = (
+                rollout_data.get("bayes_group_ids")
+                or rollout_data.get("sibling_group_ids")
+                or rollout_data.get("group_indices")
+            )
+            if group_ids is None or len(group_ids) != len(raw_rewards):
+                group_ids = list(range(len(raw_rewards)))
+            sibling_weights = rollout_data.get("bayes_sibling_weights") or [1.0] * len(raw_rewards)
+            if len(sibling_weights) != len(raw_rewards):
+                sibling_weights = [1.0] * len(raw_rewards)
+
+            precomputed_advantages = rollout_data.get("bayes_advantages")
+            precomputed_baselines = rollout_data.get("bayes_sibling_baselines")
+            if precomputed_advantages is not None and len(precomputed_advantages) != local_count:
+                if partition is not None and len(partition) == local_count:
+                    precomputed_advantages = [precomputed_advantages[int(index)] for index in partition]
+            if precomputed_baselines is not None and len(precomputed_baselines) != local_count:
+                if partition is not None and len(partition) == local_count:
+                    precomputed_baselines = [precomputed_baselines[int(index)] for index in partition]
+
+            if precomputed_advantages is not None and len(precomputed_advantages) == local_count:
+                # The rollout manager computed this over all siblings before
+                # DP splitting.  This is the only correct FSDP path when a
+                # group is distributed one sibling per rank.
+                sibling_advantages = [float(value) for value in precomputed_advantages]
+                baselines = (
+                    [float(value) for value in precomputed_baselines]
+                    if precomputed_baselines is not None and len(precomputed_baselines) == local_count
+                    else [0.0] * local_count
+                )
+            else:
+                logger.warning(
+                    "BayesTool precomputed global advantages missing; using local fallback groups. "
+                    "This path is only compatible with a single-rank/debug rollout."
+                )
+                grouped: dict[str, list[int]] = {}
+                for index, group_id in enumerate(group_ids):
+                    grouped.setdefault(str(group_id), []).append(index)
+
+                baselines = [0.0] * len(raw_rewards)
+                sibling_advantages = [0.0] * len(raw_rewards)
+                for indices in grouped.values():
+                    weights = [max(0.0, float(sibling_weights[index])) for index in indices]
+                    denominator = sum(weights) or float(len(indices))
+                    baseline = sum(
+                        weight * float(raw_rewards[index])
+                        for index, weight in zip(indices, weights, strict=True)
+                    ) / denominator
+                    for index in indices:
+                        baselines[index] = baseline
+                        sibling_advantages[index] = float(raw_rewards[index]) - baseline
+
+            advantages = []
+            effective_loss_masks = []
+            consumed_action_indices = []
+            action_rewards = rollout_data.get("action_rewards", [])
+            action_token_spans = rollout_data.get("action_token_spans", [])
+            for i, sequence_advantage_value in enumerate(sibling_advantages):
+                response_length = int(rollout_data["response_lengths"][i])
+                sequence_advantage = torch.tensor(
+                    [sequence_advantage_value] * response_length,
+                    dtype=torch.float32,
+                )
+                loss_mask = list(rollout_data["loss_masks"][i])
+                signal = apply_action_training_overrides(
+                    response_length=response_length,
+                    advantages=sequence_advantage,
+                    returns=sequence_advantage,
+                    loss_mask=loss_mask,
+                    assistant_token_masks=action_token_spans[i] if i < len(action_token_spans) else [],
+                    action_rewards=action_rewards[i] if i < len(action_rewards) else [],
+                )
+                advantages.append(signal["advantages"])
+                effective_loss_masks.append(signal["loss_mask"])
+                consumed_action_indices.append(signal["consumed_action_indices"])
+
+            rollout_data["loss_masks"] = effective_loss_masks
+            rollout_data["advantages"] = rollout_data["returns"] = advantages
+            rollout_data["action_reward_consumed"] = consumed_action_indices
+            rollout_data["bayes_sibling_baselines"] = baselines
+            rollout_data["bayes_sibling_advantages"] = sibling_advantages
+        elif self.args.advantage_estimator in ["grpo", "gspo"]:
             advantages = []
             effective_loss_masks = []
             consumed_action_indices = []
@@ -564,6 +741,25 @@ class FSDPTrainRayActor(TrainRayActor):
         else:
             raise NotImplementedError(f"Unsupported advantage_estimator {self.args.advantage_estimator}")
 
+        if dist.get_rank() == 0:
+            sequence_lengths = sorted(len(sequence) for sequence in rollout_data["tokens"])
+            p95_index = min(len(sequence_lengths) - 1, max(0, int(len(sequence_lengths) * 0.95) - 1))
+            multimodal_count = sum(
+                1
+                for value in rollout_data.get("multimodal_train_inputs", [])
+                if isinstance(value, dict) and value
+            )
+            logger.info(
+                "TRAIN_ROLLOUT_LENGTHS rollout_id=%s samples=%s max_tokens=%s p95_tokens=%s "
+                "total_tokens=%s multimodal_samples=%s",
+                rollout_id,
+                len(sequence_lengths),
+                max(sequence_lengths, default=0),
+                sequence_lengths[p95_index] if sequence_lengths else 0,
+                sum(sequence_lengths),
+                multimodal_count,
+            )
+
         packed_batches, grad_accum = self._packed_data(rollout_data)
 
         assert (
@@ -582,12 +778,50 @@ class FSDPTrainRayActor(TrainRayActor):
             for mbs_id, packed_batch in self.prof.iterate_train_actor(
                 enumerate(tqdm(packed_batches, desc="actor_train", disable=dist.get_rank() != 0))
             ):
-                self._train_step(
-                    packed_batch=packed_batch,
-                    reported_accum=reported_accum,
-                    mbs_id=mbs_id,
-                    grad_accum=grad_accum,
-                )
+                try:
+                    self._train_step(
+                        packed_batch=packed_batch,
+                        reported_accum=reported_accum,
+                        mbs_id=mbs_id,
+                        grad_accum=grad_accum,
+                    )
+                except RuntimeError as exc:
+                    if "out of memory" not in str(exc).lower():
+                        raise
+                    try:
+                        cu_seqlens = packed_batch.get("cu_seqlens")
+                        sequence_lengths = (
+                            (cu_seqlens[1:] - cu_seqlens[:-1]).detach().cpu().tolist()
+                            if isinstance(cu_seqlens, torch.Tensor)
+                            else []
+                        )
+                        multimodal_shapes = {
+                            key: tuple(value.shape)
+                            for key, value in packed_batch.get("multimodal_train_inputs", {}).items()
+                            if isinstance(value, torch.Tensor)
+                        }
+                        free_memory, total_memory = torch.cuda.mem_get_info(torch.cuda.current_device())
+                        logger.error(
+                            "FSDP_TRAIN_OOM_DIAGNOSTIC rollout_id=%s mbs_id=%s rank=%s "
+                            "packed_tokens=%s sequence_lengths=%s multimodal_shapes=%s "
+                            "allocated_bytes=%s reserved_bytes=%s free_bytes=%s total_bytes=%s",
+                            rollout_id,
+                            mbs_id,
+                            dist.get_rank(),
+                            int(packed_batch.get("tokens").numel()) if isinstance(packed_batch.get("tokens"), torch.Tensor) else None,
+                            sequence_lengths,
+                            multimodal_shapes,
+                            torch.cuda.memory_allocated(),
+                            torch.cuda.memory_reserved(),
+                            free_memory,
+                            total_memory,
+                            exc_info=True,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "FSDP_TRAIN_OOM_DIAGNOSTIC failed while collecting memory details"
+                        )
+                    raise
 
         self.prof.step(rollout_id=rollout_id)
 
@@ -612,17 +846,14 @@ class FSDPTrainRayActor(TrainRayActor):
             self.ref_model.cpu()
 
     def _train_step(self, packed_batch, reported_accum, mbs_id, grad_accum):
-        # Prepare model inputs
-        model_args = self._get_model_inputs_args(packed_batch)
-        logits = self.model(**model_args).logits.squeeze(0).float()
-
-        # Compute log probs and entropy
+        # Compute log probs and entropy.  Qwen3-VL can return logits only for
+        # the response positions; keeping the multimodal prompt logits would
+        # allocate [sequence_length, vocab_size] even though every prompt
+        # token has a zero loss mask.
         need_entropy = self.args.entropy_coef != 0.0
-        log_probs, entropy_result = get_logprob_and_entropy(
-            logits=logits,
-            target_tokens=packed_batch["tokens"],
-            allow_compile=not self.args.true_on_policy_mode,
-            temperature=self.args.rollout_temperature,
+        log_probs, entropy_result = self._forward_log_probs(
+            self.model,
+            packed_batch,
             compute_entropy=need_entropy,
         )
         packed_batch["cur_log_probs"] = log_probs
@@ -646,6 +877,10 @@ class FSDPTrainRayActor(TrainRayActor):
         advantages = torch.cat([batch["advantages"] for batch in unpacked_batches], dim=0)
         loss_masks = [batch["loss_masks"].to(device=log_probs.device) for batch in unpacked_batches]
         response_lengths = [batch["response_lengths"] for batch in unpacked_batches]
+        has_bayes_weights = any("bayes_loss_weights" in batch for batch in unpacked_batches)
+        bayes_loss_weights = [
+            float(batch.get("bayes_loss_weights", 1.0)) for batch in unpacked_batches
+        ]
 
         advantages = advantages.to(device=log_probs.device)
         old_log_probs = old_log_probs.to(device=log_probs.device)
@@ -689,20 +924,35 @@ class FSDPTrainRayActor(TrainRayActor):
             pg_clipfrac = sum_of_token(pg_clipfrac, response_lengths, loss_masks)
             ppo_kl = sum_of_token(ppo_kl.abs(), response_lengths, loss_masks)
         else:
-            pg_loss = sum_of_sample_mean(pg_loss, response_lengths, loss_masks)
-            pg_clipfrac = sum_of_sample_mean(pg_clipfrac, response_lengths, loss_masks)
-            ppo_kl = sum_of_sample_mean(ppo_kl.abs(), response_lengths, loss_masks)
+            reducer = weighted_sum_of_sample_mean if has_bayes_weights else sum_of_sample_mean
+            if has_bayes_weights:
+                pg_loss = reducer(pg_loss, response_lengths, loss_masks, bayes_loss_weights)
+                pg_clipfrac = reducer(pg_clipfrac, response_lengths, loss_masks, bayes_loss_weights)
+                ppo_kl = reducer(ppo_kl.abs(), response_lengths, loss_masks, bayes_loss_weights)
+            else:
+                pg_loss = reducer(pg_loss, response_lengths, loss_masks)
+                pg_clipfrac = reducer(pg_clipfrac, response_lengths, loss_masks)
+                ppo_kl = reducer(ppo_kl.abs(), response_lengths, loss_masks)
 
         # Only compare rollout vs. train log probs when they originate from different stages.
         train_rollout_logprob_abs_diff = None
         if not self.args.use_rollout_logprobs and rollout_log_probs is not None:
             train_rollout_logprob_abs_diff = (old_log_probs - rollout_log_probs).abs()
-            train_rollout_logprob_abs_diff = sum_of_sample_mean(
-                train_rollout_logprob_abs_diff, response_lengths, loss_masks
-            ).detach()
+            if has_bayes_weights:
+                train_rollout_logprob_abs_diff = weighted_sum_of_sample_mean(
+                    train_rollout_logprob_abs_diff, response_lengths, loss_masks, bayes_loss_weights
+                ).detach()
+            else:
+                train_rollout_logprob_abs_diff = sum_of_sample_mean(
+                    train_rollout_logprob_abs_diff, response_lengths, loss_masks
+                ).detach()
 
         entropy = torch.cat([batch["entropy"] for batch in unpacked_batches], dim=0)
-        entropy_loss = sum_of_sample_mean(entropy, response_lengths, loss_masks)
+        entropy_loss = (
+            weighted_sum_of_sample_mean(entropy, response_lengths, loss_masks, bayes_loss_weights)
+            if has_bayes_weights
+            else sum_of_sample_mean(entropy, response_lengths, loss_masks)
+        )
 
         loss = pg_loss - self.args.entropy_coef * entropy_loss
 
@@ -717,7 +967,11 @@ class FSDPTrainRayActor(TrainRayActor):
                 kl_loss_type=self.args.kl_loss_type,
                 importance_ratio=importance_ratio,
             )
-            kl_loss = sum_of_sample_mean(kl, response_lengths, loss_masks)
+            kl_loss = (
+                weighted_sum_of_sample_mean(kl, response_lengths, loss_masks, bayes_loss_weights)
+                if has_bayes_weights
+                else sum_of_sample_mean(kl, response_lengths, loss_masks)
+            )
 
             loss = loss + self.args.kl_loss_coef * kl_loss
 
@@ -738,8 +992,18 @@ class FSDPTrainRayActor(TrainRayActor):
         if self.args.use_opsm:
             reported["opsm_clipfrac"] = opsm_clipfrac
 
-        # Scale loss for gradient accumulation
-        loss = loss * self.dp_size / self.args.global_batch_size
+        # BayesTool weights are normalized to sum to one within the complete
+        # question batch.  Multiply by DP size so the FSDP all-reduce produces
+        # the same objective as a single-process weighted sum.  Legacy PPO
+        # keeps its historical sample-count scaling.
+        current_global_batch_size = int(
+            packed_batch.get("_bayes_global_batch_size", self.args.global_batch_size)
+        )
+        loss = loss * (
+            self.dp_size
+            if has_bayes_weights
+            else self.dp_size / current_global_batch_size
+        )
         loss.backward()
 
         # Accumulate reported metrics (store tensors for later mean)
@@ -762,8 +1026,9 @@ class FSDPTrainRayActor(TrainRayActor):
             reduced_aggregated = [None] * self.dp_size
             dist.all_gather_object(reduced_aggregated, aggregated, group=self.dp_group)
             aggregated = {}
+            metric_denominator = 1.0 if has_bayes_weights else float(current_global_batch_size)
             for k in reported_accum.keys():
-                aggregated[k] = sum([r[k] for r in reduced_aggregated]) / (self.args.global_batch_size)
+                aggregated[k] = sum([r[k] for r in reduced_aggregated]) / metric_denominator
             reported_accum.clear()
             if dist.get_rank() == 0:
                 log_dict = {
@@ -866,7 +1131,83 @@ class FSDPTrainRayActor(TrainRayActor):
         else:
             raise NotImplementedError(f"Loading from checkpoint file {ref_load_path} not yet implemented")
 
-    def _get_model_inputs_args(self, packed_sequence: dict) -> dict:
+    def _supports_selective_logits(self) -> bool:
+        """Whether the active VLM exposes arbitrary ``logits_to_keep`` indices."""
+
+        # Qwen3-VL's HF forward supports an index tensor, which is important
+        # for packed multimodal sequences.  Do not pass this model-specific
+        # kwarg to text-only/older models that may not accept it.
+        return hasattr(self.hf_config, "vision_config") and getattr(self.hf_config, "model_type", None) == "qwen3_vl"
+
+    @staticmethod
+    def _response_logit_positions(packed_sequence: dict, device: torch.device) -> torch.Tensor:
+        """Return flattened positions whose logits predict response tokens."""
+
+        cu_seqlens = packed_sequence["cu_seqlens"].tolist()
+        response_lengths = packed_sequence["response_lengths"]
+        positions: list[int] = []
+        for sequence_index, response_length in enumerate(response_lengths):
+            start = int(cu_seqlens[sequence_index])
+            end = int(cu_seqlens[sequence_index + 1])
+            response_length = int(response_length)
+            available = max(0, end - start - 1)
+            if response_length < 0 or response_length > available:
+                raise ValueError(
+                    f"response length {response_length} is incompatible with packed sequence "
+                    f"[{start}, {end})"
+                )
+            # Position p predicts input_ids[p + 1].  The response occupies
+            # the final response_length input tokens of this sequence.
+            positions.extend(range(end - response_length - 1, end - 1))
+        return torch.tensor(positions, dtype=torch.long, device=device)
+
+    def _forward_log_probs(
+        self,
+        model,
+        packed_sequence: dict,
+        *,
+        compute_entropy: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one packed forward while avoiding full VLM vocabulary logits."""
+
+        if self._supports_selective_logits():
+            # The model still processes the complete multimodal prefix so
+            # causal attention and MRoPE semantics are unchanged.  Only the
+            # final response-token projection is retained, which removes the
+            # otherwise dominant ``T * vocab_size`` allocation.
+            model_device = next(model.parameters()).device
+            positions = self._response_logit_positions(packed_sequence, model_device)
+            if positions.numel() > 0:
+                model_args = self._get_model_inputs_args(packed_sequence, logits_to_keep=positions)
+                logits = model(**model_args).logits.squeeze(0)
+                target_positions = positions + 1
+                target_tokens = packed_sequence["tokens"].to(device=model_device).index_select(0, target_positions)
+                selected_log_probs, selected_entropy = get_selected_logprob_and_entropy(
+                    logits=logits,
+                    target_tokens=target_tokens,
+                    allow_compile=not self.args.true_on_policy_mode,
+                    temperature=self.args.rollout_temperature,
+                    compute_entropy=compute_entropy,
+                )
+                # Preserve the existing packed/unpack interface: non-response
+                # positions are zero but never contribute because their masks
+                # are zero.  The vector is tiny compared with the logits.
+                packed_length = max(0, int(packed_sequence["tokens"].numel()) - 1)
+                log_probs = scatter_selected_values(positions, selected_log_probs, packed_length)
+                entropy = scatter_selected_values(positions, selected_entropy, packed_length)
+                return log_probs, entropy
+
+        model_args = self._get_model_inputs_args(packed_sequence)
+        logits = model(**model_args).logits.squeeze(0)
+        return get_logprob_and_entropy(
+            logits=logits,
+            target_tokens=packed_sequence["tokens"],
+            allow_compile=not self.args.true_on_policy_mode,
+            temperature=self.args.rollout_temperature,
+            compute_entropy=compute_entropy,
+        )
+
+    def _get_model_inputs_args(self, packed_sequence: dict, logits_to_keep: torch.Tensor | None = None) -> dict:
         input_ids = packed_sequence["tokens"].unsqueeze(0)
         position_ids = packed_sequence["position_ids"].unsqueeze(0)
 
@@ -877,6 +1218,8 @@ class FSDPTrainRayActor(TrainRayActor):
         }
         if packed_sequence.get("multimodal_train_inputs"):
             model_args.update(packed_sequence["multimodal_train_inputs"])
+        if logits_to_keep is not None:
+            model_args["logits_to_keep"] = logits_to_keep
         return model_args
 
 
@@ -893,8 +1236,13 @@ def selective_log_softmax_raw(logits: torch.Tensor, input_ids: torch.Tensor) -> 
     Returns:
         Tensor of shape [...] containing the log-probabilities corresponding to `input_ids`.
     """
-    logprobs = logits.log_softmax(dim=-1)
-    return torch.gather(logprobs, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
+    # Computing the full ``log_softmax`` tensor is needlessly expensive for a
+    # policy-gradient batch: only one vocabulary entry per token is used.  The
+    # equivalent gather/log-normalizer formulation keeps the autograd graph
+    # over the original logits without materialising another [T, V] tensor.
+    target_logits = torch.gather(logits, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
+    log_normalizer = torch.logsumexp(logits, dim=-1)
+    return target_logits - log_normalizer
 
 
 selective_log_softmax_compiled = torch.compile(dynamic=True)(selective_log_softmax_raw)
@@ -968,6 +1316,31 @@ def get_logprob_and_entropy(
     return log_probs, entropy
 
 
+def get_selected_logprob_and_entropy(
+    logits: torch.Tensor,
+    target_tokens: torch.Tensor,
+    allow_compile: bool,
+    temperature: float | None = None,
+    compute_entropy: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute log-probs for a tensor of already-selected response positions."""
+
+    if logits.dim() == 3:
+        logits = logits.squeeze(0)
+    if temperature is not None:
+        logits = logits.div(temperature)
+
+    selective_log_softmax = selective_log_softmax_compiled if allow_compile else selective_log_softmax_raw
+    log_probs = selective_log_softmax(logits, target_tokens.to(device=logits.device))
+    if compute_entropy:
+        log_probs_full = torch.log_softmax(logits, dim=-1)
+        probs = torch.softmax(logits, dim=-1)
+        entropy = -(probs * log_probs_full).sum(dim=-1)
+    else:
+        entropy = torch.zeros_like(log_probs)
+    return log_probs, entropy
+
+
 def sum_of_sample_mean(x: torch.Tensor, response_lengths: list[int], loss_masks: list[torch.Tensor]) -> torch.Tensor:
     """Compute sum of per-sample means across variable-length responses.
 
@@ -986,6 +1359,26 @@ def sum_of_sample_mean(x: torch.Tensor, response_lengths: list[int], loss_masks:
             for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
         ]
     )
+
+
+def weighted_sum_of_sample_mean(
+    x: torch.Tensor,
+    response_lengths: list[int],
+    loss_masks: list[torch.Tensor],
+    weights: list[float],
+) -> torch.Tensor:
+    """Weighted sequence means for question-normalized BayesTool loss."""
+
+    if len(response_lengths) != len(loss_masks) or len(weights) != len(response_lengths):
+        raise ValueError(
+            "response_lengths, loss_masks and BayesTool loss weights must have equal length"
+        )
+    result = x.new_zeros(())
+    for x_i, loss_mask_i, weight in zip(
+        x.split(response_lengths, dim=0), loss_masks, weights, strict=True
+    ):
+        result = result + float(weight) * (x_i * loss_mask_i).sum() / torch.clamp_min(loss_mask_i.sum(), 1)
+    return result
 
 
 @torch.no_grad()

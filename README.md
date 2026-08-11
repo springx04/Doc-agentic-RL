@@ -31,16 +31,36 @@ Prepare a JSONL document-QA manifest and convert it to the training format:
 
 ```bash
 python toolcall-rl/rl_data_preprocess.py \
-  --input /data/document_qa/source.jsonl \
-  --output /data/document_qa/train.jsonl \
+  --input data/train.jsonl \
+  --output data/document-qa/train.jsonl \
+  --document-root data \
   --check-files
+```
+
+The bundled project data is under `data/`: run the same converter with
+`data/train.jsonl` and `data/test.jsonl` plus `--document-root data` to produce
+the default `data/document-qa/train.jsonl` and `data/document-qa/eval.jsonl`
+used by the Qwen3-VL BayesTool launcher.
+
+After every 4B RL run, audit both the launcher log and checkpoint directory;
+job completion alone does not prove that RL produced a usable update:
+
+```bash
+python toolcall-rl/analyze_bayestool_training_log.py \
+  outputs/qwen3-vl-4b-bayestool-<run>/launcher.log \
+  --output-dir outputs/qwen3-vl-4b-bayestool-<run> \
+  --json-out outputs/qwen3-vl-4b-bayestool-<run>/rl_audit.json
 ```
 
 Then launch a supplied RL recipe:
 
 ```bash
-cd slime
-bash ../toolcall-rl/retool_qwen3_4b_rl.sh
+python toolcall-rl/rl_data_preprocess.py \
+  --input data/test.jsonl \
+  --output data/document-qa/eval.jsonl \
+  --document-root data \
+  --check-files
+bash toolcall-rl/retool_qwen3_vl_4b_bayestool_rl.sh
 ```
 
 See [`toolcall-rl/README.md`](./toolcall-rl/README.md) for dataset schemas,

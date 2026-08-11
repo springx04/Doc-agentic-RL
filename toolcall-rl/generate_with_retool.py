@@ -1,12 +1,17 @@
 # Adapted from https://github.com/volcengine/verl/blob/cb809d66e46dfd3342d008628891a14a054fa424/recipe/retool/retool.py
 import asyncio
+from copy import deepcopy
+import hashlib
 import json
 import logging
+import math
+import os
 from pathlib import Path
 import re
 import time
 import uuid
-from typing import Any
+from dataclasses import replace
+from typing import Any, Mapping
 
 try:
     from jinja2 import Template
@@ -20,12 +25,132 @@ from slime.utils.types import Sample
 # Import tool sandbox functionality
 from document_reward import compute_document_reward, extract_final_answer
 from tool_sandbox import TOOL_CONFIGS, tool_registry
-from tool_protocol import ParsedAction, parse_assistant_action
+from tool_protocol import ParsedAction, normalize_tool_arguments, parse_assistant_action
+
+try:
+    from bayestool.belief import BeliefRuntime
+    from bayestool.config import config_from_args, stage_definition, validate_stage_capabilities
+    from bayestool.decision import (
+        AnswerRiskCalibrator,
+        BayesQHead,
+        DecisionController,
+        Q_FEATURE_SCHEMA_VERSION,
+        canonical_action,
+        canonical_action_key,
+        q_feature_vectors,
+    )
+    from bayestool.meta_episode import build_meta_episode
+    from bayestool.replay import export_canonical_replay
+    from bayestool.grouping import (
+        DEFAULT_POLICY_VERSION,
+        QuestionRolloutPlan,
+        make_question_rollout_plan,
+        make_runtime_state_digest,
+        slot_role_from_metadata,
+    )
+    from bayestool.schema import TaskStateView
+    from bayestool.training import (
+        attach_bayestool_utility,
+        bayestool_question_id,
+        content_signature,
+        make_bayestool_decision_group_id,
+    )
+    from bayestool.world import (
+        DEFAULT_TOOL_ARGUMENT_CAPABILITIES,
+        CleanResultCache,
+        WorldRuntime,
+        document_hash,
+        sample_tool_world,
+        stable_seed,
+    )
+except Exception:  # pragma: no cover - baseline rollout remains importable without the optional package
+    BeliefRuntime = None  # type: ignore[assignment]
+    AnswerRiskCalibrator = None  # type: ignore[assignment]
+    BayesQHead = None  # type: ignore[assignment]
+    DecisionController = None  # type: ignore[assignment]
+    Q_FEATURE_SCHEMA_VERSION = None  # type: ignore[assignment]
+    canonical_action = None  # type: ignore[assignment]
+    canonical_action_key = None  # type: ignore[assignment]
+    q_feature_vectors = None  # type: ignore[assignment]
+    build_meta_episode = None  # type: ignore[assignment]
+    export_canonical_replay = None  # type: ignore[assignment]
+    TaskStateView = None  # type: ignore[assignment]
+    WorldRuntime = None  # type: ignore[assignment]
+    sample_tool_world = None  # type: ignore[assignment]
+    DEFAULT_TOOL_ARGUMENT_CAPABILITIES = {}  # type: ignore[assignment]
+    config_from_args = None  # type: ignore[assignment]
+    stage_definition = None  # type: ignore[assignment]
+    validate_stage_capabilities = None  # type: ignore[assignment]
+    attach_bayestool_utility = None  # type: ignore[assignment]
+    bayestool_question_id = None  # type: ignore[assignment]
+    content_signature = None  # type: ignore[assignment]
+    make_bayestool_decision_group_id = None  # type: ignore[assignment]
+    DEFAULT_POLICY_VERSION = "bayestool-policy-v1"  # type: ignore[assignment]
+    QuestionRolloutPlan = None  # type: ignore[assignment]
+    make_question_rollout_plan = None  # type: ignore[assignment]
+    make_runtime_state_digest = None  # type: ignore[assignment]
+    slot_role_from_metadata = None  # type: ignore[assignment]
+    document_hash = None  # type: ignore[assignment]
+    CleanResultCache = None  # type: ignore[assignment]
+    stable_seed = None  # type: ignore[assignment]
+
+try:
+    from bayestool.training import compute_bayestool_utility
+except Exception:  # pragma: no cover
+    compute_bayestool_utility = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
+_STRICT_ASSISTANT_ACTION_RULE = (
+    "Assistant output follows a strict action protocol. Every assistant turn must contain exactly one "
+    "complete action and no other text: use <tool_call>...</tool_call> for one tool call, "
+    "<final>...</final> for a grounded answer, or <abstain>...</abstain> when evidence is insufficient. "
+    "For JSON tool actions, use exactly the keys name and arguments; never use tool, args, or prose. "
+    "Do not emit analysis, explanations, Markdown, code fences, or extra tags. "
+    "<task_state>, <tool_belief>, <tool_state>, <tool_result>, and <interpreter> are read-only "
+    "observation metadata; never copy or output them in an assistant turn."
+)
+
+_OBSERVATION_PROTOCOL_RULE = (
+    "The following environment state is read-only context, not an assistant action. "
+    "Use it to choose the next step. The next assistant turn must contain exactly one complete "
+    "action from the system protocol and no other text."
+)
+
+_OBSERVATION_METADATA_TAG_RE = re.compile(
+    r"</?\s*(?P<name>task_state|tool_belief|tool_state|tool_result)\s*>",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_observation_metadata_markup(value: str | None) -> str:
+    """Keep state readable without teaching the model to copy metadata tags."""
+
+    text = str(value or "")
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group("name").casefold().replace("_", " ")
+        if match.group(0).lstrip().startswith("</"):
+            return f"End {name}."
+        return f"{name.title()} (read-only):"
+
+    return _OBSERVATION_METADATA_TAG_RE.sub(replace, text)
+
 _PRM_SEMAPHORE: asyncio.Semaphore | None = None
 _PRM_TOKENIZER: Any = None
+_BAYES_CLEAN_RESULT_TASKS: dict[str, asyncio.Task] = {}
+_BAYES_CLEAN_RESULT_CACHE = CleanResultCache() if CleanResultCache is not None else None
+# A branch checkpoint is intentionally process-local.  It contains live
+# runtime objects (including the clean-result cache) and is consumed exactly
+# once by its child rollout.  Only the opaque checkpoint id and public branch
+# diagnostics are copied into Sample.metadata.
+_BAYES_BRANCH_CHECKPOINTS: dict[str, dict[str, Any]] = {}
+_BAYES_FILTER_MODEL_CACHE: dict[str, tuple[Any, str]] = {}
+_BAYES_Q_HEAD_CACHE: dict[str, tuple[Any, str]] = {}
+# Meta-episode questions run sequentially in one rollout worker.  Keep the
+# sampled world object (including call count/regime position) alive across
+# those child generations; only the task-local belief/navigation state resets.
+_BAYES_META_WORLD_RUNTIMES: dict[str, Any] = {}
 
 
 def _get_generation_prompt_suffix(sample_prompt: str) -> str:
@@ -149,14 +274,22 @@ def format_conversation_with_tools(
     prompt: str, tools: list[dict[str, Any]] = None, system_prompt: str = None, messages: list[dict[str, Any]] = None,
     tool_call_format: str = "json",
 ) -> str:
-    """Format conversation using Jinja2 template with tool support"""
-    raw_template = TOOL_TEMPLATE_XML if tool_call_format == "xml" else TOOL_TEMPLATE_JSON
-    template = Template(raw_template)
+    """Format a Qwen tool conversation with the model's token boundaries intact.
 
-    # Prepare messages
-    messages_to_render = []
+    Qwen3-VL's native chat template is deliberately newline-sensitive: the
+    role marker is followed by ``\\n`` and tool schemas are emitted as the
+    standard ``{"type": "function", "function": ...}`` objects.  The old
+    Jinja template used ``{%-``/``{{-`` around those boundaries, which
+    silently rendered ``<|im_start|>systemYou...`` and
+    ``<|im_start|>userDocument...``.  That prompt is syntactically valid text
+    but is out of distribution for the model's tool instruction format.
 
-    # Always add system message - use provided one or default
+    Build this small fixed envelope explicitly so its whitespace remains
+    stable.  The full trajectory is still assembled by the rollout loop; this
+    helper only formats the initial tool-enabled conversation.
+    """
+
+    # Always add a system message - use provided one or default.
     if system_prompt:
         system_content = system_prompt
     else:
@@ -171,23 +304,75 @@ def format_conversation_with_tools(
             "until all relevant pages have been checked. After every tool result, use the navigation state "
             "to select an unvisited page or the appropriate table/visual tool. Do not repeat a page unless "
             "a different tool is needed. When all relevant pages have been checked, do not summarize the "
-            "whole document: answer concisely and end with exactly one <final>...</final> action."
+            "whole document: answer concisely and end with exactly one <final>...</final> action. "
+            "When the available evidence remains unreliable after the budget is used, you may instead "
+            "emit exactly one <abstain>reason</abstain> action; do not abstain when reliable evidence supports an answer."
         )
+    system_content = f"{str(system_content).rstrip()}\n\n{_STRICT_ASSISTANT_ACTION_RULE}"
 
-    messages_to_render.append({"role": "system", "content": system_content})
-
-    # Add user message if provided
+    messages_to_render: list[dict[str, Any]] = [
+        {"role": "system", "content": system_content},
+    ]
     if prompt:
         messages_to_render.append({"role": "user", "content": prompt})
-
-    # Add assistant responses from previous turns if provided
     if messages:
         messages_to_render.extend(messages)
 
-    # Render template
-    formatted_text = template.render(messages=messages_to_render, tools=tools or [])
+    rendered: list[str] = ["<|im_start|>system\n"]
+    rendered.append(str(messages_to_render[0].get("content", "")))
 
-    return formatted_text
+    tool_specs = list(tools or [])
+    if tool_specs:
+        rendered.append("\n\n")
+        if tool_call_format == "xml":
+            rendered.append(
+                "# Tools\n\n"
+                "You have access to the following functions:\n\n"
+                "<tools>"
+            )
+        else:
+            rendered.append(
+                "# Tools\n\n"
+                "You may call one function per assistant turn to assist with the user query.\n\n"
+                "You are provided with function signatures within <tools></tools> XML tags:\n"
+                "<tools>"
+            )
+        for tool in tool_specs:
+            rendered.append("\n")
+            rendered.append(json.dumps(tool, ensure_ascii=False))
+        rendered.append("\n</tools>\n\n")
+        if tool_call_format == "xml":
+            rendered.append(
+                "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+                "<tool_call>\n"
+                "<function=example_function_name>\n"
+                "<parameter=example_parameter_1>\n"
+                "value_1\n"
+                "</parameter>\n"
+                "</function>\n"
+                "</tool_call>"
+            )
+        else:
+            rendered.append(
+                "If you choose to call a function, return exactly one JSON object with its name and arguments "
+                "within <tool_call></tool_call> XML tags and no suffix text:\n"
+                "<tool_call>\n"
+                "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n"
+                "</tool_call>"
+            )
+        rendered.append("<|im_end|>\n")
+    else:
+        rendered.append("<|im_end|>\n")
+
+    for message in messages_to_render[1:]:
+        role = str(message.get("role", ""))
+        if role not in {"user", "assistant"}:
+            continue
+        rendered.append(f"<|im_start|>{role}\n")
+        rendered.append(str(message.get("content", "")))
+        rendered.append("<|im_end|>\n")
+    rendered.append("<|im_start|>assistant\n")
+    return "".join(rendered)
 
 
 def _extract_task_prompt(prompt: str | list[dict[str, str]]) -> str:
@@ -197,6 +382,872 @@ def _extract_task_prompt(prompt: str | list[dict[str, str]]) -> str:
         return users[-1] if users else json.dumps(prompt, ensure_ascii=False)
     matches = re.findall(r"<\|im_start\|>user\s*\n(.*?)<\|im_end\|>", prompt, re.DOTALL)
     return matches[-1].strip() if matches else prompt
+
+
+def _bayestool_is_enabled(args: Any, metadata: dict[str, Any] | None = None) -> bool:
+    metadata = metadata or {}
+    nested = metadata.get("bayestool") if isinstance(metadata.get("bayestool"), dict) else {}
+    return bool(
+        getattr(args, "bayestool_enable", False)
+        or metadata.get("bayestool_enable", False)
+        or nested.get("enabled", False)
+    ) and WorldRuntime is not None and BeliefRuntime is not None
+
+
+def _bayestool_meta_enabled(args: Any, metadata: dict[str, Any] | None = None) -> bool:
+    """Return the configured meta-episode ablation state."""
+
+    if config_from_args is None:
+        return True
+    try:
+        config = config_from_args(args, enabled=True)
+        return bool(getattr(config, "use_meta_episode", True))
+    except (TypeError, ValueError, AttributeError):
+        return True
+
+
+def _bayestool_runtime_identity(sample: Sample, task_prompt: str) -> tuple[str, str]:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    document_path = metadata.get("document_path")
+    if not document_path:
+        match = re.search(r"Document path:\s*(.*?)(?:\n\s*Question:|$)", task_prompt, re.IGNORECASE | re.DOTALL)
+        document_path = match.group(1).strip() if match else task_prompt
+    # Recompute the identity from the document bytes/path and the public task
+    # fields.  An upstream manifest may contain stale or label-dependent
+    # identity fields; trusting them here would silently break coupled-world
+    # reproducibility.  Meta-episode children are the one intentional
+    # exception: their wrapper assigns one coupling id to all questions so the
+    # persistent cross-question session sees the same world.
+    digest = str(document_hash(document_path) if document_hash else metadata.get("document_hash") or task_prompt)
+    question_match = re.search(r"(?:^|\n)Question:\s*(.*?)(?:\n\s*\n|$)", task_prompt, re.IGNORECASE | re.DOTALL)
+    question = question_match.group(1).strip() if question_match else task_prompt
+    task_id = metadata.get("task_id", metadata.get("id", ""))
+    coupling_payload = "|".join((digest, str(question), str(task_id or "")))
+    computed_coupling_id = "coupling-" + hashlib.sha256(coupling_payload.encode("utf-8", "surrogatepass")).hexdigest()[:24]
+    preserve_meta_coupling = bool(metadata.get("meta_episode_id") or metadata.get("meta_episode_child"))
+    coupling_id = str(metadata.get("coupling_id") or computed_coupling_id) if preserve_meta_coupling else computed_coupling_id
+    return digest, coupling_id
+
+
+def _checkpoint_state(payload: Any) -> tuple[dict[str, Any], str]:
+    """Extract a plain model state dict and its recorded version."""
+
+    if not isinstance(payload, dict):
+        raise ValueError("BayesTool checkpoint must contain a mapping")
+    state = payload.get("model_state") or payload.get("state_dict") or payload
+    if not isinstance(state, dict) or not state:
+        raise ValueError("BayesTool checkpoint has no model_state/state_dict")
+    if any(str(key).startswith("module.") for key in state):
+        state = {
+            str(key)[len("module.") :] if str(key).startswith("module.") else str(key): value
+            for key, value in state.items()
+        }
+    version = str(payload.get("belief_model_version") or payload.get("model_version") or "checkpoint")
+    return state, version
+
+
+def _load_bayestool_models(args: Any, config: Any) -> tuple[Any, str, Any, str]:
+    """Load the small Stage-A filter and optional finite-branch Q head once per worker."""
+
+    filter_model = None
+    filter_version = str(getattr(args, "belief_model_version", "untrained") or "untrained")
+    filter_path_value = getattr(args, "bayestool_belief_checkpoint", None)
+    if filter_path_value:
+        filter_path = str(Path(str(filter_path_value)).expanduser().resolve())
+        cached = _BAYES_FILTER_MODEL_CACHE.get(filter_path)
+        if cached is not None:
+            filter_model, filter_version = cached
+        else:
+            if not Path(filter_path).is_file():
+                raise FileNotFoundError(f"BayesTool belief checkpoint does not exist: {filter_path}")
+            if BeliefRuntime is None:
+                raise RuntimeError("BayesTool belief package is unavailable while a checkpoint was requested")
+            try:
+                import torch
+                from bayestool.belief import ToolWorldFilterNetwork
+
+                payload = torch.load(filter_path, map_location="cpu")
+                state, filter_version = _checkpoint_state(payload)
+                filter_model = ToolWorldFilterNetwork(config)
+                incompatible = filter_model.load_state_dict(state, strict=False)
+                if incompatible.missing_keys:
+                    raise RuntimeError(
+                        "BayesTool belief checkpoint is incompatible; missing keys: "
+                        + ", ".join(incompatible.missing_keys[:8])
+                    )
+                filter_model.eval()
+            except Exception as exc:
+                raise RuntimeError(f"failed to load BayesTool belief checkpoint {filter_path}: {exc}") from exc
+            _BAYES_FILTER_MODEL_CACHE[filter_path] = (filter_model, filter_version)
+
+    q_head = None
+    q_version = "untrained"
+    q_path_value = getattr(args, "bayestool_q_checkpoint", None)
+    if not q_path_value and filter_path_value:
+        derived = Path(str(filter_path_value)).expanduser().with_suffix(".qhead.pt")
+        if derived.is_file():
+            q_path_value = str(derived)
+    if q_path_value:
+        q_path = str(Path(str(q_path_value)).expanduser().resolve())
+        cached = _BAYES_Q_HEAD_CACHE.get(q_path)
+        if cached is not None:
+            q_head, q_version = cached
+        else:
+            if not Path(q_path).is_file():
+                raise FileNotFoundError(f"BayesTool Q-head checkpoint does not exist: {q_path}")
+            if BayesQHead is None:
+                raise RuntimeError("BayesTool Q-head package is unavailable while a checkpoint was requested")
+            try:
+                import torch
+
+                payload = torch.load(q_path, map_location="cpu")
+                checkpoint_schema = str(payload.get("q_feature_schema_version") or "")
+                if checkpoint_schema != Q_FEATURE_SCHEMA_VERSION:
+                    raise RuntimeError(
+                        "BayesTool Q-head feature schema mismatch: "
+                        f"checkpoint={checkpoint_schema or 'missing'} expected={Q_FEATURE_SCHEMA_VERSION}"
+                    )
+                state, q_version = _checkpoint_state(payload)
+                q_head = BayesQHead()
+                incompatible = q_head.load_state_dict(state, strict=False)
+                if incompatible.missing_keys:
+                    raise RuntimeError(
+                        "BayesTool Q-head checkpoint is incompatible; missing keys: "
+                        + ", ".join(incompatible.missing_keys[:8])
+                    )
+                q_head.eval()
+            except Exception as exc:
+                raise RuntimeError(f"failed to load BayesTool Q-head checkpoint {q_path}: {exc}") from exc
+            _BAYES_Q_HEAD_CACHE[q_path] = (q_head, q_version)
+    return filter_model, filter_version, q_head, q_version
+
+
+def _load_bayestool_risk_calibrator(args: Any) -> tuple[Any, str]:
+    """Load a validation-fitted AnswerRiskCalibrator when configured."""
+
+    path_value = getattr(args, "bayestool_risk_checkpoint", None)
+    if not path_value or AnswerRiskCalibrator is None:
+        return None, "heuristic"
+    path = Path(str(path_value)).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"BayesTool risk calibrator checkpoint does not exist: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        version = str(payload.get("version") or "validation-fitted")
+        if isinstance(payload.get("calibrator"), Mapping):
+            payload = payload["calibrator"]
+        calibrator = AnswerRiskCalibrator.from_dict(payload)
+    except Exception as exc:
+        raise RuntimeError(f"failed to load BayesTool risk calibrator {path}: {exc}") from exc
+    return calibrator, version
+
+
+def _bayestool_environment_block(
+    belief_runtime: Any,
+    navigation_state: dict[str, Any],
+    *,
+    tool_budget: int,
+    tokenizer: Any | None = None,
+) -> str:
+    if belief_runtime is None or TaskStateView is None:
+        return ""
+    navigation_state["remaining_tool_budget"] = max(0, int(tool_budget))
+    task_state = TaskStateView.from_navigation_state(navigation_state, tool_budget=tool_budget)
+    return belief_runtime.to_prompt_block(task_state, tokenizer=tokenizer)
+
+
+def _bayestool_append_observation(
+    observed_result: str,
+    belief_runtime: Any,
+    navigation_state: dict[str, Any],
+    *,
+    tool_budget: int,
+    tokenizer: Any | None = None,
+) -> str:
+    block = _bayestool_environment_block(
+        belief_runtime,
+        navigation_state,
+        tool_budget=tool_budget,
+        tokenizer=tokenizer,
+    )
+    if not block:
+        return observed_result
+    return f"{observed_result}\n{_sanitize_observation_metadata_markup(block)}"
+
+
+def _bayestool_token_count(value: Any, tokenizer: Any | None = None) -> int:
+    """Count visible observation tokens without requiring a tokenizer."""
+
+    text_value = str(value or "")
+    if not text_value:
+        return 0
+    if tokenizer is not None and callable(tokenizer):
+        try:
+            encoded = tokenizer(text_value, add_special_tokens=False)
+            ids = encoded.get("input_ids", []) if isinstance(encoded, Mapping) else encoded
+            if hasattr(ids, "tolist"):
+                ids = ids.tolist()
+            while isinstance(ids, list) and ids and isinstance(ids[0], list):
+                ids = ids[0]
+            if isinstance(ids, list):
+                return len(ids)
+        except Exception:
+            pass
+    return max(1, math.ceil(len(text_value) / 4.0))
+
+
+async def _bayestool_execute_clean_cached(
+    world_runtime: Any,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> str:
+    """Share one clean tool execution across coupled world replicas."""
+
+    if world_runtime is None:
+        return await tool_registry.execute_tool(tool_name, arguments)
+    document_digest = str(getattr(world_runtime, "document_digest", ""))
+    cache = getattr(world_runtime, "clean_cache", None)
+    if cache is not None:
+        key = cache.key(document_digest, tool_name, arguments, getattr(world_runtime, "tool_backend_version", "v1"))
+    else:
+        key = "|".join((document_digest, tool_name, json.dumps(arguments, ensure_ascii=False, sort_keys=True, default=str)))
+    task = _BAYES_CLEAN_RESULT_TASKS.get(key)
+    if task is None:
+        if cache is not None and hasattr(cache, "get_or_set_async"):
+            task = asyncio.create_task(
+                cache.get_or_set_async(
+                    document_digest,
+                    tool_name,
+                    arguments,
+                    getattr(world_runtime, "tool_backend_version", "v1"),
+                    lambda: tool_registry.execute_tool(tool_name, arguments),
+                )
+            )
+        else:
+            task = asyncio.create_task(tool_registry.execute_tool(tool_name, arguments))
+        _BAYES_CLEAN_RESULT_TASKS[key] = task
+    try:
+        return str(await asyncio.shield(task))
+    except Exception:
+        if _BAYES_CLEAN_RESULT_TASKS.get(key) is task:
+            _BAYES_CLEAN_RESULT_TASKS.pop(key, None)
+        raise
+
+
+def _bayestool_action_text(action: Any) -> str:
+    """Render a canonical action as strict protocol text for auxiliary replay."""
+
+    if not isinstance(action, dict):
+        return str(action or "")
+    kind = str(action.get("kind") or action.get("type") or "").casefold()
+    if kind in {"tool", "tool_call"}:
+        return "<tool_call>" + json.dumps(
+            {
+                "name": str(action.get("tool") or action.get("name") or ""),
+                "arguments": dict(action.get("arguments") or {}),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ) + "</tool_call>"
+    if kind == "final":
+        return f"<final>{str(action.get('answer') or '')}</final>"
+    if kind == "abstain":
+        return f"<abstain>{str(action.get('reason') or '')}</abstain>"
+    return str(action)
+
+
+def _bayestool_branch_action_from_text(
+    text: str,
+    navigation_state: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, ParsedAction]:
+    """Parse one policy sample into the canonical action used by BayesQ."""
+
+    parsed = parse_assistant_action(text)
+    if parsed.kind == "tool_call" and isinstance(parsed.value, dict):
+        value = dict(parsed.value)
+        arguments = dict(value.get("arguments", {}))
+        tool_name = str(value.get("name") or "")
+        arguments, _ = _tool_arguments_for_navigation(tool_name, arguments, navigation_state)
+        value = {"name": tool_name, "arguments": arguments}
+        if not _validate_tool_call(value)[0]:
+            return None, parsed
+        return {"kind": "tool", "tool": tool_name, "arguments": arguments}, parsed
+    if parsed.kind == "final":
+        return {"kind": "final", "answer": str(parsed.value or "")}, parsed
+    if parsed.kind == "abstain":
+        return {"kind": "abstain", "reason": str(parsed.value or "")}, parsed
+    return None, parsed
+
+
+def _bayestool_branch_prefix_hash(
+    prompt_token_ids: list[int],
+    context_token_ids: list[int],
+    response_token_ids: list[int],
+    turn: int,
+) -> str:
+    payload = {
+        "prompt": list(prompt_token_ids),
+        "context": list(context_token_ids),
+        "response": list(response_token_ids),
+        "turn": int(turn),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _branch_deepcopy(value: Any) -> Any:
+    try:
+        return deepcopy(value)
+    except Exception:
+        if isinstance(value, list):
+            return list(value)
+        if isinstance(value, dict):
+            return dict(value)
+        return value
+
+
+def _capture_bayestool_branch_checkpoint(
+    *,
+    prompt_token_ids: list[int],
+    context_token_ids: list[int],
+    context_image_data: list[str],
+    context_segments: list[dict[str, Any]],
+    response: str,
+    response_token_ids: list[int],
+    loss_masks: list[int],
+    rollout_log_probs: list[float],
+    current_images: list[Any],
+    multimodal_train_inputs_buffer: list[dict[str, Any]],
+    execution_trace: list[dict[str, Any]],
+    action_log: dict[str, Any],
+    generation_steps: list[dict[str, Any]],
+    step_action_spans: list[dict[str, int]],
+    navigation_state: dict[str, Any],
+    world_runtime: Any,
+    belief_runtime: Any,
+    bayes_document_digest: str | None,
+    bayes_coupling_id: str | None,
+    world_sample_index: int,
+    turn: int,
+    tool_call_count: int,
+    max_tool_steps: int,
+    config: Any,
+    runtime_state_digest: str = "",
+) -> dict[str, Any]:
+    """Snapshot only the mutable state needed to replay a shared-prefix branch.
+
+    The world specification and belief are copied before the current action is
+    executed.  The clean-result cache is deliberately reattached after the
+    copy so sibling branches reuse the exact same clean tool result.
+    """
+
+    prefix_hash = _bayestool_branch_prefix_hash(
+        prompt_token_ids,
+        context_token_ids,
+        response_token_ids,
+        turn,
+    )
+    copied_world = _branch_deepcopy(world_runtime)
+    if copied_world is not None and world_runtime is not None:
+        try:
+            copied_world.clean_cache = world_runtime.clean_cache
+        except Exception:
+            pass
+    return {
+        "prefix_hash": prefix_hash,
+        "prompt_token_ids": list(prompt_token_ids),
+        "context_token_ids": list(context_token_ids),
+        "context_image_data": list(context_image_data),
+        "context_segments": _branch_deepcopy(context_segments),
+        "response": str(response),
+        "response_token_ids": list(response_token_ids),
+        "loss_masks": list(loss_masks),
+        "rollout_log_probs": list(rollout_log_probs),
+        "current_images": _branch_deepcopy(current_images),
+        "multimodal_train_inputs_buffer": _branch_deepcopy(multimodal_train_inputs_buffer),
+        "execution_trace": _branch_deepcopy(execution_trace),
+        "action_log": _branch_deepcopy(action_log),
+        "generation_steps": _branch_deepcopy(generation_steps),
+        "step_action_spans": _branch_deepcopy(step_action_spans),
+        "navigation_state": _branch_deepcopy(navigation_state),
+        "world_runtime": copied_world,
+        "belief_runtime": _branch_deepcopy(belief_runtime),
+        "bayes_document_digest": bayes_document_digest,
+        "bayes_coupling_id": bayes_coupling_id,
+        "world_sample_index": int(world_sample_index),
+        "turn": int(turn),
+        "tool_call_count": int(tool_call_count),
+        "max_tool_steps": int(max_tool_steps),
+        "config": config,
+        "runtime_state_digest": str(runtime_state_digest),
+    }
+
+
+def _clone_bayestool_branch_checkpoint(checkpoint: dict[str, Any]) -> dict[str, Any]:
+    clone = _branch_deepcopy(checkpoint)
+    if clone.get("world_runtime") is not None and checkpoint.get("world_runtime") is not None:
+        try:
+            clone["world_runtime"].clean_cache = checkpoint["world_runtime"].clean_cache
+        except Exception:
+            pass
+    return clone
+
+
+async def _sample_bayestool_branch_candidates(
+    *,
+    state: Any,
+    url: str,
+    checkpoint: dict[str, Any],
+    current_text: str,
+    current_token_ids: list[int],
+    current_log_probs: list[float],
+    sampling_params: dict[str, Any],
+    im_end_id: int | None,
+    config: Any,
+    target_group_size: int | None = None,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Draw actual policy candidates from one identical model prefix."""
+
+    candidates: list[dict[str, Any]] = []
+    errors: list[str] = []
+    current_action, current_parsed = _bayestool_branch_action_from_text(
+        current_text,
+        checkpoint.get("navigation_state", {}),
+    )
+    if current_action is None or canonical_action_key is None:
+        return candidates, errors
+
+    def add_candidate(action: dict[str, Any], raw: str, token_ids: list[int], log_probs: list[float], *, source: str) -> None:
+        key = canonical_action_key(action)
+        if any(item["key"] == key for item in candidates):
+            return
+        candidates.append(
+            {
+                "key": key,
+                "action": action,
+                "raw": str(raw),
+                "token_ids": list(token_ids),
+                "log_probs": list(log_probs),
+                "source": source,
+            }
+        )
+
+    add_candidate(current_action, current_text, current_token_ids, current_log_probs, source="primary")
+    # K=8 requires seven independent children plus the primary.  A legacy
+    # max-action-candidates=4 must not silently turn that plan into K4.
+    target_group_size = int(
+        target_group_size
+        if target_group_size is not None
+        else getattr(config, "default_group_size", 4)
+        or 4
+    )
+    max_candidates = max(
+        1,
+        int(getattr(config, "max_action_candidates", 4)),
+        target_group_size,
+    )
+    attempts = max(0, max_candidates * 3 - 1)
+    for offset in range(attempts):
+        if len(candidates) >= max_candidates:
+            break
+        params = dict(sampling_params)
+        base_seed = params.get("sampling_seed")
+        if isinstance(base_seed, int):
+            params["sampling_seed"] = base_seed + offset + 1
+        else:
+            # Explicit seeds make branch construction reproducible without
+            # changing the caller's deterministic-inference flag.
+            seed_bytes = hashlib.sha256(
+                f"{checkpoint['prefix_hash']}:{offset}".encode("utf-8")
+            ).digest()[:8]
+            params["sampling_seed"] = int.from_bytes(seed_bytes, "big") % (2**31 - 1)
+        payload: dict[str, Any] = {
+            "input_ids": list(checkpoint["context_token_ids"]),
+            "sampling_params": params,
+            "return_logprob": True,
+        }
+        if checkpoint.get("context_image_data"):
+            payload["image_data"] = list(checkpoint["context_image_data"])
+        try:
+            output = await post(url, payload)
+            extracted = _extract_generation_output(output, state, im_end_id)
+            raw = str(extracted["raw_generation_text"])
+            action, parsed = _bayestool_branch_action_from_text(raw, checkpoint.get("navigation_state", {}))
+            if action is None:
+                continue
+            add_candidate(
+                action,
+                raw,
+                list(extracted["token_ids"]),
+                list(extracted["log_probs"]),
+                source="branch_policy_sample",
+            )
+        except Exception as exc:
+            errors.append(str(exc))
+    return candidates, errors
+
+
+def _select_bayestool_policy_candidate(
+    candidates: list[dict[str, Any]],
+    *,
+    navigation_state: dict[str, Any],
+    belief_runtime: Any,
+    decision_controller: Any,
+    tool_budget: int,
+) -> tuple[dict[str, Any] | None, Any | None, dict[str, Any]]:
+    """Select one of the actual completions before any selected action runs."""
+
+    if not candidates or decision_controller is None or TaskStateView is None:
+        return candidates[0] if candidates else None, None, {
+            "candidate_degenerate": len(candidates) < 2,
+            "candidate_action_keys": [item.get("key") for item in candidates],
+        }
+    task_state = TaskStateView.from_navigation_state(
+        navigation_state,
+        tool_budget=max(0, int(tool_budget)),
+    )
+    actions = [item["action"] for item in candidates]
+    diagnostic_actions = [
+        action
+        for action in actions
+        if str(action.get("tool") or "") in {"detect_layout", "render_page", "crop_region", "zoom_region", "ocr_region"}
+    ]
+    report = decision_controller.select(
+        task_state,
+        belief_runtime,
+        actions,
+        diagnostic_actions=diagnostic_actions,
+        risk_metadata={
+            "independent_tool_count": len(set(
+                str(item.get("tool"))
+                for item in navigation_state.get("evidence_candidates", [])
+                if isinstance(item, dict) and item.get("tool")
+            )),
+            "recent_surprise": float(navigation_state.get("recent_surprise", 0.0) or 0.0),
+            "answer_self_consistency": float(navigation_state.get("answer_self_consistency", 0.0) or 0.0),
+            "page_count": max(1, int(navigation_state.get("page_count", 0) or 0)),
+        },
+    )
+    selected_key = str(report.selected_action or report.bayes_action or candidates[0]["key"])
+    selected = next((item for item in candidates if str(item.get("key")) == selected_key), candidates[0])
+    ordered_values = sorted(
+        list(report.action_values),
+        key=lambda value: (-float(value.value_mean), str(value.action_key)),
+    )
+    margin = (
+        float(ordered_values[0].value_mean - ordered_values[1].value_mean)
+        if len(ordered_values) >= 2
+        else None
+    )
+    snapshot = belief_runtime.snapshot().to_dict() if belief_runtime is not None else {}
+    metadata = {
+        "selected_action": report.selected_action,
+        "selected_mode": report.selected_mode,
+        "consensus": report.consensus,
+        "consensus_action": report.consensus_action,
+        "bayes_action": report.bayes_action,
+        "decision_regret": float(report.decision_regret),
+        "dvoi": dict(report.dvoi or {}),
+        "stop_decision": dict(report.stop_decision or {}),
+        "candidate_degenerate": len(candidates) < 2,
+        "candidate_action_keys": [str(item["key"]) for item in candidates],
+        "candidate_actions": [
+            {
+                "key": str(item["key"]),
+                "action": canonical_action(item["action"]),
+                "text": str(item.get("raw", "")),
+                "source": str(item.get("source", "")),
+                "token_count": len(item.get("token_ids", [])),
+            }
+            for item in candidates
+        ],
+        "selected_candidate_key": str(selected.get("key")),
+        "selected_candidate_source": str(selected.get("source", "")),
+        "best_action_margin": margin,
+        "policy_action_text": str(candidates[0].get("raw", "")),
+        "selected_action_text": str(selected.get("raw", "")),
+        "belief_snapshot": snapshot,
+        "observed_prefix_event_count": int(snapshot.get("step", 0) or 0),
+    }
+    metadata["branch_eligible"] = bool(
+        len(candidates) >= 2
+        and bool(getattr(decision_controller.config, "use_regret_branching", True))
+        and float(report.decision_regret) > float(decision_controller.config.decision_regret_threshold)
+        and task_state.remaining_tool_budget >= 2
+        and float(snapshot.get("ood_score", 0.0) or 0.0) < 0.15
+        and canonical_action(selected["action"]).get("kind") == "tool"
+    )
+    return selected, report, metadata
+
+
+async def _launch_bayestool_branches(
+    *,
+    args: Any,
+    state: Any,
+    url: str,
+    sample: Sample,
+    sampling_params: dict[str, Any],
+    evaluation: bool,
+    checkpoint: dict[str, Any],
+    current_text: str,
+    current_token_ids: list[int],
+    current_log_probs: list[float],
+    im_end_id: int | None,
+    decision_controller: Any,
+    bayes_config: Any,
+    candidates_override: list[dict[str, Any]] | None = None,
+    candidate_errors_override: list[str] | None = None,
+    target_group_size: int | None = None,
+    force_branch: bool = False,
+) -> tuple[list[Sample], dict[str, Any]]:
+    """Create real sibling continuations from one shared prefix."""
+
+    if decision_controller is None or bayes_config is None or canonical_action_key is None:
+        return [], {"branch_triggered": False, "reason": "bayestool decision runtime unavailable"}
+    if candidates_override is not None:
+        candidates = list(candidates_override)
+        candidate_errors = list(candidate_errors_override or [])
+    else:
+        candidates, candidate_errors = await _sample_bayestool_branch_candidates(
+            state=state,
+            url=url,
+            checkpoint=checkpoint,
+            current_text=current_text,
+            current_token_ids=current_token_ids,
+            current_log_probs=current_log_probs,
+            sampling_params=sampling_params,
+            im_end_id=im_end_id,
+            config=bayes_config,
+            target_group_size=target_group_size,
+        )
+    if len(candidates) < 2:
+        return [], {
+            "branch_triggered": False,
+            "reason": "fewer than two valid policy candidates",
+            "candidate_action_keys": [item["key"] for item in candidates],
+            "candidate_errors": candidate_errors,
+        }
+
+    task_state = TaskStateView.from_navigation_state(
+        checkpoint.get("navigation_state", {}),
+        tool_budget=max(0, int(checkpoint.get("max_tool_steps", 0) - checkpoint.get("tool_call_count", 0))),
+    )
+    branch_belief = checkpoint.get("belief_runtime")
+    action_values = [item["action"] for item in candidates]
+    diagnostic_actions = [
+        action
+        for action in action_values
+        if str(action.get("tool") or "") in {"detect_layout", "render_page", "crop_region", "zoom_region", "ocr_region"}
+    ]
+    branch_controller = DecisionController(
+        bayes_config,
+        q_head=getattr(decision_controller, "q_head", None),
+        risk_calibrator=getattr(decision_controller, "risk_calibrator", None),
+        seed=int(getattr(sample, "index", 0) or 0),
+    )
+    if bool(getattr(decision_controller, "q_head_ready", False)):
+        branch_controller.enable_q_head(True)
+    report = branch_controller.select(
+        task_state,
+        branch_belief,
+        action_values,
+        diagnostic_actions=diagnostic_actions,
+        risk_metadata={
+            "independent_tool_count": len(checkpoint.get("navigation_state", {}).get("supporting_pages", [])),
+            "recent_surprise": float(checkpoint.get("navigation_state", {}).get("recent_surprise", 0.0) or 0.0),
+        },
+    )
+    gate_seed = int.from_bytes(
+        hashlib.sha256(f"{checkpoint['prefix_hash']}:branch-gate".encode("utf-8")).digest()[:8],
+        "big",
+    )
+    import random
+
+    if not force_branch and not branch_controller.branch_gate(
+        task_state,
+        report,
+        belief=branch_belief,
+        rng=random.Random(gate_seed),
+    ):
+        return [], {
+            "branch_triggered": False,
+            "reason": "branch probability gate or eligibility failed",
+            "candidate_action_keys": [item["key"] for item in candidates],
+            "decision_regret": float(report.decision_regret),
+            "candidate_errors": candidate_errors,
+        }
+
+    q_feature_records: dict[str, dict[str, Any]] = {}
+    if q_feature_vectors is not None and report.particles:
+        for candidate in candidates:
+            particle_records: list[dict[str, Any]] = []
+            for particle in report.particles:
+                task_features, particle_features, action_features, budget_features = q_feature_vectors(
+                    task_state,
+                    particle,
+                    candidate["action"],
+                )
+                particle_records.append(
+                    {
+                        "particle_id": int(getattr(particle, "particle_id", len(particle_records))),
+                        "task_features": task_features,
+                        "particle_features": particle_features,
+                        "action_features": action_features,
+                        "budget_features": budget_features,
+                    }
+                )
+            if particle_records:
+                q_feature_records[candidate["key"]] = dict(particle_records[0])
+                q_feature_records[candidate["key"]]["particle_records"] = particle_records
+
+    sibling_group_id = str(
+        (sample.metadata or {}).get("sibling_group_id")
+        or f"bayes-branch:{checkpoint['bayes_coupling_id']}:{checkpoint['prefix_hash'][:16]}"
+    )
+    branch_group_id = f"{sibling_group_id}:prefix:{checkpoint['prefix_hash'][:16]}"
+    target_group_size = int(
+        target_group_size
+        if target_group_size is not None
+        else getattr(bayes_config, "default_group_size", 4)
+        or 4
+    )
+    # Direct legacy helper callers may provide only ``max_siblings`` and no
+    # QuestionRolloutPlan.  Keep that isolated compatibility path working;
+    # generated training samples always carry an explicit plan and therefore
+    # take the strict K invariant below.
+    explicit_plan = isinstance((sample.metadata or {}).get("question_rollout_plan"), Mapping)
+    if not explicit_plan and int(getattr(bayes_config, "max_siblings", target_group_size)) < target_group_size:
+        target_group_size = int(getattr(bayes_config, "max_siblings", target_group_size))
+    if (explicit_plan and target_group_size not in {4, 8}) or (
+        not explicit_plan and target_group_size < 2
+    ):
+        return [], {
+            "branch_triggered": False,
+            "degenerate_no_signal": True,
+            "reason": f"invalid target decision-group K={target_group_size}",
+        }
+    max_siblings = (
+        target_group_size
+        if explicit_plan
+        else max(target_group_size, int(getattr(bayes_config, "max_siblings", target_group_size)))
+    )
+    parent_action, _ = _bayestool_branch_action_from_text(
+        current_text,
+        checkpoint.get("navigation_state", {}),
+    )
+    parent_key = canonical_action_key(parent_action) if parent_action is not None else ""
+    children: list[Sample] = []
+    child_errors = list(candidate_errors)
+    branch_candidates = [
+        item for item in candidates
+        if not parent_key or item["key"] != parent_key
+    ][: max_siblings - 1]
+    if len(branch_candidates) < target_group_size - 1:
+        return [], {
+            "branch_triggered": False,
+            "degenerate_no_signal": True,
+            "reason": "insufficient independent candidates for target K",
+            "target_group_size": target_group_size,
+            "available_independent_candidates": len(branch_candidates) + 1,
+            "runtime_state_digest": str(checkpoint.get("runtime_state_digest", "")),
+            "candidate_action_keys": [item["key"] for item in candidates],
+            "candidate_errors": child_errors,
+        }
+    for child_number, candidate in enumerate(branch_candidates, start=1):
+        resume_id = f"{checkpoint['prefix_hash']}:{child_number}:{uuid.uuid4().hex}"
+        child_checkpoint = _clone_bayestool_branch_checkpoint(checkpoint)
+        child_checkpoint["forced_action"] = {
+            "raw": candidate["raw"],
+            "token_ids": list(candidate["token_ids"]),
+            "log_probs": list(candidate["log_probs"]),
+            "key": candidate["key"],
+        }
+        child_checkpoint["branch_sibling_group_id"] = branch_group_id
+        child_checkpoint["branch_horizon"] = int(getattr(bayes_config, "branch_horizon", 3))
+        child_checkpoint["branch_q_features"] = q_feature_records.get(candidate["key"], {})
+        _BAYES_BRANCH_CHECKPOINTS[resume_id] = child_checkpoint
+
+        child = deepcopy(sample)
+        parent_index = int(sample.index or 0)
+        child.index = parent_index * 1_000_000 + int(checkpoint["turn"]) * 1_000 + child_number
+        child.status = Sample.Status.PENDING
+        child.tokens = list(checkpoint["prompt_token_ids"]) + list(checkpoint["response_token_ids"])
+        child.response = str(checkpoint["response"])
+        child.response_length = len(checkpoint["response_token_ids"])
+        child.loss_mask = list(checkpoint["loss_masks"])
+        child.rollout_log_probs = list(checkpoint["rollout_log_probs"])
+        child.multimodal_inputs = {
+            "images": _branch_deepcopy(checkpoint.get("current_images", [])),
+            "videos": None,
+        } if checkpoint.get("current_images") else None
+        child.multimodal_train_inputs = _merge_multimodal_train_inputs(
+            checkpoint.get("multimodal_train_inputs_buffer", [])
+        )
+        child.reward = None
+        child.metadata = deepcopy(sample.metadata or {})
+        child.metadata.update(
+            {
+                "bayestool_branch_child": True,
+                "bayestool_branch_resume_id": resume_id,
+                "bayestool_branch_id": f"{branch_group_id}:{child_number}",
+                "bayestool_branch_parent_index": parent_index,
+                "bayestool_branch_prefix_hash": checkpoint["prefix_hash"],
+                "selected_decision_event": str(
+                    checkpoint.get("selected_decision_event")
+                    or f"branch:{checkpoint['prefix_hash'][:32]}"
+                ),
+                "bayestool_branch_shared_prefix": True,
+                "bayestool_branch_shared_prefix_tokens": len(checkpoint["context_token_ids"]),
+                "bayestool_branch_action_key": candidate["key"],
+                "bayestool_branch_action_text": candidate["raw"],
+                "bayestool_branch_q_features": q_feature_records.get(candidate["key"], {}),
+                "bayestool_branch_horizon": int(getattr(bayes_config, "branch_horizon", 3)),
+                "bayestool_branch_candidate_keys": [item["key"] for item in candidates],
+                "bayestool_branch_sibling_group_id": branch_group_id,
+                "bayes_content_signature": checkpoint.get("bayes_content_signature", ""),
+                "bayes_aux_prompt": checkpoint.get("bayes_aux_prompt", ""),
+                "sibling_group_id": branch_group_id,
+                "runtime_state_digest": str(checkpoint.get("runtime_state_digest", "")),
+                "bayes_runtime_state_digest": str(checkpoint.get("runtime_state_digest", "")),
+                "world_slot_role": str((sample.metadata or {}).get("world_slot_role", "")),
+                "variant_id": str((sample.metadata or {}).get("variant_id", "base")),
+                "bayestool_realization_index": (sample.metadata or {}).get(
+                    "bayestool_realization_index"
+                ),
+                "policy_version": str(
+                    (sample.metadata or {}).get("policy_version", DEFAULT_POLICY_VERSION)
+                ),
+                "decision_group_size": target_group_size,
+            }
+        )
+        child_sampling_params = dict(sampling_params)
+        try:
+            result = await generate(args, child, child_sampling_params, evaluation=evaluation)
+            if isinstance(result, Sample):
+                children.append(result)
+            else:
+                child_errors.append("nested branch child returned multiple samples")
+        except Exception as exc:
+            child_errors.append(str(exc))
+            _BAYES_BRANCH_CHECKPOINTS.pop(resume_id, None)
+
+    return children, {
+        "branch_triggered": bool(children),
+        "force_branch": bool(force_branch),
+        "branch_sibling_group_id": branch_group_id,
+        "prefix_hash": checkpoint["prefix_hash"],
+        "parent_action_key": parent_key,
+        "candidate_action_keys": [item["key"] for item in candidates],
+        "q_features": q_feature_records,
+        "selected_action": report.selected_action,
+        "decision_regret": float(report.decision_regret),
+        "branch_horizon": int(getattr(bayes_config, "branch_horizon", 3)),
+        "child_count": len(children),
+        "target_group_size": target_group_size,
+        "runtime_state_digest": str(checkpoint.get("runtime_state_digest", "")),
+        "candidate_errors": child_errors,
+    }
 
 
 def _find_last_final_span(text: str) -> tuple[int, int] | None:
@@ -539,6 +1590,36 @@ def _record_action_candidate(
     )
 
 
+def _record_failure_event(
+    action_log: dict[str, Any] | None,
+    *,
+    kind: str,
+    origin: str,
+    turn: int | None = None,
+    tool: str | None = None,
+    reason: str = "",
+    penalize: bool | None = None,
+    evidence: Mapping[str, Any] | None = None,
+) -> None:
+    """Record one canonical failure outcome without conflating world faults."""
+
+    if action_log is None:
+        return
+    if penalize is None:
+        penalize = origin in {"model_action", "protocol", "budget"}
+    action_log.setdefault("failure_events", []).append(
+        {
+            "kind": str(kind),
+            "origin": str(origin),
+            "turn": turn,
+            "tool": tool,
+            "reason": str(reason),
+            "penalize": bool(penalize),
+            "evidence": dict(evidence or {}),
+        }
+    )
+
+
 def _looks_like_placeholder_path(value: str) -> bool:
     normalized = value.strip().casefold().replace("\\", "/")
     if normalized in {
@@ -591,6 +1672,10 @@ def _parse_tool_result(result: str) -> tuple[bool, dict[str, Any] | None, str | 
     if not isinstance(payload, dict):
         return False, None, "tool result must be an object"
     status = str(payload.get("status", "")).casefold()
+    execution_succeeded = payload.get("execution_succeeded")
+    observation_delivered = payload.get("observation_delivered")
+    if execution_succeeded is True and observation_delivered is True and not status:
+        status = "ok"
     # ``partial`` is a recoverable tool result, not a silent success: for
     # example OCR may be unavailable while the cropped image is still valid
     # vision input.  Continue the model loop and preserve the error payload.
@@ -1106,6 +2191,31 @@ def _candidate_relation_score(candidate: dict[str, Any]) -> float:
         return 0.0
 
 
+def _bayestool_dvoi_score(value: Any) -> float:
+    """Return a scalar DVOI score for branch ranking and telemetry.
+
+    ``DecisionReport.dvoi`` is intentionally a mapping from candidate action
+    keys to scores.  Branch selection needs one checkpoint-level score, so use
+    the strongest finite candidate value while retaining the original mapping
+    in the decision metadata.  Older callers may still provide a scalar.
+    """
+    if isinstance(value, Mapping):
+        scores: list[float] = []
+        for candidate in value.values():
+            try:
+                score = float(candidate)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(score):
+                scores.append(score)
+        return max(scores, default=0.0)
+    try:
+        score = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return score if math.isfinite(score) else 0.0
+
+
 def _valid_evidence_candidates(candidates: Any) -> list[dict[str, Any]]:
     """Return only candidates that satisfy the question-bound relation rule."""
     if not isinstance(candidates, (list, tuple)):
@@ -1368,6 +2478,7 @@ def _navigation_status_text(navigation_state: dict[str, Any]) -> str:
     visited = sorted({int(page) for page in navigation_state.get("visited_pages", [])})
     unvisited = sorted({int(page) for page in navigation_state.get("unvisited_pages", [])})
     lines = [
+        _OBSERVATION_PROTOCOL_RULE,
         "Document navigation state:",
         f"Document page count: {page_count_text}",
         f"Visited pages: {visited}",
@@ -1402,17 +2513,17 @@ def _navigation_status_text(navigation_state: dict[str, Any]) -> str:
     if navigation_state.get("search_budget_exhausted"):
         lines.append(
             "Search budget exhausted. Do not call another tool; produce the best "
-            "grounded <final>...</final> answer now."
+            "grounded final answer action now."
         )
     elif visited and not unvisited:
         lines.append(
             "All known document pages have been checked. Do not call another tool or "
-            "write a document summary; answer concisely and end with <final>...</final>."
+            "write a document summary; answer concisely with the final answer action."
         )
     if navigation_state.get("evidence_sufficient"):
         lines.append(
             "Sufficient supporting evidence has been found. You may stop searching and emit the concise "
-            "<final>...</final> answer; do not scan additional pages unless a table/visual follow-up is required."
+            "final answer action; do not scan additional pages unless a table/visual follow-up is required."
         )
     elif question_type == "table" and navigation_state.get("table_candidate_pages"):
         lines.append(
@@ -1443,9 +2554,34 @@ def _tool_arguments_for_navigation(
     arguments: dict[str, Any],
     navigation_state: dict[str, Any] | None,
 ) -> tuple[dict[str, Any], bool]:
-    if navigation_state is None or tool_name != "parse_document":
-        return arguments, False
     updated = dict(arguments)
+    auto_routed = False
+    normalized, normalization_reason = normalize_tool_arguments(tool_name, updated)
+    if normalized is not None:
+        updated = normalized
+    elif normalization_reason:
+        # The strict parser normally catches this before reaching navigation.
+        # Keep direct callers deterministic without turning a duplicate alias
+        # into a silently rewritten action.
+        return updated, False
+    if navigation_state is None:
+        return updated, False
+    if tool_name in {
+        "render_page",
+        "crop_region",
+        "zoom_region",
+        "parse_document",
+        "detect_layout",
+        "ocr_region",
+        "extract_table",
+        "chart_to_table",
+    } and not updated.get("document_path") and not updated.get("image_path"):
+        document_path = navigation_state.get("document_path")
+        if document_path:
+            updated["document_path"] = str(document_path)
+            auto_routed = True
+    if tool_name != "parse_document":
+        return updated, auto_routed
     requested = _requested_pages(updated)
     visited = {int(page) for page in navigation_state.get("parsed_pages", [])}
     unvisited = [int(page) for page in navigation_state.get("unvisited_pages", [])]
@@ -1464,7 +2600,7 @@ def _tool_arguments_for_navigation(
     if not requested and unvisited:
         updated["page_numbers"] = [unvisited[0]]
         return updated, True
-    return updated, False
+    return updated, auto_routed
 
 
 def _normalized_evidence(value: Any) -> str:
@@ -1802,10 +2938,18 @@ def _can_finish(prediction: str, navigation_state: dict[str, Any] | None) -> tup
     search_budget_exhausted = bool(navigation_state.get("search_budget_exhausted"))
     page_count_known = isinstance(navigation_state.get("page_count"), int) and int(navigation_state.get("page_count")) > 0
     visited_pages = list(navigation_state.get("visited_pages", []))
-    if not visited_pages and not search_budget_exhausted:
-        if _is_absence_answer(answer):
-            navigation_state["current_evidence_sufficient"] = False
-            return False, "no document page has been inspected yet", supported_pages
+    has_document_observation = bool(
+        visited_pages
+        or candidates
+        or navigation_state.get("evidence_by_page")
+        or navigation_state.get("parsed_pages")
+        or navigation_state.get("rendered_pages")
+        or navigation_state.get("cropped_pages")
+        or navigation_state.get("ocr_pages")
+    )
+    if not has_document_observation and not search_budget_exhausted:
+        navigation_state["current_evidence_sufficient"] = False
+        return False, "no document page has been inspected yet", supported_pages
     if not page_count_known and not search_budget_exhausted and _is_absence_answer(answer):
         navigation_state["current_evidence_sufficient"] = False
         return False, "document page count is unknown and an absence answer has no supporting evidence", supported_pages
@@ -1989,6 +3133,15 @@ async def execute_predictions(
     action_log: dict[str, Any] | None = None,
     turn: int | None = None,
     navigation_state: dict[str, Any] | None = None,
+    world_runtime: Any | None = None,
+    belief_runtime: Any | None = None,
+    decision_controller: Any | None = None,
+    tool_budget: int | None = None,
+    bayes_aux_prompt: str | None = None,
+    bayes_prompt_tokenizer: Any | None = None,
+    cost_state: dict[str, float] | None = None,
+    candidate_records: list[dict[str, Any]] | None = None,
+    candidate_decision: dict[str, Any] | None = None,
 ) -> tuple[str, bool]:
     """Parse and execute one assistant turn without silently recovering it."""
     if action_log is not None:
@@ -2005,10 +3158,34 @@ async def execute_predictions(
         action_log.setdefault("actions", [])
     parsed = parse_assistant_action(prediction)
     _record_action_candidate(action_log, parsed, turn=turn, raw=prediction)
+    if action_log is not None and candidate_decision is not None:
+        action_log["bayes_decision"] = dict(candidate_decision)
+        action_log.setdefault("bayes_decisions", []).append(dict(candidate_decision))
+        action_log["candidate_action_keys"] = [
+            str(item.get("key")) for item in (candidate_records or []) if isinstance(item, dict)
+        ]
+        if action_log.get("actions"):
+            action_log["actions"][-1]["policy_candidates"] = [
+                {
+                    "key": str(item.get("key")),
+                    "source": str(item.get("source", "")),
+                    "token_count": len(item.get("token_ids", [])),
+                }
+                for item in (candidate_records or [])
+                if isinstance(item, dict)
+            ]
 
     if parsed.kind == "final":
         can_finish, finish_reason, supporting_pages = _can_finish(prediction, navigation_state)
         if not can_finish:
+            _record_failure_event(
+                action_log,
+                kind="premature_final",
+                origin="protocol",
+                turn=turn,
+                reason=finish_reason,
+                evidence={"supporting_pages": supporting_pages},
+            )
             if action_log is not None:
                 action_log["premature_final_count"] = int(action_log.get("premature_final_count", 0)) + 1
                 action_log["actions"][-1].update(
@@ -2051,6 +3228,24 @@ async def execute_predictions(
             return _final_guard_observation(finish_reason, navigation_state or {}), False
         if action_log is not None:
             action_log["valid_action_count"] = int(action_log.get("valid_action_count", 0)) + 1
+            failed_evidence = any(
+                isinstance(item, dict)
+                and item.get("kind") == "tool_call"
+                and item.get("executed")
+                and not item.get("success")
+                for item in (execution_trace or [])
+            )
+            if failed_evidence:
+                action_log["actions"][-1]["used_failed_evidence"] = True
+                _record_failure_event(
+                    action_log,
+                    kind="final_used_failed_evidence",
+                    origin="model_action",
+                    turn=turn,
+                    reason="final action followed an unsuccessful tool observation",
+                    penalize=not bool(supporting_pages),
+                    evidence={"supporting_pages": supporting_pages},
+                )
             action_log["actions"][-1].update(
                 {
                     "valid": True,
@@ -2082,8 +3277,51 @@ async def execute_predictions(
         _set_terminal_status(action_log, "completed")
         return "", True
 
+    if parsed.kind == "abstain":
+        reason = str(parsed.value or "insufficient reliable evidence")
+        if action_log is not None:
+            action_log["valid_action_count"] = int(action_log.get("valid_action_count", 0)) + 1
+            action_log["actions"][-1].update(
+                {
+                    "valid": True,
+                    "executed": False,
+                    "accepted": True,
+                    "abstention": True,
+                    "abstention_reason": reason,
+                    "action_valid_for_policy_gradient": True,
+                    "action_reward": 0.0,
+                }
+            )
+            _set_terminal_status(action_log, "abstained")
+        if execution_trace is not None:
+            execution_trace.append(
+                {
+                    "kind": "abstain",
+                    "turn": turn,
+                    "raw": prediction,
+                    "raw_generation_text": prediction,
+                    "parsed_action_type": parsed.kind,
+                    "parsed_tool_name": None,
+                    "valid": True,
+                    "executed": False,
+                    "accepted": True,
+                    "reason": reason,
+                }
+            )
+        if navigation_state is not None:
+            navigation_state["abstention"] = True
+            navigation_state["abstention_reason"] = reason
+        return "", True
+
     if parsed.kind != "tool_call":
         invalid_count = max(1, parsed.candidate_action_count)
+        _record_failure_event(
+            action_log,
+            kind="invalid_action",
+            origin="protocol",
+            turn=turn,
+            reason=parsed.reason,
+        )
         if action_log is not None:
             action_log["invalid_action_count"] = int(action_log.get("invalid_action_count", 0)) + invalid_count
             action_log["ignored_action_count"] = int(action_log.get("ignored_action_count", 0)) + parsed.candidate_action_count
@@ -2120,6 +3358,14 @@ async def execute_predictions(
     tool_call = parsed.value if isinstance(parsed.value, dict) else {}
     valid, validation_error = _validate_tool_call(tool_call)
     if not valid:
+        _record_failure_event(
+            action_log,
+            kind="invalid_tool_arguments",
+            origin="protocol",
+            turn=turn,
+            tool=str(tool_call.get("name") or ""),
+            reason=validation_error or "invalid tool call",
+        )
         if action_log is not None:
             action_log["invalid_action_count"] = int(action_log.get("invalid_action_count", 0)) + 1
             action_log["ignored_action_count"] = int(action_log.get("ignored_action_count", 0)) + 1
@@ -2160,6 +3406,14 @@ async def execute_predictions(
         # been consumed.  Give the model a normal observation so it can use the
         # reserved recovery turn to emit a final answer.
         reason = "tool search budget exhausted; emit final answer"
+        _record_failure_event(
+            action_log,
+            kind="budget_blocked_tool",
+            origin="budget",
+            turn=turn,
+            tool=str(tool_call.get("name") or ""),
+            reason=reason,
+        )
         if action_log is not None:
             action_log["valid_action_count"] = int(action_log.get("valid_action_count", 0)) + 1
             action_log["ignored_action_count"] = int(action_log.get("ignored_action_count", 0)) + 1
@@ -2200,7 +3454,7 @@ async def execute_predictions(
         return (
             "<interpreter>\n"
             "Tool search budget exhausted. Do not call another tool; output "
-            "the best grounded answer inside <final>...</final>.\n"
+            "the best grounded final answer action.\n"
             f"{_navigation_status_text(navigation_state)}\n"
             "</interpreter>",
             False,
@@ -2209,6 +3463,206 @@ async def execute_predictions(
     tool_name = str(tool_call["name"])
     arguments = dict(tool_call.get("arguments", {}))
     arguments, auto_routed = _tool_arguments_for_navigation(tool_name, arguments, navigation_state)
+    controller_selected_action: dict[str, Any] | None = None
+    policy_action_key = (
+        canonical_action_key({"kind": "tool", "tool": tool_name, "arguments": arguments})
+        if canonical_action_key is not None
+        else ""
+    )
+    if decision_controller is not None and TaskStateView is not None and candidate_decision is None:
+        try:
+            task_state = TaskStateView.from_navigation_state(
+                navigation_state or {},
+                tool_budget=int(tool_budget if tool_budget is not None else TOOL_CONFIGS.get("max_tool_calls", 8)),
+            )
+            decision_candidates = [
+                {"kind": "tool", "tool": tool_name, "arguments": arguments},
+            ]
+            # DVOI is only allowed to compare actions that the current policy
+            # actually proposed.  Do not inject a fixed diagnostic menu here:
+            # the branch path already obtains a finite set of real policy
+            # candidates from the shared prefix, while this single-action
+            # path has at most the current tool as a diagnostic candidate.
+            diagnostic_candidates = (
+                [decision_candidates[0]]
+                if tool_name in {"detect_layout", "render_page", "crop_region", "zoom_region", "ocr_region"}
+                else []
+            )
+            observed_tool_names = {
+                str(item.get("tool"))
+                for item in (execution_trace or [])
+                if isinstance(item, dict) and item.get("kind") == "tool_call" and item.get("tool")
+            }
+            risk_metadata: dict[str, Any] = {
+                "independent_tool_count": max(
+                    len(observed_tool_names),
+                    len((navigation_state or {}).get("supporting_pages", [])),
+                ),
+                "recent_surprise": float((navigation_state or {}).get("recent_surprise", 0.0) or 0.0),
+                "answer_self_consistency": float(
+                    (navigation_state or {}).get("answer_self_consistency", 0.0) or 0.0
+                ),
+                "page_count": max(
+                    1,
+                    int((navigation_state or {}).get("page_count", 0) or 0),
+                    len((navigation_state or {}).get("visited_pages", []))
+                    + int((navigation_state or {}).get("unvisited_page_count", 0) or 0),
+                ),
+            }
+            if belief_runtime is not None:
+                risk_snapshot = belief_runtime.snapshot()
+                risk_quality = risk_snapshot.tool_quality.get(tool_name)
+                if risk_quality is not None:
+                    risk_metadata.update(
+                        {
+                            "semantic_posterior": float(risk_quality.semantic_mean),
+                            "structure_posterior": float(risk_quality.structure_mean),
+                        }
+                    )
+            decision_report = decision_controller.select(
+                task_state,
+                belief_runtime,
+                decision_candidates,
+                diagnostic_actions=diagnostic_candidates,
+                risk_metadata=risk_metadata,
+            )
+            controller_selected_action = next(
+                (
+                    canonical_action(candidate_action)
+                    for candidate_key, candidate_action in decision_report.candidate_actions
+                    if str(candidate_key) == str(decision_report.selected_action)
+                ),
+                None,
+            )
+            candidate_action_records: list[dict[str, Any]] = []
+            candidate_text_by_key: dict[str, str] = {}
+            for candidate_key, candidate_action in decision_report.candidate_actions:
+                if canonical_action_key is None:
+                    continue
+                candidate_key = str(candidate_key)
+                candidate_text = ""
+                try:
+                    if candidate_key == canonical_action_key(
+                        _bayestool_branch_action_from_text(prediction, navigation_state)[0]
+                    ):
+                        candidate_text = prediction
+                except Exception:
+                    candidate_text = ""
+                if not candidate_text:
+                    candidate_text = _bayestool_action_text(candidate_action)
+                candidate_text_by_key[candidate_key] = candidate_text
+                candidate_action_records.append(
+                    {"key": candidate_key, "action": canonical_action(candidate_action), "text": candidate_text}
+                )
+            ordered_values = list(decision_report.action_values)
+            ordered_values.sort(key=lambda value: (-value.value_mean, value.action_key))
+            best_action_margin = (
+                float(ordered_values[0].value_mean - ordered_values[1].value_mean)
+                if len(ordered_values) >= 2
+                else float(max(0.0, ordered_values[0].value_mean)) if ordered_values else 0.0
+            )
+            belief_snapshot = belief_runtime.snapshot().to_dict() if belief_runtime is not None else {}
+            prefix_event_count = len(getattr(world_runtime, "events", [])) if world_runtime is not None else 0
+            prefix_observation_payload = [
+                {
+                    "tool": item.get("tool"),
+                    "arguments": item.get("arguments", {}),
+                    "observed_result": str(item.get("observed_result") or ""),
+                    "result_status": item.get("result_status"),
+                }
+                for item in (execution_trace or [])
+                if isinstance(item, dict) and item.get("kind") == "tool_call"
+            ]
+            prefix_observation_signature = hashlib.sha256(
+                json.dumps(
+                    prefix_observation_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            current_content_signature = None
+            if content_signature is not None:
+                current_content_signature = content_signature(
+                    {
+                        "navigation_state": navigation_state or {},
+                        "question_type": (navigation_state or {}).get("question_type", "text"),
+                        "evidence_candidates": (navigation_state or {}).get("evidence_candidates", []),
+                        "remaining_tool_budget": task_state.remaining_tool_budget,
+                        "phase": (navigation_state or {}).get("phase", "search"),
+                    },
+                    question=str((navigation_state or {}).get("question") or ""),
+                )
+            branch_eligible = bool(
+                bool(getattr(decision_controller.config, "use_regret_branching", True))
+                and
+                decision_report.decision_regret > decision_controller.config.decision_regret_threshold
+                and task_state.remaining_tool_budget >= 2
+                and float(belief_snapshot.get("ood_score", 0.0) or 0.0) < 0.15
+            )
+            decision_metadata = {
+                "selected_action": decision_report.selected_action,
+                "selected_mode": decision_report.selected_mode,
+                "consensus": decision_report.consensus,
+                "consensus_action": decision_report.consensus_action,
+                "bayes_action": decision_report.bayes_action,
+                "decision_regret": decision_report.decision_regret,
+                "dvoi": dict(decision_report.dvoi or {}),
+                "stop_decision": dict(decision_report.stop_decision or {}),
+                "branch_eligible": branch_eligible,
+                "branch_triggered": False,
+                "branch_horizon": int(getattr(decision_controller.config, "branch_horizon", 0)),
+                "candidate_action_keys": [item["key"] for item in candidate_action_records],
+                "candidate_actions": candidate_action_records,
+                "best_action_margin": best_action_margin,
+                "best_action_text": candidate_text_by_key.get(str(decision_report.bayes_action or ""), ""),
+                "policy_action_text": prediction,
+                "belief_snapshot": belief_snapshot,
+                "observed_prefix_event_count": prefix_event_count,
+                "observed_prefix_js": 0.0 if prefix_event_count == 0 else 1.0,
+                "prefix_observation_signature": prefix_observation_signature,
+                "content_signature": current_content_signature or "",
+                "prompt": str(bayes_aux_prompt or ""),
+            }
+            if controller_selected_action is not None:
+                selected_key = canonical_action_key(controller_selected_action)
+                decision_metadata.update(
+                    {
+                        "policy_action_key": policy_action_key,
+                        "selected_action_kind": controller_selected_action.get("kind"),
+                        "decision_action_applied": selected_key != policy_action_key,
+                    }
+                )
+            if action_log is not None:
+                action_log["bayes_decision"] = decision_metadata
+                action_log.setdefault("bayes_decisions", []).append(decision_metadata)
+            if navigation_state is not None:
+                navigation_state["bayes_last_decision"] = decision_metadata
+        except Exception as exc:  # controller diagnostics cannot invalidate a tool action
+            if action_log is not None:
+                action_log.setdefault("bayes_decision_errors", []).append(str(exc))
+
+    # The normal path contains only the action sampled by the policy.  The
+    # controller can therefore annotate this action, but it cannot insert a
+    # synthetic final/abstain action or replace it with an unscored tool.  A
+    # finite set of alternate actions is executed only by the branch path,
+    # which obtains each candidate from a real policy sample.
+    if controller_selected_action is not None:
+        selected_key = canonical_action_key(controller_selected_action)
+        if selected_key != policy_action_key:
+            # This is a defensive telemetry-only guard.  The normal candidate
+            # set contains only the sampled action, and branch continuations
+            # are generated separately from real policy samples.  Never
+            # execute a controller-only replacement here because it would be
+            # absent from the policy-gradient token sequence.
+            if action_log is not None:
+                action_log["actions"][-1].update(
+                    {
+                        "controller_action_not_applied": True,
+                        "controller_selected_action": selected_key,
+                    }
+                )
     if action_log is not None:
         action_log["valid_action_count"] = int(action_log.get("valid_action_count", 0)) + 1
         action_log["executed_action_count"] = int(action_log.get("executed_action_count", 0)) + 1
@@ -2216,18 +3670,40 @@ async def execute_predictions(
             {"valid": True, "executed": True, "tool": tool_name, "auto_routed": auto_routed}
         )
 
+    tool_started_at = time.perf_counter()
     try:
-        result = await tool_registry.execute_tool(tool_name, arguments)
+        result = await _bayestool_execute_clean_cached(world_runtime, tool_name, arguments)
     except Exception as exc:  # the model action was sent, but the tool failed
+        tool_elapsed_seconds = max(0.0, time.perf_counter() - tool_started_at)
+        exception_budget = max(
+            0,
+            int(tool_budget if tool_budget is not None else TOOL_CONFIGS.get("max_tool_calls", 8)) - 1,
+        )
+        if navigation_state is not None:
+            navigation_state["last_tool"] = tool_name
+            navigation_state["last_result_status"] = "error"
+            navigation_state["remaining_tool_budget"] = exception_budget
+        if cost_state is not None:
+            cost_state["tool_calls"] = float(cost_state.get("tool_calls", 0.0)) + 1.0
+            cost_state["latency_seconds"] = float(cost_state.get("latency_seconds", 0.0)) + tool_elapsed_seconds
+            cost_state["observation_text_tokens"] = float(cost_state.get("observation_text_tokens", 0.0)) + _bayestool_token_count(str(exc), bayes_prompt_tokenizer)
         if navigation_state is not None and _is_infrastructure_tool_error(exc):
             navigation_state["had_infra_error"] = True
             navigation_state["infra_error_messages"] = list(navigation_state.get("infra_error_messages", [])) + [str(exc)]
         if action_log is not None:
             action_log["tool_error_count"] = int(action_log.get("tool_error_count", 0)) + 1
             action_log["actions"][-1].update({"success": False, "tool_error": str(exc)})
+        _record_failure_event(
+            action_log,
+            kind="tool_execution_failure",
+            origin="real_infrastructure",
+            turn=turn,
+            tool=tool_name,
+            reason=str(exc),
+            penalize=False,
+        )
         if execution_trace is not None:
-            execution_trace.append(
-                {
+            failure_trace = {
                     "kind": "tool_call",
                     "turn": turn,
                     "tool": tool_name,
@@ -2236,18 +3712,57 @@ async def execute_predictions(
                     "executed": True,
                     "success": False,
                     "error": str(exc),
+                    "failure_origin": "real_infrastructure",
                 }
-            )
+            if world_runtime is not None:
+                transformed = world_runtime.record_real_infrastructure_failure(tool_name, arguments, str(exc))
+                failure_trace["world_event"] = transformed.world_event.to_dict()
+                failure_trace["bayes_supervision"] = transformed.hidden_supervision.to_dict()
+            execution_trace.append(failure_trace)
         fallback = _tool_failure_fallback(tool_name, arguments, str(exc), navigation_state)
         if fallback is not None:
             if execution_trace is not None:
                 execution_trace[-1]["recovery_observation"] = True
                 execution_trace[-1]["recovered_with_fallback"] = True
+            if belief_runtime is not None:
+                fallback = _bayestool_append_observation(
+                    fallback,
+                    belief_runtime,
+                    navigation_state or {},
+                    tool_budget=exception_budget,
+                    tokenizer=bayes_prompt_tokenizer,
+                )
             return fallback, False
         _set_terminal_status(action_log, "tool_error")
         return "", True
 
-    success, parsed_result, result_status = _parse_tool_result(result)
+    tool_elapsed_seconds = max(0.0, time.perf_counter() - tool_started_at)
+    clean_result = str(result)
+    success, parsed_result, result_status = _parse_tool_result(clean_result)
+    observed_result = clean_result
+    world_event = None
+    hidden_supervision = None
+    if world_runtime is not None:
+        clean_image_paths, clean_image_candidates = _image_paths_from_result(parsed_result)
+        transformed = world_runtime.transform_result(
+            tool_name,
+            arguments,
+            clean_result,
+            result_status=str(result_status or ("ok" if success else "error")),
+            image_paths=clean_image_paths,
+            image_valid=not clean_image_candidates or bool(clean_image_paths),
+        )
+        observed_result = transformed.observed_result
+        world_event = transformed.world_event
+        hidden_supervision = transformed.hidden_supervision
+        observed_success, observed_payload, observed_status = _parse_tool_result(observed_result)
+        if observed_success:
+            parsed_result = observed_payload
+            result_status = observed_status or result_status
+        else:
+            success = False
+            parsed_result = {"error": observed_result}
+            result_status = observed_status or "error"
     image_paths, image_candidates = _image_paths_from_result(parsed_result if success else None)
     media_error = bool(success and image_candidates and not image_paths)
     trace_item = {
@@ -2267,8 +3782,29 @@ async def execute_predictions(
         "image_paths": image_paths,
         "image_candidates": image_candidates,
         "media_error": media_error,
-        "result": result,
+        "result": clean_result,
+        "observed_result": observed_result,
+        "failure_origin": world_event.failure_origin if world_event is not None else "none",
     }
+    if TaskStateView is not None:
+        trace_item["task_state_before"] = TaskStateView.from_navigation_state(
+            navigation_state or {},
+            tool_budget=max(0, int(tool_budget if tool_budget is not None else TOOL_CONFIGS.get("max_tool_calls", 8))),
+        ).to_prompt_dict()
+    if world_event is not None:
+        trace_item["world_event"] = world_event.to_dict()
+        trace_item["bayes_supervision"] = hidden_supervision.to_dict() if hidden_supervision is not None else None
+    observed_latency = (
+        float(world_event.latency)
+        if world_event is not None and math.isfinite(float(world_event.latency))
+        else tool_elapsed_seconds
+    )
+    trace_item["latency_seconds"] = max(0.0, observed_latency)
+    trace_item["observation_token_count"] = _bayestool_token_count(observed_result, bayes_prompt_tokenizer)
+    if cost_state is not None:
+        cost_state["tool_calls"] = float(cost_state.get("tool_calls", 0.0)) + 1.0
+        cost_state["latency_seconds"] = float(cost_state.get("latency_seconds", 0.0)) + max(0.0, observed_latency)
+        cost_state["observation_text_tokens"] = float(cost_state.get("observation_text_tokens", 0.0)) + float(trace_item["observation_token_count"])
     if isinstance(parsed_result, dict) and parsed_result.get("error"):
         trace_item["error"] = str(parsed_result["error"])
     if execution_trace is not None:
@@ -2284,13 +3820,96 @@ async def execute_predictions(
             }
         )
 
+    # Navigation is derived from the observed result before the belief
+    # filter extracts features.  This keeps task projection/budget/page state
+    # causally aligned with the same observation that updates the posterior.
+    budget_before_observation = int(
+        tool_budget if tool_budget is not None else TOOL_CONFIGS.get("max_tool_calls", 8)
+    )
+    budget_after_observation = max(0, budget_before_observation - 1)
+    if navigation_state is not None:
+        navigation_state["last_tool"] = tool_name
+        navigation_state["last_result_status"] = result_status or ("ok" if success else "error")
+        navigation_state["remaining_tool_budget"] = budget_after_observation
+    _update_navigation_state(navigation_state, tool_name, arguments, parsed_result, success)
+    _update_pending_visual_input(
+        navigation_state,
+        tool_name,
+        image_paths,
+        parsed_result,
+        arguments,
+    )
+    if TaskStateView is not None:
+        trace_item["task_state_after"] = TaskStateView.from_navigation_state(
+            navigation_state or {},
+            tool_budget=budget_after_observation,
+        ).to_prompt_dict()
+
     if not success:
+        if world_event is not None and world_event.failure_origin == "world_injected":
+            _record_failure_event(
+                action_log,
+                kind="world_observation_failure",
+                origin="world_injected",
+                turn=turn,
+                tool=tool_name,
+                reason=str(result_status or "observation unavailable"),
+                penalize=False,
+                evidence={"observation_delivered": bool(world_event.observation_delivered)},
+            )
+            # Injected failures are valid POMDP observations and must remain
+            # in RL.  They are not routed through the infrastructure-error
+            # exclusion path.
+            if belief_runtime is not None:
+                event_for_belief = world_event
+                surprise = belief_runtime.predictive_surprise(event_for_belief)
+                event_for_belief = replace(event_for_belief, predictive_surprise=surprise)
+                if execution_trace is not None:
+                    execution_trace[-1]["world_event"] = event_for_belief.to_dict()
+                belief_runtime.update(
+                    tool_name,
+                    observed_result,
+                    event_for_belief,
+                    task_state=TaskStateView.from_navigation_state(navigation_state or {}) if TaskStateView else None,
+                    hidden_supervision=hidden_supervision.to_dict() if hidden_supervision is not None else None,
+                )
+                level = belief_runtime.detect_reopen_level(event_for_belief)
+                if level and bool(getattr(getattr(decision_controller, "config", None), "use_reopen", True)):
+                    reopen = belief_runtime.reopen(
+                        level,
+                        cause_tools=[tool_name],
+                        surprise=surprise,
+                    )
+                    if execution_trace is not None:
+                        execution_trace[-1]["reopen"] = reopen
+            next_obs = _bayestool_append_observation(
+                observed_result,
+                belief_runtime,
+                navigation_state or {},
+                tool_budget=budget_after_observation,
+                tokenizer=bayes_prompt_tokenizer,
+            )
+            next_obs = f"<interpreter>\nTool: {tool_name}\n{next_obs}\n</interpreter>"
+            return next_obs, False
         tool_error_text = str((parsed_result or {}).get("error") if isinstance(parsed_result, dict) else result)
         if navigation_state is not None and _is_infrastructure_tool_error(tool_error_text):
             navigation_state["had_infra_error"] = True
             navigation_state["infra_error_messages"] = list(navigation_state.get("infra_error_messages", [])) + [tool_error_text]
         if action_log is not None:
             action_log["tool_error_count"] = int(action_log.get("tool_error_count", 0)) + 1
+        _record_failure_event(
+            action_log,
+            kind="tool_result_failure",
+            origin="model_action",
+            turn=turn,
+            tool=tool_name,
+            reason=tool_error_text,
+        )
+        trace_item["failure_origin"] = "real_infrastructure" if _is_infrastructure_tool_error(tool_error_text) else "model_action"
+        if world_runtime is not None and world_event is None:
+            transformed = world_runtime.record_real_infrastructure_failure(tool_name, arguments, tool_error_text)
+            trace_item["world_event"] = transformed.world_event.to_dict()
+            trace_item["bayes_supervision"] = transformed.hidden_supervision.to_dict()
         fallback = _tool_failure_fallback(
             tool_name,
             arguments,
@@ -2305,19 +3924,150 @@ async def execute_predictions(
         _set_terminal_status(action_log, "tool_error")
         return "", True
 
-    _update_navigation_state(navigation_state, tool_name, arguments, parsed_result, success)
-    _update_pending_visual_input(
-        navigation_state,
-        tool_name,
-        image_paths,
-        parsed_result,
-        arguments,
-    )
-    limited_result = _limit_tool_result(str(result), int(TOOL_CONFIGS.get("max_obs_chars", 8192)))
+    if world_event is not None and belief_runtime is not None:
+        surprise = belief_runtime.predictive_surprise(world_event)
+        world_event = replace(world_event, predictive_surprise=surprise)
+        if execution_trace is not None:
+            execution_trace[-1]["world_event"] = world_event.to_dict()
+        belief_runtime.update(
+            tool_name,
+            observed_result,
+            world_event,
+            task_state=TaskStateView.from_navigation_state(navigation_state or {}) if TaskStateView else None,
+            hidden_supervision=hidden_supervision.to_dict() if hidden_supervision is not None else None,
+        )
+        level = belief_runtime.detect_reopen_level(world_event)
+        if level and bool(getattr(getattr(decision_controller, "config", None), "use_reopen", True)):
+            reopen = belief_runtime.reopen(level, cause_tools=[tool_name], surprise=surprise)
+            if execution_trace is not None:
+                execution_trace[-1]["reopen"] = reopen
+    limited_result = _limit_tool_result(observed_result, int(TOOL_CONFIGS.get("max_obs_chars", 8192)))
     if navigation_state is not None:
         limited_result = f"{limited_result}\n{_navigation_status_text(navigation_state)}"
+    if belief_runtime is not None:
+        limited_result = _bayestool_append_observation(
+            limited_result,
+            belief_runtime,
+            navigation_state or {},
+            tool_budget=budget_after_observation,
+            tokenizer=bayes_prompt_tokenizer,
+        )
     next_obs = f"<interpreter>\nTool: {tool_name}\n{limited_result}\n</interpreter>"
     return next_obs, False
+
+
+async def _generate_bayestool_meta_episode(
+    args: Any,
+    sample: Sample,
+    sampling_params: dict[str, Any],
+    *,
+    evaluation: bool = False,
+) -> list[Sample]:
+    """Run each meta question as a Sample while carrying session belief.
+
+    The model still emits one strict final action per question.  The wrapper
+    only shares the world identity, clean-result cache, and persistent
+    session/shared posterior; navigation, evidence, and task hidden state are
+    rebuilt for every question.
+    """
+
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    raw_questions = metadata.get("meta_questions") or []
+    records: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_questions):
+        if isinstance(raw, str):
+            records.append({"prompt": raw, "id": index, "metadata": {}})
+        elif isinstance(raw, dict):
+            record = dict(raw)
+            record.setdefault("id", index)
+            record.setdefault("metadata", {})
+            records.append(record)
+    if len(records) < 2 or build_meta_episode is None:
+        child_metadata = dict(metadata)
+        child_metadata.pop("meta_questions", None)
+        child = deepcopy(sample)
+        child.metadata = child_metadata
+        return [await generate(args, child, sampling_params, evaluation=evaluation)]
+
+    config = config_from_args(args, enabled=True) if config_from_args is not None else None
+    persistent_session_belief = bool(
+        getattr(config, "use_persistent_session_belief", True)
+    )
+    episode = build_meta_episode(records, config=config, seed=int(sample.index or 0))
+    base_index = int(sample.index or 0)
+    document_hash_value = str(metadata.get("document_hash") or "")
+    coupling_id = str(metadata.get("coupling_id") or f"meta-coupling-{episode.meta_episode_id}")
+    session_record: dict[str, Any] | None = None
+    outputs: list[Sample] = []
+
+    meta_world_key = f"{episode.meta_episode_id}:{base_index}"
+    meta_world_type: str | None = None
+    if str(getattr(config, "stage", "c") or "c").casefold() == "d":
+        meta_world_type = (
+            "healthy"
+            if int(stable_seed(episode.meta_episode_id, base_index, "meta-world-type") % 2) == 0
+            else "abrupt_change"
+        ) if stable_seed is not None else None
+    try:
+        for question_index, question in enumerate(episode.questions):
+            child = deepcopy(sample)
+            child.index = base_index * len(episode.questions) + question_index
+            child.status = Sample.Status.PENDING
+            child.tokens = []
+            child.response = ""
+            child.response_length = 0
+            child.loss_mask = None
+            child.rollout_log_probs = []
+            child.reward = None
+            child.metadata = deepcopy(metadata)
+            child.metadata.pop("meta_questions", None)
+            child.metadata.update(question.metadata)
+            child.metadata.update(
+                {
+                    "meta_episode_id": episode.meta_episode_id,
+                    "episode_content_id": episode.episode_content_id,
+                    "meta_trajectory_id": f"{episode.meta_episode_id}:q{question_index}",
+                    "meta_question_index": question_index,
+                    "meta_question_count": len(episode.questions),
+                    "meta_world_sample_index": base_index,
+                    "coupling_id": coupling_id,
+                    "document_hash": document_hash_value or child.metadata.get("document_hash", ""),
+                    "meta_episode_child": True,
+                    "bayestool_meta_world_key": meta_world_key,
+                }
+            )
+            if meta_world_type is not None:
+                child.metadata["world_type"] = meta_world_type
+            if persistent_session_belief and session_record is not None:
+                child.metadata["bayestool_session_belief"] = deepcopy(session_record)
+            child.prompt = question.prompt
+            if question.label is not None:
+                child.label = question.label
+            child_sampling_params = sampling_params.copy()
+            if isinstance(child_sampling_params.get("sampling_seed"), int):
+                child_sampling_params["sampling_seed"] += question_index
+            result = await generate(args, child, child_sampling_params, evaluation=evaluation)
+            result_samples = result if isinstance(result, list) else [result]
+            if not result_samples or not all(isinstance(item, Sample) for item in result_samples):
+                raise TypeError("BayesTool meta episode child generation returned a non-Sample result")
+            primary_result = result_samples[0]
+            for result_sample in result_samples:
+                result_sample.metadata = result_sample.metadata if isinstance(result_sample.metadata, dict) else {}
+                result_sample.metadata["meta_episode_id"] = episode.meta_episode_id
+                result_sample.metadata["meta_question_index"] = question_index
+                result_sample.metadata["meta_question_count"] = len(episode.questions)
+                result_sample.metadata["meta_world_sample_index"] = base_index
+                result_sample.metadata["coupling_id"] = coupling_id
+                result_sample.metadata["bayestool_meta_world_key"] = meta_world_key
+                outputs.append(result_sample)
+            session_record = (
+                deepcopy(primary_result.metadata.get("bayestool_session_belief"))
+                if persistent_session_belief
+                else None
+            )
+    finally:
+        _BAYES_META_WORLD_RUNTIMES.pop(meta_world_key, None)
+    return outputs
 
 
 def _image_token_count(tokenizer: Any, processor: Any, token_ids: list[int]) -> int:
@@ -2362,6 +4112,181 @@ def _merge_multimodal_train_inputs(chunks: list[dict[str, Any]]) -> dict[str, An
     return merged or None
 
 
+def _resolve_training_sequence_limit(args: Any) -> int:
+    """Return the hard sequence limit used by the VLM actor during training.
+
+    The generation context is compacted independently from the training
+    trajectory.  Without an explicit training limit, a successful multi-turn
+    tool rollout can retain every observation and grow well beyond the
+    inference context, making one dynamic microbatch require more memory than
+    an 80-GiB GPU has.  Keep the real-data default conservative and allow an
+    explicit override for experiments that have a larger memory budget.
+    """
+
+    configured = os.environ.get("OPENCLAW_BAYESTOOL_MAX_TRAIN_SEQUENCE_LENGTH")
+    if configured:
+        try:
+            value = int(configured)
+        except ValueError as exc:
+            raise ValueError(
+                "OPENCLAW_BAYESTOOL_MAX_TRAIN_SEQUENCE_LENGTH must be an integer"
+            ) from exc
+        if value <= 0:
+            raise ValueError("OPENCLAW_BAYESTOOL_MAX_TRAIN_SEQUENCE_LENGTH must be positive")
+        return value
+
+    rollout_context = getattr(args, "rollout_max_context_len", None)
+    if rollout_context is not None:
+        try:
+            return max(1024, min(8192, int(rollout_context)))
+        except (TypeError, ValueError):
+            pass
+    return 8192
+
+
+def _cap_training_trajectory(
+    prompt_token_ids: list[int],
+    response_token_ids: list[int],
+    loss_masks: list[int],
+    rollout_log_probs: list[float] | None,
+    context_segments: list[dict[str, Any]],
+    multimodal_train_inputs_buffer: list[dict[str, Any]],
+    step_action_spans: list[dict[str, int]],
+    *,
+    max_sequence_length: int,
+) -> tuple[list[int], list[int], list[float] | None, list[dict[str, Any]], dict[str, Any]]:
+    """Bound the sequence sent to the actor while preserving RL alignment.
+
+    The reward and diagnostic response remain complete.  Only the actor input
+    is shortened, at an assistant-action boundary whenever possible, so
+    tokens, loss masks, rollout log-probabilities, and visual tensors continue
+    to refer to the same suffix.  The final assistant action is always
+    preferred; dropping it would turn a successful rollout into an
+    untrainable prefix-only sample.
+    """
+
+    original_response_length = len(response_token_ids)
+    original_total_length = len(prompt_token_ids) + original_response_length
+    limit = max(1, int(max_sequence_length))
+    response_budget = max(1, limit - len(prompt_token_ids))
+
+    def _valid_span(value: Any) -> tuple[int, int] | None:
+        if not isinstance(value, dict):
+            return None
+        try:
+            start = int(value.get("action_token_start", value.get("token_start", -1)))
+            end = int(value.get("response_token_end", value.get("token_end", -1)))
+        except (TypeError, ValueError):
+            return None
+        if start < 0 or end <= start or end > original_response_length:
+            return None
+        return start, end
+
+    # A complete suffix beginning at one of the retained action boundaries is
+    # the least destructive compaction.  ``context_segments`` is the bounded
+    # inference history, so it also prevents re-attaching images belonging to
+    # observations that were already removed from the model context.
+    candidate_starts: set[int] = set()
+    for segment in context_segments:
+        span = _valid_span(segment)
+        if span is not None:
+            candidate_starts.add(span[0])
+    # The last action may be a terminal answer and therefore has no following
+    # observation segment.  Add only that final boundary; older action spans
+    # can belong to inference-compacted segments whose visual tensors are no
+    # longer present in ``context_segments``.
+    if step_action_spans and isinstance(step_action_spans[-1], dict):
+        try:
+            final_action_start = int(step_action_spans[-1].get("token_start", -1))
+        except (TypeError, ValueError):
+            final_action_start = -1
+        if 0 <= final_action_start < original_response_length:
+            candidate_starts.add(final_action_start)
+
+    selected_start = 0
+    if original_total_length > limit:
+        # Walk from the oldest available boundary to the newest and keep the
+        # longest suffix that fits.  This retains more useful history than
+        # always keeping only the final action.
+        fitting = [
+            start
+            for start in sorted(candidate_starts)
+            if original_response_length - start <= response_budget
+        ]
+        if fitting:
+            selected_start = fitting[0]
+        else:
+            selected_start = max(0, original_response_length - response_budget)
+
+    selected_buffer: list[dict[str, Any]] = []
+    retained_segment_count = 0
+    retained_visual_segment_count = 0
+    indexed_segments = any(
+        isinstance(segment, dict) and "multimodal_train_input_index" in segment
+        for segment in context_segments
+    )
+    selected_segment_indices: set[int] = set()
+    for segment in context_segments:
+        span = _valid_span(segment)
+        if span is None or span[0] < selected_start:
+            continue
+        retained_segment_count += 1
+        if segment.get("image_data"):
+            retained_visual_segment_count += 1
+        raw_index = segment.get("multimodal_train_input_index")
+        if raw_index is None:
+            continue
+        try:
+            buffer_index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= buffer_index < len(multimodal_train_inputs_buffer):
+            selected_segment_indices.add(buffer_index)
+
+    if original_total_length <= limit:
+        # The actor sequence is unchanged, so retain every visual chunk even
+        # if inference-only context compaction has already removed an older
+        # segment from ``context_segments``.
+        selected_buffer = list(multimodal_train_inputs_buffer)
+    elif indexed_segments:
+        selected_buffer = [
+            multimodal_train_inputs_buffer[index]
+            for index in range(len(multimodal_train_inputs_buffer))
+            if index in selected_segment_indices
+        ]
+    else:
+        # Backward-compatible path for a checkpoint created before segment
+        # indices were added.  A truncated legacy trajectory cannot safely
+        # remap image tensors, so keep the chunks and let the existing
+        # multimodal alignment audit fail closed rather than silently train on
+        # mismatched visual inputs.
+        selected_buffer = list(multimodal_train_inputs_buffer)
+
+    trimmed_response = list(response_token_ids[selected_start:])
+    trimmed_masks = list(loss_masks[selected_start:])
+    trimmed_log_probs = (
+        list(rollout_log_probs[selected_start:]) if rollout_log_probs is not None else None
+    )
+    metadata = {
+        "applied": bool(selected_start),
+        "max_sequence_length": limit,
+        "original_total_length": original_total_length,
+        "original_response_length": original_response_length,
+        "training_total_length": len(prompt_token_ids) + len(trimmed_response),
+        "training_response_length": len(trimmed_response),
+        "response_start": selected_start,
+        "dropped_response_tokens": selected_start,
+        "retained_segment_count": retained_segment_count,
+        "retained_visual_segment_count": retained_visual_segment_count,
+        "retained_multimodal_chunk_count": len(selected_buffer),
+        "fallback_tail_cut": bool(
+            original_total_length > limit
+            and not any(start == selected_start for start in candidate_starts)
+        ),
+    }
+    return trimmed_response, trimmed_masks, trimmed_log_probs, selected_buffer, metadata
+
+
 def _compact_model_context(
     prompt_token_ids: list[int],
     segments: list[dict[str, Any]],
@@ -2393,6 +4318,47 @@ def _compact_model_context(
                     value for value in segment.get("image_data", []) if isinstance(value, str)
                 )
         return token_ids, image_data
+
+    def fit_observation_to_budget(
+        observation_ids: list[int],
+        available: int,
+        suffix_token_count: int,
+    ) -> tuple[list[int], bool]:
+        """Trim an observation without destroying its next-turn boundary.
+
+        The previous implementation kept ``observation_ids[:available]``.
+        That is unsafe because the observation is encoded as a complete user
+        turn and its final ``<|im_end|>\n<|im_start|>assistant\n`` suffix is
+        what tells the backend to start a fresh assistant action.  If the
+        suffix is cut off, the next generation continues the middle of a
+        JSON/path observation, which is a model-input corruption rather than
+        a model protocol decision.
+        """
+
+        if len(observation_ids) <= available:
+            return list(observation_ids), True
+        available = max(0, int(available))
+        suffix_token_count = min(
+            max(0, int(suffix_token_count or 0)),
+            len(observation_ids),
+        )
+        if suffix_token_count <= 0:
+            # Synthetic/unit-test segments from older callers may not carry
+            # the boundary metadata.  Preserve their historical behavior;
+            # real encoded observations always provide the count below.
+            return list(observation_ids[:available]), True
+        if available < suffix_token_count:
+            # There is no valid assistant-turn context that fits.  Returning
+            # the complete observation keeps the boundary intact; the caller
+            # will observe the over-budget context and terminate explicitly
+            # as context_overflow instead of issuing a malformed request.
+            return list(observation_ids), False
+        body_count = available - suffix_token_count
+        return (
+            list(observation_ids[:body_count])
+            + list(observation_ids[-suffix_token_count:]),
+            True,
+        )
 
     token_ids, image_data = rebuild()
     target_length = max(1, int(max_context_length) - max(32, int(reserve_tokens)))
@@ -2429,8 +4395,22 @@ def _compact_model_context(
         available = max(0, target_length - len(prompt_token_ids) - len(action_ids))
         observation_ids = list(latest.get(observation_key, []))
         if len(observation_ids) > available:
-            latest[observation_key] = observation_ids[:available]
+            suffix_key = (
+                "text_observation_suffix_token_count"
+                if observation_key == "text_observation_token_ids"
+                else "observation_suffix_token_count"
+            )
+            fitted_observation, fits = fit_observation_to_budget(
+                observation_ids,
+                available,
+                int(latest.get(suffix_key, 0) or 0),
+            )
+            latest[observation_key] = fitted_observation
             token_ids, image_data = rebuild()
+            if not fits:
+                # Keep the full, well-formed turn so the next loop's explicit
+                # context limit check can fail closed before a backend call.
+                token_ids, image_data = rebuild()
     return token_ids, image_data
 
 
@@ -2473,12 +4453,14 @@ def _encode_tool_observation(
     state: GenerateState,
     observation: str,
     image_paths: list[str],
-) -> tuple[list[int], str, list[str], list[Any], dict[str, Any] | None, int]:
+) -> tuple[list[int], str, list[str], list[Any], dict[str, Any] | None, int, int]:
     """Encode an observation as a new user turn, including real image tokens."""
+    assistant_turn_suffix = "<|im_end|>\n<|im_start|>assistant\n"
     if not image_paths:
-        encoded_text = f"<|im_end|>\n<|im_start|>user\n{observation}<|im_end|>\n<|im_start|>assistant\n"
+        encoded_text = f"<|im_end|>\n<|im_start|>user\n{observation}{assistant_turn_suffix}"
         token_ids = state.tokenizer(encoded_text, add_special_tokens=False)["input_ids"]
-        return token_ids, encoded_text, [], [], None, 0
+        suffix_ids = state.tokenizer(assistant_turn_suffix, add_special_tokens=False)["input_ids"]
+        return token_ids, encoded_text, [], [], None, 0, len(suffix_ids)
 
     if state.processor is None:
         raise RuntimeError("tool returned an image but the multimodal processor is unavailable")
@@ -2498,7 +4480,7 @@ def _encode_tool_observation(
         vision_tokens = "\n".join(f"{vision_start}{image_token}{vision_end}" for _ in images)
         encoded_text = (
             f"<|im_end|>\n<|im_start|>user\n{vision_tokens}\n{observation}"
-            "<|im_end|>\n<|im_start|>assistant\n"
+            + assistant_turn_suffix
         )
         processor_output = state.processor(text=[encoded_text], images=images, return_tensors="pt")
         input_ids = processor_output["input_ids"][0]
@@ -2512,7 +4494,8 @@ def _encode_tool_observation(
         image_tokens_count = _image_token_count(state.tokenizer, state.processor, token_ids)
         if image_tokens_count <= 0:
             raise RuntimeError("multimodal processor produced no image token for a returned image")
-        return token_ids, encoded_text, image_data, images, train_inputs, image_tokens_count
+        suffix_ids = state.tokenizer(assistant_turn_suffix, add_special_tokens=False)["input_ids"]
+        return token_ids, encoded_text, image_data, images, train_inputs, image_tokens_count, len(suffix_ids)
     except Exception as exc:
         raise RuntimeError(f"image observation encoding failed: {exc}") from exc
 
@@ -2705,6 +4688,7 @@ async def _legacy_generate(args, sample: Sample, sampling_params, evaluation: bo
             )
         else:
             next_obs, done = await execute_predictions(cur_response, execution_trace=tool_execution_trace)
+            next_obs = _sanitize_observation_metadata_markup(next_obs)
 
         if getattr(args, "prm_enable", False):
             # Run PRM for every action step, including the final "Answer" step.
@@ -2850,6 +4834,19 @@ _INFRA_STATUSES = {
 }
 
 
+def _is_world_injected_observation(trace_item: Mapping[str, Any] | None) -> bool:
+    """Return whether a failed tool call still delivered a valid world observation."""
+
+    if not isinstance(trace_item, Mapping):
+        return False
+    if str(trace_item.get("failure_origin") or "") == "world_injected":
+        return True
+    world_event = trace_item.get("world_event")
+    return isinstance(world_event, Mapping) and str(
+        world_event.get("failure_origin") or ""
+    ) == "world_injected"
+
+
 def _set_rollout_status(sample: Sample, status: str, *, reason: str | None = None) -> None:
     """Persist the rollout state in both runtime fields and serialized metadata."""
     valid_for_rl = status not in _INFRA_STATUSES
@@ -2857,7 +4854,7 @@ def _set_rollout_status(sample: Sample, status: str, *, reason: str | None = Non
     sample.valid_for_rl = valid_for_rl
     if status == "context_overflow":
         sample.status = Sample.Status.TRUNCATED
-    elif status == "completed":
+    elif status in {"completed", "abstained"}:
         sample.status = Sample.Status.COMPLETED
     elif status != "completed":
         sample.status = Sample.Status.FAILED
@@ -2961,7 +4958,7 @@ def _extract_generation_output(
     }
 
 
-async def generate(args, sample: Sample, sampling_params, evaluation: bool = False) -> Sample:
+async def generate(args, sample: Sample, sampling_params, evaluation: bool = False) -> Sample | list[Sample]:
     """Generate a strict, multi-turn document-tool rollout.
 
     Tool observations are appended as separate user turns.  When a tool
@@ -2970,6 +4967,19 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     the accumulated base64 image data is sent on the next generation request.
     """
     assert not getattr(args, "partial_rollout", False), "Partial rollout is not supported for this function."
+
+    if (
+        isinstance(sample.metadata, dict)
+        and sample.metadata.get("meta_questions")
+        and not sample.metadata.get("meta_episode_child")
+        and _bayestool_meta_enabled(args, sample.metadata)
+    ):
+        return await _generate_bayestool_meta_episode(
+            args,
+            sample,
+            sampling_params,
+            evaluation=evaluation,
+        )
 
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
@@ -2980,6 +4990,13 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     # outside navigation_state so they cannot leak into the prompt or alter
     # online action selection.
     diagnostic_metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    branch_resume_id = diagnostic_metadata.get("bayestool_branch_resume_id")
+    branch_resume = (
+        _BAYES_BRANCH_CHECKPOINTS.pop(str(branch_resume_id), None)
+        if branch_resume_id
+        else None
+    )
+    branch_child = bool(diagnostic_metadata.get("bayestool_branch_child"))
     diagnostic_answer_page = diagnostic_metadata.get("answer_page", diagnostic_metadata.get("target_page"))
     try:
         diagnostic_answer_page = int(diagnostic_answer_page) if diagnostic_answer_page is not None else None
@@ -2987,14 +5004,328 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         diagnostic_answer_page = None
     diagnostic_answer_bbox = diagnostic_metadata.get("answer_bbox")
     navigation_state = _new_navigation_state(task_prompt)
+    bayestool_enabled = _bayestool_is_enabled(args, diagnostic_metadata)
+    bayestool_config = config_from_args(args, enabled=True) if bayestool_enabled and config_from_args else None
+    default_tool_budget = max(1, int(TOOL_CONFIGS.get("max_tool_calls", 8)))
+    configured_bayes_budget = getattr(args, "bayestool_tool_budget", None)
+    bayestool_tool_budget = (
+        max(1, int(configured_bayes_budget))
+        if bayestool_enabled and configured_bayes_budget is not None
+        else default_tool_budget
+    )
+    world_runtime = None
+    belief_runtime = None
+    decision_controller = None
+    bayes_document_digest = None
+    bayes_coupling_id = None
+    bayes_content_signature = None
+    bayestool_filter_model = None
+    bayestool_filter_version = str(getattr(args, "belief_model_version", "untrained") or "untrained")
+    bayestool_q_head = None
+    bayestool_q_version = "untrained"
+    bayestool_risk_calibrator = None
+    bayestool_risk_version = "heuristic"
+    bayes_question_plan = None
+    bayes_runtime_state_digest = ""
+    world_sample_index = int(
+        diagnostic_metadata.get("meta_world_sample_index", getattr(sample, "index", 0) or 0)
+    )
+    bayes_realization_index: int | None = None
+    if bayestool_enabled:
+        if validate_stage_capabilities is not None:
+            diagnostic_metadata["bayestool_capability_manifest"] = validate_stage_capabilities(
+                str(getattr(args, "bayestool_stage", "c") or "c"),
+                belief_checkpoint=getattr(args, "bayestool_belief_checkpoint", None),
+                q_checkpoint=getattr(args, "bayestool_q_checkpoint", None),
+                risk_checkpoint=getattr(args, "bayestool_risk_checkpoint", None),
+                meta_manifest=getattr(args, "bayestool_meta_manifest", None),
+                allow_heuristic_belief=bool(getattr(args, "bayestool_allow_heuristic_belief", False)),
+                allow_heuristic_q=bool(getattr(args, "bayestool_allow_heuristic_q", False)),
+                allow_heuristic_risk=bool(getattr(args, "bayestool_allow_heuristic_risk", False)),
+            )
+        (
+            bayestool_filter_model,
+            bayestool_filter_version,
+            bayestool_q_head,
+            bayestool_q_version,
+        ) = _load_bayestool_models(args, bayestool_config)
+        bayestool_risk_calibrator, bayestool_risk_version = _load_bayestool_risk_calibrator(args)
+        bayes_document_digest, bayes_coupling_id = _bayestool_runtime_identity(sample, task_prompt)
+        if QuestionRolloutPlan is not None and make_question_rollout_plan is not None:
+            raw_plan = diagnostic_metadata.get("question_rollout_plan")
+            if isinstance(raw_plan, Mapping):
+                bayes_question_plan = QuestionRolloutPlan.from_mapping(raw_plan)
+            else:
+                question_id = (
+                    bayestool_question_id(diagnostic_metadata, default=bayes_coupling_id)
+                    if bayestool_question_id is not None
+                    else str(bayes_coupling_id)
+                )
+                configured_primary_count = int(getattr(args, "n_samples_per_prompt", 4) or 4)
+                if not 4 <= configured_primary_count <= 6:
+                    if evaluation:
+                        configured_primary_count = 4
+                    else:
+                        raise ValueError(
+                            "BayesTool raw dataset fallback requires n_samples_per_prompt in [4, 6]; "
+                            f"got {configured_primary_count}"
+                        )
+                bayes_question_plan = make_question_rollout_plan(
+                    question_id,
+                    policy_version=str(
+                        getattr(bayestool_config, "policy_version", DEFAULT_POLICY_VERSION)
+                    ),
+                    seed=str(diagnostic_metadata.get("rollout_id", 0)),
+                    group_size=int(getattr(bayestool_config, "default_group_size", 4)),
+                    realization_count=configured_primary_count,
+                )
+                diagnostic_metadata["question_rollout_plan"] = bayes_question_plan.to_dict()
+                diagnostic_metadata["question_id"] = question_id
+            if bayes_question_plan is not None:
+                # The data source allocates globally increasing sample.index
+                # values, but n_samples_per_prompt is now the number of
+                # primary realization trajectories for each prompt.  Recover
+                # the prompt-local realization index before constructing the
+                # world; K-1 siblings are expanded from its checkpoint later.
+                if branch_resume is None:
+                    configured_primary_count = getattr(args, "n_samples_per_prompt", None)
+                    if (
+                        not evaluation
+                        and configured_primary_count is not None
+                        and int(configured_primary_count) > 0
+                        and int(configured_primary_count) != bayes_question_plan.group_count
+                    ):
+                        raise ValueError(
+                            "BayesTool n_samples_per_prompt must equal the explicit "
+                            "QuestionRolloutPlan realization count; legacy world/replica "
+                            f"settings cannot remap it ({configured_primary_count}!="
+                            f"{bayes_question_plan.group_count})"
+                        )
+                    primary_count = int(
+                        getattr(args, "n_samples_per_prompt", bayes_question_plan.group_count)
+                        or bayes_question_plan.group_count
+                    )
+                    primary_count = max(1, primary_count)
+                    realization_source = diagnostic_metadata.get(
+                        "bayestool_realization_index", world_sample_index
+                    )
+                    bayes_realization_index = int(realization_source) % primary_count
+                else:
+                    realization_source = diagnostic_metadata.get(
+                        "bayestool_realization_index",
+                        branch_resume.get("world_sample_index", world_sample_index),
+                    )
+                    bayes_realization_index = int(realization_source) % bayes_question_plan.group_count
+                if bayes_realization_index >= bayes_question_plan.group_count:
+                    raise ValueError(
+                        "BayesTool primary realization index exceeds the explicit question plan: "
+                        f"index={bayes_realization_index} groups={bayes_question_plan.group_count}"
+                    )
+                diagnostic_metadata["bayestool_realization_index"] = bayes_realization_index
+        bayes_output_root = diagnostic_metadata.get("bayestool_output_root") or os.getenv("OPENCLAW_TOOL_OUTPUT_DIR")
+        if _BAYES_CLEAN_RESULT_CACHE is not None and bayes_output_root:
+            _BAYES_CLEAN_RESULT_CACHE.set_root(
+                Path(str(bayes_output_root)) / "tool_outputs" / "bayestool" / "clean_cache"
+            )
+        meta_world_key = diagnostic_metadata.get("bayestool_meta_world_key")
+        if meta_world_key and str(meta_world_key) in _BAYES_META_WORLD_RUNTIMES:
+            world_runtime = _BAYES_META_WORLD_RUNTIMES[str(meta_world_key)]
+        else:
+            raw_sampling_context = diagnostic_metadata.get("world_sampling_context")
+            if isinstance(raw_sampling_context, dict):
+                world_sampling_context = dict(raw_sampling_context)
+            else:
+                world_sampling_context = {}
+            # ``page_count`` and the argument capabilities are public task
+            # metadata.  Carry them into the sampler even for the ordinary
+            # preprocessed document-qa dataset, which does not have a
+            # pre-built BayesTool manifest.
+            if world_sampling_context.get("page_count") is None:
+                world_sampling_context["page_count"] = diagnostic_metadata.get(
+                    "page_count", diagnostic_metadata.get("num_pages")
+                )
+            if not world_sampling_context.get("tool_argument_capabilities"):
+                world_sampling_context["tool_argument_capabilities"] = {
+                    str(name): sorted(str(argument) for argument in arguments)
+                    for name, arguments in DEFAULT_TOOL_ARGUMENT_CAPABILITIES.items()
+                }
+            world_sampling_context["tool_budget"] = bayestool_tool_budget
+            if bayes_question_plan is not None and not bayes_question_plan.latent_ids_finalized:
+                # Raw datasets have no prebuilt world manifest.  Freeze all
+                # realization worlds before constructing the first runtime so
+                # every primary and continuation uses one authoritative latent
+                # identity rather than a synthetic planning ID.
+                raw_fixed_specs = diagnostic_metadata.get("fixed_world_specs")
+                if isinstance(raw_fixed_specs, list) and len(raw_fixed_specs) == bayes_question_plan.group_count:
+                    frozen_specs = list(raw_fixed_specs)
+                else:
+                    if sample_tool_world is None:
+                        raise RuntimeError("BayesTool world sampler is unavailable for raw-plan materialization")
+                    frozen_specs = [
+                        sample_tool_world(
+                            bayes_coupling_id,
+                            world_slot=slot,
+                            replica_id=0,
+                            world_slot_role=realization.world_slot_role,
+                            variant_id=realization.variant_id,
+                            rollout_id=diagnostic_metadata.get("rollout_id", 0),
+                            config=bayestool_config,
+                            sampling_context=world_sampling_context,
+                            tool_budget=bayestool_tool_budget,
+                        ).to_dict()
+                        for slot, realization in enumerate(bayes_question_plan.realizations)
+                    ]
+                finalized_realizations = []
+                for realization, frozen_spec in zip(
+                    bayes_question_plan.realizations,
+                    frozen_specs,
+                    strict=True,
+                ):
+                    latent_world_id = (
+                        frozen_spec.get("latent_world_id")
+                        if isinstance(frozen_spec, Mapping)
+                        else getattr(frozen_spec, "latent_world_id", "")
+                    )
+                    if not str(latent_world_id).strip():
+                        raise ValueError(
+                            "raw BayesTool world materialization produced an empty latent_world_id"
+                        )
+                    finalized_realizations.append(
+                        replace(realization, latent_world_id=str(latent_world_id))
+                    )
+                bayes_question_plan = replace(
+                    bayes_question_plan,
+                    realizations=tuple(finalized_realizations),
+                    latent_ids_finalized=True,
+                )
+                diagnostic_metadata["fixed_world_specs"] = [
+                    spec.to_dict() if hasattr(spec, "to_dict") else dict(spec)
+                    for spec in frozen_specs
+                ]
+                diagnostic_metadata["question_rollout_plan"] = bayes_question_plan.to_dict()
+            world_runtime = WorldRuntime.for_sample(
+                coupling_id=bayes_coupling_id,
+                sample_index=world_sample_index,
+                rollout_id=diagnostic_metadata.get("rollout_id", 0),
+                config=bayestool_config,
+                output_root=bayes_output_root,
+                world_type=diagnostic_metadata.get("world_type"),
+                document_digest=bayes_document_digest,
+                clean_cache=_BAYES_CLEAN_RESULT_CACHE,
+                sampling_context=world_sampling_context,
+                tool_budget=bayestool_tool_budget,
+                question_rollout_plan=bayes_question_plan,
+                realization_index=bayes_realization_index,
+                fixed_world_specs=(
+                    diagnostic_metadata.get("fixed_world_specs")
+                    if isinstance(diagnostic_metadata.get("fixed_world_specs"), list)
+                    else None
+                ),
+            )
+            if bayes_question_plan is not None and world_runtime is not None:
+                realization = bayes_question_plan.realizations[int(world_runtime.spec.world_slot)]
+                diagnostic_metadata["world_slot_role"] = realization.world_slot_role
+                diagnostic_metadata["variant_id"] = realization.variant_id
+                diagnostic_metadata["decision_group_size"] = int(realization.k)
+        if make_runtime_state_digest is not None and world_runtime is not None:
+            bayes_runtime_state_digest = make_runtime_state_digest(
+                {
+                    "remaining_tool_budget": bayestool_tool_budget,
+                    "tool_call_count": int(getattr(world_runtime, "call_count", 0)),
+                    "world_schedule": world_runtime.schedule_metadata(),
+                    "world_call_counters": world_runtime.public_event_metadata(),
+                    "restore_state_id": "root",
+                    "branch_horizon": int(getattr(bayestool_config, "branch_horizon", 0)),
+                    "bootstrap": "terminal_reward",
+                }
+            )
+            diagnostic_metadata["runtime_state_digest"] = bayes_runtime_state_digest
+            diagnostic_metadata["bayes_runtime_state_digest"] = bayes_runtime_state_digest
+        if meta_world_key:
+            _BAYES_META_WORLD_RUNTIMES[str(meta_world_key)] = world_runtime
+        session_record = diagnostic_metadata.get("bayestool_session_belief")
+        if isinstance(session_record, dict) and hasattr(BeliefRuntime, "from_replay_record"):
+            belief_runtime = BeliefRuntime.from_replay_record(
+                session_record,
+                bayestool_config,
+                document_digest=bayes_document_digest,
+                seed=world_sample_index,
+                model=bayestool_filter_model,
+                model_version=bayestool_filter_version,
+            )
+        else:
+            belief_runtime = BeliefRuntime(
+                bayestool_config,
+                document_digest=bayes_document_digest,
+                model=bayestool_filter_model,
+                model_version=bayestool_filter_version,
+                seed=world_sample_index,
+            )
+        decision_controller = DecisionController(
+            bayestool_config,
+            q_head=bayestool_q_head,
+            risk_calibrator=bayestool_risk_calibrator,
+            seed=int(sample.index or 0),
+        )
+        if bayestool_q_head is not None:
+            decision_controller.enable_q_head(True)
+        navigation_state["remaining_tool_budget"] = bayestool_tool_budget
+        navigation_state["bayestool_enabled"] = True
+        if content_signature is not None:
+            bayes_content_signature = content_signature(
+                {"question_type": navigation_state.get("question_type", "text")},
+                question=task_prompt,
+            )
+
+    if branch_resume is not None:
+        # The branch starts from the exact pre-action state.  Runtime objects
+        # are copied in the checkpoint and therefore only this child's world
+        # events/belief updates are mutable.  The clean-result cache remains
+        # shared by _capture/_clone_bayestool_branch_checkpoint.
+        navigation_state = _branch_deepcopy(branch_resume["navigation_state"])
+        world_runtime = branch_resume.get("world_runtime")
+        belief_runtime = branch_resume.get("belief_runtime")
+        bayes_document_digest = branch_resume.get("bayes_document_digest") or bayes_document_digest
+        bayes_coupling_id = branch_resume.get("bayes_coupling_id") or bayes_coupling_id
+        bayes_content_signature = diagnostic_metadata.get("bayes_content_signature") or bayes_content_signature
+        world_sample_index = int(branch_resume.get("world_sample_index", world_sample_index))
+        frozen_resume_digest = str(
+            branch_resume.get("runtime_state_digest")
+            or diagnostic_metadata.get("runtime_state_digest")
+            or ""
+        )
+        if frozen_resume_digest:
+            # The child may have constructed a temporary root runtime before
+            # this restore block.  The parent/children group must use the
+            # digest of the selected frozen checkpoint, not that temporary
+            # root state.
+            bayes_runtime_state_digest = frozen_resume_digest
+            diagnostic_metadata["runtime_state_digest"] = frozen_resume_digest
+            diagnostic_metadata["bayes_runtime_state_digest"] = frozen_resume_digest
+        if bayestool_config is not None:
+            bayestool_enabled = True
+        navigation_state["bayestool_enabled"] = True
     # Do not carry a model-specific <think> suffix into the strict action
     # protocol.  The assistant turn must begin with its one action tag.
-    prompt = format_conversation_with_tools(
-        prompt=f"{task_prompt}\n\n{_navigation_status_text(navigation_state)}",
-        tools=tool_specs,
-        tool_call_format=tc_format,
-    )
-    prompt_tokens_ids = list(state.tokenizer(prompt, add_special_tokens=False)["input_ids"])
+    if branch_resume is None:
+        initial_environment = _bayestool_environment_block(
+            belief_runtime,
+            navigation_state,
+            tool_budget=bayestool_tool_budget,
+            tokenizer=state.tokenizer,
+        ) if bayestool_enabled else ""
+        prompt = format_conversation_with_tools(
+            prompt=f"{task_prompt}\n\n{_navigation_status_text(navigation_state)}{chr(10) + initial_environment if initial_environment else ''}",
+            tools=tool_specs,
+            tool_call_format=tc_format,
+        )
+        prompt_tokens_ids = list(state.tokenizer(prompt, add_special_tokens=False)["input_ids"])
+    else:
+        # Keep the original formatted prompt tokens as the training prefix;
+        # rebuilding it would change the token-level shared-prefix contract.
+        initial_environment = ""
+        prompt = str(diagnostic_metadata.get("bayestool_branch_prompt") or "")
+        prompt_tokens_ids = list(branch_resume["prompt_token_ids"])
 
     im_end_id: int | None = None
     try:
@@ -3026,7 +5357,14 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         "premature_final_count": 0,
         "had_evidence_guard_recovery": False,
         "rejected_final_count": 0,
+        "failure_events": [],
         "actions": [],
+    }
+    cost_state: dict[str, float] = {
+        "latency_seconds": 0.0,
+        "observation_text_tokens": 0.0,
+        "image_tokens": 0.0,
+        "tool_calls": 0.0,
     }
     generation_steps: list[dict[str, Any]] = []
     prm_step_scores: list[float] = []
@@ -3035,6 +5373,27 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     step_action_spans: list[dict[str, int]] = []
     terminal_status: str | None = None
     terminal_reason: str | None = None
+    start_turn = 0
+    resume_forced_action: dict[str, Any] | None = None
+
+    if branch_resume is not None:
+        response = str(branch_resume.get("response", ""))
+        response_token_ids = list(branch_resume.get("response_token_ids", []))
+        loss_masks = list(branch_resume.get("loss_masks", []))
+        context_token_ids = list(branch_resume.get("context_token_ids", prompt_tokens_ids))
+        context_image_data = list(branch_resume.get("context_image_data", []))
+        context_segments = _branch_deepcopy(branch_resume.get("context_segments", []))
+        current_images = _branch_deepcopy(branch_resume.get("current_images", []))
+        multimodal_train_inputs_buffer = _branch_deepcopy(
+            branch_resume.get("multimodal_train_inputs_buffer", [])
+        )
+        execution_trace = _branch_deepcopy(branch_resume.get("execution_trace", []))
+        action_log = _branch_deepcopy(branch_resume.get("action_log", action_log))
+        generation_steps = _branch_deepcopy(branch_resume.get("generation_steps", []))
+        step_action_spans = _branch_deepcopy(branch_resume.get("step_action_spans", []))
+        sample.rollout_log_probs = list(branch_resume.get("rollout_log_probs", []))
+        start_turn = int(branch_resume.get("turn", 0))
+        resume_forced_action = _branch_deepcopy(branch_resume.get("forced_action"))
 
     eval_context = getattr(args, "eval_max_context_len", None)
     train_context = getattr(args, "rollout_max_context_len", None)
@@ -3045,14 +5404,51 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     else:
         max_context_length = 32768
     max_new_tokens = int(sampling_params.get("max_new_tokens") or getattr(args, "rollout_max_response_len", 2048))
-    max_tool_steps = max(1, int(TOOL_CONFIGS.get("max_tool_calls", 8)))
+    max_tool_steps = max(
+        1,
+        int(
+            branch_resume.get("max_tool_steps", bayestool_tool_budget)
+            if branch_resume is not None
+            else (bayestool_tool_budget if bayestool_enabled else default_tool_budget)
+        ),
+    )
     max_turns = max(max_tool_steps + 2, int(TOOL_CONFIGS.get("max_turns", max_tool_steps + 2)))
     tool_call_count = 0
+
+    if branch_resume is not None:
+        tool_call_count = int(branch_resume.get("tool_call_count", 0))
+        branch_horizon = max(1, int(branch_resume.get("branch_horizon", 3)))
+        max_turns = min(max_turns, start_turn + branch_horizon)
+
+    branching_allowed = bool(
+        bayestool_enabled
+        and not branch_child
+        and branch_resume is None
+        and decision_controller is not None
+        and bool(getattr(bayestool_config, "use_regret_branching", True))
+    )
+    # Candidate sampling is a prerequisite for action selection, independent
+    # of whether the later regret gate decides to fork sibling rollouts.
+    candidate_sampling_allowed = bool(
+        bayestool_enabled
+        and not branch_child
+        and branch_resume is None
+        and decision_controller is not None
+        and bayestool_config is not None
+    )
+    branch_children: list[Sample] = []
+    branch_events: list[dict[str, Any]] = []
+    # Primary generation may expose several eligible checkpoints.  Exactly
+    # one decision node is selected after the primary trajectory completes;
+    # launching children in the middle of the loop would create multiple
+    # decision groups for one realization.
+    deferred_branch_candidates: list[dict[str, Any]] = []
+    root_branch_candidate: dict[str, Any] | None = None
 
     if sample.rollout_log_probs is None:
         sample.rollout_log_probs = []
 
-    for turn in range(max_turns):
+    for turn in range(start_turn, max_turns):
         navigation_state["search_budget_exhausted"] = tool_call_count >= max_tool_steps
         if context_image_data:
             navigation_state["visual_input_required"] = True
@@ -3093,7 +5489,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         turn_sampling_params["max_new_tokens"] = turn_max_new_tokens
         existing_stop = turn_sampling_params.get("stop") or []
         existing_stop = [existing_stop] if isinstance(existing_stop, str) else list(existing_stop)
-        for stop_text in ("</tool_call>", "</final>"):
+        for stop_text in ("</tool_call>", "</final>", "</abstain>"):
             if stop_text not in existing_stop:
                 existing_stop.append(stop_text)
         turn_sampling_params["stop"] = existing_stop
@@ -3133,28 +5529,104 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
             "generation_error": None,
             "protocol_parse_error": None,
         }
+        pre_action_checkpoint = None
+        if candidate_sampling_allowed and bayestool_config is not None:
+            pre_action_checkpoint = _capture_bayestool_branch_checkpoint(
+                prompt_token_ids=prompt_tokens_ids,
+                context_token_ids=context_token_ids,
+                context_image_data=context_image_data,
+                context_segments=context_segments,
+                response=response,
+                response_token_ids=response_token_ids,
+                loss_masks=loss_masks,
+                rollout_log_probs=list(sample.rollout_log_probs or []),
+                current_images=current_images,
+                multimodal_train_inputs_buffer=multimodal_train_inputs_buffer,
+                execution_trace=execution_trace,
+                action_log=action_log,
+                generation_steps=generation_steps,
+                step_action_spans=step_action_spans,
+                navigation_state=navigation_state,
+                world_runtime=world_runtime,
+                belief_runtime=belief_runtime,
+                bayes_document_digest=bayes_document_digest,
+                bayes_coupling_id=bayes_coupling_id,
+                world_sample_index=(
+                    bayes_realization_index
+                    if bayes_realization_index is not None
+                    else world_sample_index
+                ),
+                turn=turn,
+                tool_call_count=tool_call_count,
+                max_tool_steps=max_tool_steps,
+                config=bayestool_config,
+                runtime_state_digest=bayes_runtime_state_digest,
+            )
+            if make_runtime_state_digest is not None and world_runtime is not None:
+                pre_action_checkpoint["runtime_state_digest"] = make_runtime_state_digest(
+                    {
+                        "remaining_tool_budget": max(0, int(max_tool_steps - tool_call_count)),
+                        "tool_call_count": int(getattr(world_runtime, "call_count", tool_call_count)),
+                        "world_schedule": world_runtime.schedule_metadata(),
+                        "world_call_counters": world_runtime.public_event_metadata(),
+                        "restore_state_id": f"prefix:{pre_action_checkpoint['prefix_hash']}",
+                        "branch_horizon": int(getattr(bayestool_config, "branch_horizon", 0)),
+                        "bootstrap": "terminal_reward",
+                    }
+                )
+            pre_action_checkpoint["bayes_content_signature"] = bayes_content_signature
+            pre_action_checkpoint["bayes_aux_prompt"] = prompt
 
         try:
-            # This flag is set immediately before invoking the backend.  It
-            # distinguishes a skipped generation (for example context
-            # overflow) from a backend call that returned no assistant text.
-            step["generation_called"] = True
-            output = await post(url, payload)
-            if not isinstance(output, dict):
-                raise RuntimeError("generation backend returned a non-object response")
-            finish_reason = _finish_reason_type(output)
-            step["finish_reason"] = finish_reason
-            extracted = _extract_generation_output(output, state, im_end_id)
-            cur_response = str(extracted["raw_generation_text"])
-            cur_response_token_ids = list(extracted["token_ids"])
-            cur_log_probs = list(extracted["log_probs"])
-            if not cur_response.strip():
-                # Whitespace-only and special-token-only turns are empty from
-                # the protocol's point of view even if the backend emitted a
-                # token id for them.
-                cur_response_token_ids = []
-                cur_log_probs = []
-                extracted["output_token_count"] = 0
+            # A branch candidate was already sampled by the policy from this
+            # exact prefix.  Reuse its token ids/log-probs and skip a second
+            # backend request for the child action; subsequent turns are
+            # generated normally.
+            if resume_forced_action is not None and turn == start_turn:
+                step["generation_called"] = True
+                step["generation_source"] = "shared_prefix_branch_policy_sample"
+                cur_response = str(resume_forced_action.get("raw", ""))
+                cur_response_token_ids = list(resume_forced_action.get("token_ids", []))
+                cur_log_probs = list(resume_forced_action.get("log_probs", []))
+                extracted = {
+                    "raw_generation_text": cur_response,
+                    "backend_raw_generation_text": cur_response,
+                    "backend_output_token_count": len(cur_response_token_ids),
+                    "output_token_count": len(cur_response_token_ids),
+                    "stop_token_removed_count": 0,
+                    "output_source": "shared_prefix_branch_policy_sample",
+                }
+                resume_forced_action = None
+            else:
+                # This flag is set immediately before invoking the backend.  It
+                # distinguishes a skipped generation (for example context
+                # overflow) from a backend call that returned no assistant text.
+                step["generation_called"] = True
+                output = await post(url, payload)
+                if not isinstance(output, dict):
+                    raise RuntimeError("generation backend returned a non-object response")
+                finish_reason = _finish_reason_type(output)
+                step["finish_reason"] = finish_reason
+                extracted = _extract_generation_output(output, state, im_end_id)
+                cur_response = str(extracted["raw_generation_text"])
+                cur_response_token_ids = list(extracted["token_ids"])
+                cur_log_probs = list(extracted["log_probs"])
+                if not cur_response.strip():
+                    # Whitespace-only and special-token-only turns are empty from
+                    # the protocol's point of view even if the backend emitted a
+                    # token id for them.
+                    cur_response_token_ids = []
+                    cur_log_probs = []
+                    extracted["output_token_count"] = 0
+                for key in (
+                    "raw_generation_text",
+                    "backend_raw_generation_text",
+                    "backend_output_token_count",
+                    "output_token_count",
+                    "stop_token_removed_count",
+                    "output_source",
+                ):
+                    step[key] = extracted[key]
             for key in (
                 "raw_generation_text",
                 "backend_raw_generation_text",
@@ -3163,7 +5635,8 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                 "stop_token_removed_count",
                 "output_source",
             ):
-                step[key] = extracted[key]
+                if key in extracted:
+                    step[key] = extracted[key]
         except Exception as exc:
             step["generation_error"] = str(exc)
             generation_steps.append(step)
@@ -3199,6 +5672,89 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
             terminal_status = "generation_empty"
             break
 
+        pre_action_candidates: list[dict[str, Any]] | None = None
+        pre_action_candidate_errors: list[str] = []
+        pre_action_decision: dict[str, Any] | None = None
+        if pre_action_checkpoint is not None and candidate_sampling_allowed and bayestool_config is not None:
+            try:
+                current_group_size = int(
+                    diagnostic_metadata.get("decision_group_size")
+                    or getattr(bayestool_config, "default_group_size", 4)
+                    or 4
+                )
+                sampled_candidates, pre_action_candidate_errors = await _sample_bayestool_branch_candidates(
+                    state=state,
+                    url=url,
+                    checkpoint=pre_action_checkpoint,
+                    current_text=cur_response,
+                    current_token_ids=cur_response_token_ids,
+                    current_log_probs=cur_log_probs,
+                    sampling_params=turn_sampling_params,
+                    im_end_id=im_end_id,
+                    config=bayestool_config,
+                    target_group_size=current_group_size,
+                )
+                pre_action_candidates = sampled_candidates
+                selected_candidate, _, pre_action_decision = _select_bayestool_policy_candidate(
+                    sampled_candidates,
+                    navigation_state=navigation_state,
+                    belief_runtime=belief_runtime,
+                    decision_controller=decision_controller,
+                    tool_budget=max(0, max_tool_steps - tool_call_count),
+                )
+                pre_action_decision["candidate_errors"] = list(pre_action_candidate_errors)
+                pre_action_decision["selection_before_execution"] = True
+                if selected_candidate is not None:
+                    selected_key = str(selected_candidate.get("key"))
+                    primary_key = str(sampled_candidates[0].get("key")) if sampled_candidates else ""
+                    if selected_key != primary_key:
+                        cur_response = str(selected_candidate.get("raw", ""))
+                        cur_response_token_ids = list(selected_candidate.get("token_ids", []))
+                        cur_log_probs = list(selected_candidate.get("log_probs", []))
+                        step["generation_source"] = "bayestool_selected_policy_candidate"
+                        step["selected_candidate_key"] = selected_key
+                        step["selected_candidate_source"] = str(selected_candidate.get("source", ""))
+                        step["policy_candidate_count"] = len(sampled_candidates)
+                        step["raw_generation_text"] = cur_response
+                        step["output_token_count"] = len(cur_response_token_ids)
+                        step["backend_output_token_count"] = len(cur_response_token_ids)
+                        step["assistant_output_token_count"] = len(cur_response_token_ids)
+                    else:
+                        step["policy_candidate_count"] = len(sampled_candidates)
+                        step["selected_candidate_key"] = primary_key
+                else:
+                    step["policy_candidate_count"] = 0
+            except Exception as exc:
+                pre_action_candidate_errors.append(str(exc))
+                pre_action_candidates = None
+                pre_action_decision = {
+                    "candidate_degenerate": True,
+                    "candidate_errors": list(pre_action_candidate_errors),
+                    "selection_before_execution": False,
+                }
+
+            if (
+                root_branch_candidate is None
+                and pre_action_checkpoint is not None
+                and pre_action_candidates
+            ):
+                # Keep the first visible decision node as the bounded root
+                # fallback.  It is captured after Bayes candidate selection so
+                # the primary action and its log-probs are exactly the parent
+                # continuation that will be compared with K-1 siblings.
+                pre_action_checkpoint["selected_decision_event"] = "root"
+                root_branch_candidate = {
+                    "checkpoint": pre_action_checkpoint,
+                    "current_text": cur_response,
+                    "current_token_ids": cur_response_token_ids,
+                    "current_log_probs": cur_log_probs,
+                    "sampling_params": dict(turn_sampling_params),
+                    "candidates": list(pre_action_candidates),
+                    "candidate_errors": list(pre_action_candidate_errors),
+                    "decision": dict(pre_action_decision or {}),
+                    "turn": int(turn),
+                }
+
         action_token_start = len(response_token_ids)
         response += cur_response
         response_token_ids.extend(cur_response_token_ids)
@@ -3209,13 +5765,24 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         )
 
         trace_count_before = len(execution_trace)
+        response_prefix_before_action = response
         next_obs, done = await execute_predictions(
             cur_response,
             execution_trace=execution_trace,
             action_log=action_log,
             turn=turn,
             navigation_state=navigation_state,
+            world_runtime=world_runtime,
+            belief_runtime=belief_runtime,
+            decision_controller=decision_controller,
+            tool_budget=max(0, max_tool_steps - tool_call_count),
+            bayes_aux_prompt=(prompt + response_prefix_before_action) if bayestool_enabled else None,
+            bayes_prompt_tokenizer=state.tokenizer,
+            cost_state=cost_state,
+            candidate_records=pre_action_candidates,
+            candidate_decision=pre_action_decision,
         )
+        next_obs = _sanitize_observation_metadata_markup(next_obs)
         if action_log.get("actions"):
             parsed_meta = action_log["actions"][-1]
             step["parsed_action_type"] = parsed_meta.get("parsed_action_type")
@@ -3234,7 +5801,44 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                 loss_masks[action_token_start:len(response_token_ids)] = [
                     0
                 ] * max(0, len(response_token_ids) - action_token_start)
-        if getattr(args, "prm_enable", False):
+        branch_decision = action_log.get("bayes_decision", {})
+        if (
+            pre_action_checkpoint is not None
+            and bayestool_config is not None
+            and isinstance(branch_decision, dict)
+            and bool(branch_decision.get("branch_eligible"))
+            and not done
+        ):
+            deferred_branch_candidates.append(
+                {
+                    "checkpoint": pre_action_checkpoint,
+                    "current_text": cur_response,
+                    "current_token_ids": cur_response_token_ids,
+                    "current_log_probs": cur_log_probs,
+                    "sampling_params": dict(turn_sampling_params),
+                    "candidates": list(pre_action_candidates),
+                    "candidate_errors": list(pre_action_candidate_errors),
+                    "decision": dict(branch_decision),
+                    "turn": int(turn),
+                }
+            )
+            branch_decision["branch_triggered"] = False
+            branch_decision["branch_deferred"] = True
+            deferred_event = {
+                "branch_triggered": False,
+                "branch_deferred": True,
+                "reason": "eligible checkpoint retained until primary trajectory completed",
+                "turn": int(turn),
+                "prefix_hash": pre_action_checkpoint.get("prefix_hash", ""),
+                "decision_regret": float(branch_decision.get("decision_regret", 0.0) or 0.0),
+                "dvoi": _bayestool_dvoi_score(branch_decision.get("dvoi", 0.0)),
+                "dvoi_values": dict(branch_decision.get("dvoi") or {})
+                if isinstance(branch_decision.get("dvoi"), Mapping)
+                else {},
+            }
+            branch_events.append(deferred_event)
+            navigation_state.setdefault("bayes_branch_events", []).append(deferred_event)
+        if getattr(args, "prm_enable", False) and not bayestool_enabled:
             prm_pending_tasks.append(
                 (
                     turn,
@@ -3253,16 +5857,24 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
 
         if done:
             terminal_status = str(action_log.get("_terminal_status") or "model_protocol_error")
-            if terminal_status == "completed":
+            if terminal_status in {"completed", "abstained"}:
                 sample.metadata = sample.metadata or {}
                 sample.metadata["final_action"] = cur_response
                 sample.metadata["final_answer"] = cur_response
+                sample.metadata["abstention"] = terminal_status == "abstained"
             break
 
         latest_tool = execution_trace[-1] if execution_trace else {}
         recovery_observation = bool(latest_tool.get("recovery_observation"))
-        if not recovery_observation and (
-            not latest_tool.get("executed") or not latest_tool.get("success")
+        # World-injected failures intentionally return success=False, but the
+        # returned error is a valid POMDP observation and must remain in RL data.
+        if (
+            not recovery_observation
+            and not _is_world_injected_observation(latest_tool)
+            and (
+                not latest_tool.get("executed")
+                or not latest_tool.get("success")
+            )
         ):
             terminal_status = "infra_error"
             terminal_reason = "successful tool execution did not produce a sendable observation"
@@ -3294,6 +5906,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
                 obs_images,
                 obs_train_inputs,
                 _new_image_token_count,
+                observation_suffix_token_count,
             ) = _encode_tool_observation(state, next_obs, image_paths_for_next)
         except Exception as exc:
             step["generation_error"] = str(exc)
@@ -3309,10 +5922,15 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         response_token_ids.extend(obs_token_ids)
         loss_masks.extend([0] * len(obs_token_ids))
         sample.rollout_log_probs.extend([0.0] * len(obs_token_ids))
+        image_start = len(current_images)
         current_images.extend(obs_images)
+        image_end = len(current_images)
+        multimodal_train_input_index: int | None = None
         if obs_train_inputs:
+            multimodal_train_input_index = len(multimodal_train_inputs_buffer)
             multimodal_train_inputs_buffer.append(obs_train_inputs)
         text_observation_token_ids = list(obs_token_ids)
+        text_observation_suffix_token_count = int(observation_suffix_token_count)
         if obs_image_data:
             # Keep a text-only representation available for context recovery
             # when the vision-expanded observation cannot fit alongside a
@@ -3323,6 +5941,12 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
             )
             text_observation_token_ids = list(
                 state.tokenizer(text_only_encoded, add_special_tokens=False)["input_ids"]
+            )
+            text_observation_suffix_token_count = len(
+                state.tokenizer(
+                    "<|im_end|>\n<|im_start|>assistant\n",
+                    add_special_tokens=False,
+                )["input_ids"]
             )
         latest_tool["image_token_count"] = int(_new_image_token_count or 0)
         latest_tool["image_input_count"] = len(obs_image_data)
@@ -3345,12 +5969,21 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
             navigation_state["visual_input_reason"] = "requested page pixels were not attached"
         context_segments.append(
             {
+                "action_token_start": int(action_token_start),
+                "action_token_end": int(len(response_token_ids) - len(obs_token_ids)),
+                "response_token_start": int(action_token_start),
+                "response_token_end": int(len(response_token_ids)),
                 "action_token_ids": list(cur_response_token_ids),
                 "observation_token_ids": list(obs_token_ids),
                 "text_observation_token_ids": text_observation_token_ids,
+                "observation_suffix_token_count": int(observation_suffix_token_count),
+                "text_observation_suffix_token_count": int(text_observation_suffix_token_count),
                 "image_data": list(obs_image_data),
                 "image_token_count": int(_new_image_token_count or 0),
                 "image_paths": list(image_paths_for_next),
+                "image_start": int(image_start),
+                "image_end": int(image_end),
+                "multimodal_train_input_index": multimodal_train_input_index,
                 "vision_placeholder_present": bool(obs_image_data),
                 "visual_input_required": bool(image_paths_for_next),
             }
@@ -3371,6 +6004,196 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
             if tool_call_count >= max_tool_steps:
                 navigation_state["search_budget_exhausted"] = True
 
+    if not branch_child and bayestool_config is not None:
+        explicit_plan = bayes_question_plan is not None
+        selected_checkpoint: dict[str, Any] | None = None
+        if deferred_branch_candidates:
+            # Select one checkpoint only after the primary trajectory has
+            # ended.  The score uses quantities visible at the checkpoint and
+            # never consults the later terminal reward.
+            selected_checkpoint = max(
+                deferred_branch_candidates,
+                key=lambda item: (
+                    float(item["decision"].get("decision_regret", 0.0) or 0.0),
+                    _bayestool_dvoi_score(item["decision"].get("dvoi", 0.0)),
+                    float(item["decision"].get("best_action_margin", 0.0) or 0.0),
+                    -int(item.get("turn", 0)),
+                ),
+            )
+        elif explicit_plan:
+            # Every explicit realization must produce exactly one K-group.
+            # If no mid-trajectory checkpoint met the branch score, the root
+            # is the required bounded fallback rather than an unpaired sample.
+            selected_checkpoint = root_branch_candidate
+
+        target_group_size = int(
+            diagnostic_metadata.get("decision_group_size")
+            or getattr(bayestool_config, "default_group_size", 4)
+            or 4
+        )
+        if bayes_question_plan is not None and world_runtime is not None:
+            target_group_size = int(
+                bayes_question_plan.realizations[int(world_runtime.spec.world_slot)].k
+            )
+
+        def _record_branch_event(event: dict[str, Any]) -> None:
+            branch_events.append(event)
+            navigation_state.setdefault("bayes_branch_events", []).append(event)
+
+        def _mark_question_skipped(reason: str) -> None:
+            diagnostic_metadata["question_skipped"] = True
+            diagnostic_metadata["exclude_from_group_statistics"] = True
+            diagnostic_metadata["valid_for_rl"] = False
+            diagnostic_metadata["degenerate_no_signal"] = True
+            diagnostic_metadata["question_skip_reason"] = str(reason)
+            navigation_state.setdefault("bayes_branch_events", []).append(
+                {
+                    "branch_triggered": False,
+                    "question_skipped": True,
+                    "degenerate_no_signal": True,
+                    "reason": str(reason),
+                    "target_group_size": target_group_size,
+                }
+            )
+
+        if selected_checkpoint is not None:
+            selected_prefix_hint = str(selected_checkpoint["checkpoint"].get("prefix_hash", ""))
+            root_prefix_hint = str(
+                root_branch_candidate["checkpoint"].get("prefix_hash", "")
+                if root_branch_candidate is not None
+                else ""
+            )
+            selected_checkpoint["checkpoint"]["selected_decision_event"] = (
+                "root"
+                if selected_prefix_hint == root_prefix_hint
+                else f"branch:{selected_prefix_hint[:32]}"
+            )
+            try:
+                children, branch_event = await _launch_bayestool_branches(
+                    args=args,
+                    state=state,
+                    url=url,
+                    sample=sample,
+                    sampling_params=selected_checkpoint["sampling_params"],
+                    evaluation=evaluation,
+                    checkpoint=selected_checkpoint["checkpoint"],
+                    current_text=selected_checkpoint["current_text"],
+                    current_token_ids=selected_checkpoint["current_token_ids"],
+                    current_log_probs=selected_checkpoint["current_log_probs"],
+                    im_end_id=im_end_id,
+                    decision_controller=decision_controller,
+                    bayes_config=bayestool_config,
+                    candidates_override=selected_checkpoint["candidates"],
+                    candidate_errors_override=selected_checkpoint["candidate_errors"],
+                    target_group_size=target_group_size,
+                    force_branch=explicit_plan,
+                )
+                _record_branch_event(branch_event)
+
+                # A middle checkpoint is allowed to fail independently.  Do
+                # one bounded retry from the root under the same latent world;
+                # partial children from the failed middle attempt are never
+                # admitted as a smaller decision group.
+                enough_children = len(children) >= max(0, target_group_size - 1)
+                selected_prefix = str(selected_checkpoint["checkpoint"].get("prefix_hash", ""))
+                root_prefix = str(
+                    root_branch_candidate["checkpoint"].get("prefix_hash", "")
+                    if root_branch_candidate is not None
+                    else ""
+                )
+                if explicit_plan and not enough_children and root_branch_candidate is not None:
+                    root_retry = dict(root_branch_candidate)
+                    retry_candidates, retry_errors = await _sample_bayestool_branch_candidates(
+                        state=state,
+                        url=url,
+                        checkpoint=root_retry["checkpoint"],
+                        current_text=root_retry["current_text"],
+                        current_token_ids=root_retry["current_token_ids"],
+                        current_log_probs=root_retry["current_log_probs"],
+                        sampling_params=root_retry["sampling_params"],
+                        im_end_id=im_end_id,
+                        config=bayestool_config,
+                        target_group_size=target_group_size,
+                    )
+                    root_retry["candidates"] = retry_candidates
+                    root_retry["candidate_errors"] = retry_errors
+                    retry_children, retry_event = await _launch_bayestool_branches(
+                        args=args,
+                        state=state,
+                        url=url,
+                        sample=sample,
+                        sampling_params=root_retry["sampling_params"],
+                        evaluation=evaluation,
+                        checkpoint=root_retry["checkpoint"],
+                        current_text=root_retry["current_text"],
+                        current_token_ids=root_retry["current_token_ids"],
+                        current_log_probs=root_retry["current_log_probs"],
+                        im_end_id=im_end_id,
+                        decision_controller=decision_controller,
+                        bayes_config=bayestool_config,
+                        candidates_override=retry_candidates,
+                        candidate_errors_override=retry_errors,
+                        target_group_size=target_group_size,
+                        force_branch=True,
+                    )
+                    _record_branch_event(retry_event)
+                    if len(retry_children) >= max(0, target_group_size - 1):
+                        children = retry_children
+                        branch_event = retry_event
+                        selected_checkpoint = root_retry
+                        enough_children = True
+                    else:
+                        children = []
+
+                if explicit_plan and not enough_children:
+                    _mark_question_skipped(
+                        "unable to construct the required K-sized decision group after middle/root retry"
+                    )
+                    children = []
+                elif branch_event.get("branch_triggered") and enough_children:
+                    branch_children.extend(children)
+                    branch_group_id = str(branch_event.get("branch_sibling_group_id"))
+                    diagnostic_metadata["sibling_group_id"] = branch_group_id
+                    diagnostic_metadata["bayestool_branch_sibling_group_id"] = branch_group_id
+                    diagnostic_metadata["bayestool_branch_prefix_hash"] = branch_event.get("prefix_hash")
+                    diagnostic_metadata["bayestool_branch_action_key"] = branch_event.get("parent_action_key")
+                    diagnostic_metadata["bayestool_branch_shared_prefix"] = True
+                    diagnostic_metadata["bayestool_branch_q_features"] = (
+                        branch_event.get("q_features", {}).get(branch_event.get("parent_action_key"), {})
+                        if isinstance(branch_event.get("q_features"), dict)
+                        else {}
+                    )
+                    diagnostic_metadata["bayestool_branch_horizon"] = branch_event.get("branch_horizon", 0)
+                    diagnostic_metadata["runtime_state_digest"] = branch_event.get(
+                        "runtime_state_digest", selected_checkpoint["checkpoint"].get("runtime_state_digest", "")
+                    )
+                    diagnostic_metadata["bayes_runtime_state_digest"] = diagnostic_metadata["runtime_state_digest"]
+                    diagnostic_metadata["selected_decision_event"] = (
+                        "root" if str(selected_checkpoint["checkpoint"].get("prefix_hash", "")) == root_prefix
+                        else f"branch:{branch_event.get('prefix_hash', '')[:32]}"
+                    )
+                elif explicit_plan:
+                    _mark_question_skipped(
+                        str(branch_event.get("reason") or "branch expansion did not produce a complete decision group")
+                    )
+                elif not branch_event.get("branch_triggered"):
+                    diagnostic_metadata["degenerate_no_signal"] = True
+            except Exception as exc:
+                failure_event = {
+                    "branch_triggered": False,
+                    "degenerate_no_signal": True,
+                    "reason": f"branch expansion failed: {exc}",
+                }
+                _record_branch_event(failure_event)
+                if explicit_plan:
+                    _mark_question_skipped(failure_event["reason"])
+                else:
+                    diagnostic_metadata["degenerate_no_signal"] = True
+        elif explicit_plan:
+            _mark_question_skipped(
+                "no valid root decision checkpoint was available for the explicit realization plan"
+            )
+
     if terminal_status is None:
         # A syntactically valid final can be rejected by the evidence guard.
         # If the model keeps repeating that premature final until the turn
@@ -3388,11 +6211,24 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         terminal_status = "infra_error"
         terminal_reason = "one or more tool calls failed because a runtime backend was unavailable"
 
-    sample.tokens = prompt_tokens_ids + response_token_ids
-    sample.response_length = len(response_token_ids)
+    train_response_token_ids, train_loss_masks, train_rollout_log_probs, train_mm_chunks, train_trajectory = (
+        _cap_training_trajectory(
+            prompt_tokens_ids,
+            response_token_ids,
+            loss_masks,
+            sample.rollout_log_probs,
+            context_segments,
+            multimodal_train_inputs_buffer,
+            step_action_spans,
+            max_sequence_length=_resolve_training_sequence_limit(args),
+        )
+    )
+    sample.tokens = prompt_tokens_ids + train_response_token_ids
+    sample.response_length = len(train_response_token_ids)
     sample.response = response
-    sample.loss_mask = loss_masks
-    sample.multimodal_train_inputs = _merge_multimodal_train_inputs(multimodal_train_inputs_buffer)
+    sample.loss_mask = train_loss_masks
+    sample.rollout_log_probs = train_rollout_log_probs
+    sample.multimodal_train_inputs = _merge_multimodal_train_inputs(train_mm_chunks)
     if current_images:
         sample.multimodal_inputs = {"images": current_images, "videos": None}
 
@@ -3404,6 +6240,8 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     )
     sample.tool_error_count = int(action_log.get("tool_error_count", 0))
     sample.tool_execution_trace = execution_trace
+    training_response_start = int(train_trajectory.get("response_start", 0) or 0)
+    training_response_end = training_response_start + len(train_response_token_ids)
     for key in (
         "candidate_action_count",
         "executed_action_count",
@@ -3427,11 +6265,29 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     action_rewards: list[float] = []
     rejected_action_indices: list[int] = []
     for action_index, action in enumerate(action_log.get("actions", [])):
-        span = step_action_spans[action_index] if action_index < len(step_action_spans) else {}
+        full_span = step_action_spans[action_index] if action_index < len(step_action_spans) else {}
+        try:
+            full_start = int(full_span.get("token_start", 0) or 0)
+            full_end = int(full_span.get("token_end", 0) or 0)
+        except (TypeError, ValueError):
+            full_start = 0
+            full_end = 0
+        # The actor receives a suffix of the response.  Drop action metadata
+        # for discarded prefixes and translate the remaining token spans to
+        # the new response origin so rejected-action penalties cannot land on
+        # unrelated tokens.
+        if full_start < training_response_start or full_end > training_response_end:
+            continue
+        span = {
+            "token_start": full_start - training_response_start,
+            "token_end": full_end - training_response_start,
+        }
         valid_for_gradient = bool(action.get("action_valid_for_policy_gradient", True))
         action_reward = float(action.get("action_reward", 0.0) or 0.0)
         action["action_valid_for_policy_gradient"] = valid_for_gradient
         action["action_reward"] = action_reward
+        action["full_token_start"] = full_start
+        action["full_token_end"] = full_end
         action["token_start"] = int(span.get("token_start", 0))
         action["token_end"] = int(span.get("token_end", 0))
         mask_value = 1 if valid_for_gradient else 0
@@ -3445,7 +6301,7 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         )
         action_rewards.append(action_reward)
         if not valid_for_gradient:
-            rejected_action_indices.append(action_index)
+            rejected_action_indices.append(len(action_rewards) - 1)
 
     sample.metadata = sample.metadata or {}
     sample.metadata["tool_execution"] = {
@@ -3465,6 +6321,14 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         "premature_final_count",
         "rejected_final_count",
     )}
+    sample.metadata["failure_events"] = list(action_log.get("failure_events", []))
+    sample.metadata["budget_exhausted_without_terminal"] = bool(
+        navigation_state.get("search_budget_exhausted")
+        and terminal_status not in {"completed", "abstained"}
+    )
+    sample.metadata["bayes_decisions"] = list(action_log.get("bayes_decisions", []))
+    sample.metadata["training_trajectory"] = dict(train_trajectory)
+    sample.metadata["full_response_length"] = len(response_token_ids)
     sample.metadata["assistant_token_masks"] = assistant_token_masks
     sample.metadata["action_rewards"] = action_rewards
     sample.metadata["rejected_action_indices"] = rejected_action_indices
@@ -3547,6 +6411,26 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         (int(step.get("image_tensor_count", 0) or 0) for step in generation_steps),
         default=0,
     )
+    cost_state["image_tokens"] = float(
+        sum(int(step.get("image_token_count", 0) or 0) for step in generation_steps)
+    )
+    cost_calls = max(1.0, float(cost_state.get("tool_calls", sample.tool_call_count) or sample.tool_call_count or 1.0))
+    cost_metrics = {
+        "latency_seconds": float(cost_state.get("latency_seconds", 0.0) or 0.0),
+        "observation_text_tokens": float(cost_state.get("observation_text_tokens", 0.0) or 0.0),
+        "image_tokens": float(cost_state.get("image_tokens", 0.0) or 0.0),
+        "latency_cost": min(1.0, float(cost_state.get("latency_seconds", 0.0) or 0.0) / (2.0 * cost_calls)),
+        "text_token_cost": min(1.0, float(cost_state.get("observation_text_tokens", 0.0) or 0.0) / (1024.0 * cost_calls)),
+        "image_token_cost": min(1.0, float(cost_state.get("image_tokens", 0.0) or 0.0) / (256.0 * cost_calls)),
+    }
+    cost_metrics["normalized_latency_cost"] = cost_metrics["latency_cost"]
+    cost_metrics["normalized_text_token_cost"] = cost_metrics["text_token_cost"]
+    cost_metrics["normalized_image_token_cost"] = cost_metrics["image_token_cost"]
+    sample.metadata["bayestool_cost"] = cost_metrics
+    sample.metadata.update(cost_metrics)
+    sample.metadata["tool_budget"] = int(
+        getattr(args, "bayestool_tool_budget", None) or max_tool_steps
+    )
     sample.metadata["consumed_image_paths"] = list(
         dict.fromkeys(
             path
@@ -3599,6 +6483,288 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     sample.metadata["runtime_evidence_source"] = "tool_observation"
     sample.metadata["ground_truth_metadata_used_in_prompt"] = False
     sample.metadata["ground_truth_metadata_used_in_action_selection"] = False
+    if bayestool_enabled and world_runtime is not None and belief_runtime is not None:
+        snapshot = belief_runtime.snapshot()
+        stage_policy = stage_definition(bayestool_config) if stage_definition is not None else None
+        decision_history = list(sample.metadata.get("bayes_decisions", []))
+        primary_decision = next(
+            (item for item in reversed(decision_history) if isinstance(item, dict)),
+            {},
+        )
+        world_slot = int(world_runtime.spec.world_slot)
+        world_slot_role = str(
+            getattr(world_runtime.spec, "world_slot_role", "")
+            or (slot_role_from_metadata(diagnostic_metadata) if slot_role_from_metadata is not None else "")
+        )
+        variant_id = str(getattr(world_runtime.spec, "variant_id", "base") or "base")
+        decision_group_size = int(getattr(bayestool_config, "default_group_size", 4) or 4)
+        if bayes_question_plan is not None and world_slot < len(bayes_question_plan.realizations):
+            realization = bayes_question_plan.realizations[world_slot]
+            decision_group_size = int(realization.k)
+            world_slot_role = world_slot_role or realization.world_slot_role
+            variant_id = variant_id or realization.variant_id
+        meta_episode_id = diagnostic_metadata.get("meta_episode_id")
+        question_id = (
+            bayestool_question_id(diagnostic_metadata, default=f"sample-{sample.index}")
+            if bayestool_question_id is not None
+            else str(diagnostic_metadata.get("task_id") or diagnostic_metadata.get("coupling_id") or sample.index)
+        )
+        # The initial input identity is deliberately independent of the
+        # sampled world, replica and observed evidence.  All policy siblings
+        # for one question/world therefore share the root group, while two
+        # different questions can never accidentally share a baseline.
+        initial_input_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "episode_content_id": diagnostic_metadata.get("episode_content_id")
+                    or diagnostic_metadata.get("document_hash")
+                    or bayes_document_digest,
+                    "question_id": question_id,
+                    "prompt": task_prompt,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        selected_event_hint = str(diagnostic_metadata.get("selected_decision_event") or "")
+        branch_prefix_hash = str(
+            diagnostic_metadata.get("bayestool_branch_prefix_hash")
+            or diagnostic_metadata.get("branch_prefix_hash")
+            or ""
+        )
+        if selected_event_hint == "root":
+            # Root fallback children carry a checkpoint prefix for replay
+            # diagnostics, but that prefix is not a new decision node.  Keep
+            # them in the parent's root group identity.
+            branch_prefix_hash = ""
+        decision_event_id = (
+            f"branch:{branch_prefix_hash[:32]}" if branch_prefix_hash else "root"
+        )
+        decision_prefix_hash = branch_prefix_hash or initial_input_hash
+        frozen_runtime_digest = str(
+            diagnostic_metadata.get("runtime_state_digest")
+            or diagnostic_metadata.get("bayes_runtime_state_digest")
+            or bayes_runtime_state_digest
+            or ""
+        )
+        if not frozen_runtime_digest and make_runtime_state_digest is not None:
+            frozen_runtime_digest = make_runtime_state_digest(
+                {
+                    "remaining_tool_budget": bayestool_tool_budget,
+                    "tool_call_count": 0,
+                    "world_schedule": world_runtime.schedule_metadata(),
+                    "world_call_counters": [],
+                    "restore_state_id": "root",
+                    "branch_horizon": int(getattr(bayestool_config, "branch_horizon", 0)),
+                    "bootstrap": "terminal_reward",
+                }
+            )
+        policy_version = str(
+            diagnostic_metadata.get("policy_version")
+            or getattr(bayestool_config, "policy_version", DEFAULT_POLICY_VERSION)
+        )
+        selected_decision_event = str(
+            diagnostic_metadata.get("selected_decision_event")
+            or (f"branch:{branch_prefix_hash[:32]}" if branch_prefix_hash else "root")
+        )
+        # Freeze the selected node back into the per-question manifest before
+        # serializing the sample.  Parent and branch children therefore carry
+        # the same selected event, prefix and runtime digest; a plan that only
+        # describes the initial root state cannot silently pass grouping
+        # validation after a middle-node branch was selected.
+        if bayes_question_plan is not None and 0 <= world_slot < bayes_question_plan.group_count:
+            realization = bayes_question_plan.realizations[world_slot]
+            bayes_question_plan = replace(
+                bayes_question_plan,
+                realizations=tuple(
+                    replace(
+                        item,
+                        selected_decision_event=(
+                            selected_decision_event
+                            if index == world_slot
+                            else item.selected_decision_event
+                        ),
+                        decision_prefix_hash=(
+                            decision_prefix_hash
+                            if index == world_slot
+                            else item.decision_prefix_hash
+                        ),
+                        runtime_state_digest=(
+                            frozen_runtime_digest
+                            if index == world_slot
+                            else item.runtime_state_digest
+                        ),
+                    )
+                    for index, item in enumerate(bayes_question_plan.realizations)
+                ),
+            )
+            diagnostic_metadata["question_rollout_plan"] = bayes_question_plan.to_dict()
+        slot_weight = float(
+            dict(bayes_question_plan.slot_weights).get(world_slot_role, 0.25)
+            if bayes_question_plan is not None
+            else 0.25
+        )
+        group_metadata = dict(diagnostic_metadata)
+        group_metadata.update(
+            {
+                "question_id": question_id,
+                "episode_content_id": diagnostic_metadata.get("episode_content_id")
+                or diagnostic_metadata.get("document_hash")
+                or bayes_document_digest,
+                "initial_input_hash": initial_input_hash,
+                "decision_event_id": decision_event_id,
+                "selected_decision_event": selected_decision_event,
+                "decision_prefix_hash": decision_prefix_hash,
+                "runtime_state_digest": frozen_runtime_digest,
+                "rng_coupling_id": bayes_coupling_id,
+                "return_definition_version": "bayestool-utility-v1",
+                "latent_world_id": world_runtime.spec.latent_world_id,
+                "world_id": world_runtime.spec.world_id,
+                "coupling_id": bayes_coupling_id,
+                "world_slot_role": world_slot_role,
+                "variant_id": variant_id,
+                "slot_weight": slot_weight,
+                "policy_version": policy_version,
+                "decision_group_size": decision_group_size,
+            }
+        )
+        decision_group_id = (
+            make_bayestool_decision_group_id(group_metadata)
+            if make_bayestool_decision_group_id is not None
+            else str(diagnostic_metadata.get("sibling_group_id") or f"bayes-world:{bayes_coupling_id}:{world_slot}")
+        )
+        # Keep the legacy field as an alias for older consumers, but make the
+        # strict decision-group identity the only source used by Bayes GRPO.
+        sibling_group_id = decision_group_id
+        aux_prompt = str(
+            primary_decision.get("prompt")
+            or diagnostic_metadata.get("bayes_aux_prompt")
+            or prompt
+            or task_prompt
+        )
+        aux_content_signature = str(
+            primary_decision.get("content_signature")
+            or diagnostic_metadata.get("bayes_content_signature")
+            or bayes_content_signature
+            or ""
+        )
+        aux_state = {
+            "coupling_id": bayes_coupling_id,
+            "content_signature": aux_content_signature,
+            "belief_snapshot": primary_decision.get("belief_snapshot", snapshot.to_dict()),
+            "ood_score": float(primary_decision.get("belief_snapshot", {}).get("ood_score", snapshot.ood_score) or 0.0)
+            if isinstance(primary_decision.get("belief_snapshot", {}), dict)
+            else float(snapshot.ood_score),
+            "best_action": primary_decision.get("bayes_action"),
+            "best_action_text": primary_decision.get("best_action_text", ""),
+            "best_action_margin": float(primary_decision.get("best_action_margin", 0.0) or 0.0),
+            "candidate_actions": list(primary_decision.get("candidate_action_keys", [])),
+            "candidate_action_texts": {
+                str(item.get("key")): str(item.get("text") or "")
+                for item in primary_decision.get("candidate_actions", [])
+                if isinstance(item, dict) and item.get("key")
+            },
+            "observed_prefix_js": float(primary_decision.get("observed_prefix_js", 1.0) or 0.0),
+            "first_distinguishing_event_step": primary_decision.get("observed_prefix_event_count"),
+            "prefix_observation_signature": primary_decision.get("prefix_observation_signature", ""),
+            "prompt": aux_prompt,
+        }
+        sample.metadata["bayestool"] = {
+            "enabled": True,
+            "stage": str(getattr(bayestool_config, "stage", "c") or "c"),
+            "stage_policy": (
+                {
+                    "name": stage_policy.name,
+                    "objective": stage_policy.objective,
+                    "runtime_mode": stage_policy.runtime_mode,
+                    "branch_probability": stage_policy.branch_probability,
+                    "use_meta_episode": stage_policy.use_meta_episode,
+                    "use_persistent_session_belief": stage_policy.use_persistent_session_belief,
+                    "expected_update_fraction": stage_policy.expected_update_fraction,
+                }
+                if stage_policy is not None
+                else None
+            ),
+            "coupling_id": bayes_coupling_id,
+            "document_hash": bayes_document_digest,
+            "world_id": world_runtime.spec.world_id,
+            "latent_world_id": world_runtime.spec.latent_world_id,
+            "latent_seed": int(world_runtime.spec.latent_seed),
+            "world_type": world_runtime.spec.world_type,
+            "world_slot": int(world_runtime.spec.world_slot),
+            "replica_id": int(world_runtime.spec.replica_id),
+            "world_slot_role": world_slot_role,
+            "variant_id": variant_id,
+            "policy_version": policy_version,
+            "decision_group_size": decision_group_size,
+            "belief_model_version": belief_runtime.belief_model_version,
+            "bayes_q_head_version": bayestool_q_version,
+            "bayes_risk_calibrator_version": bayestool_risk_version,
+            "belief_snapshot": snapshot.to_dict(),
+            "posterior_entropy": snapshot.posterior_entropy,
+            "ood_score": snapshot.ood_score,
+            "world_events": world_runtime.public_event_metadata(),
+            "bayes_supervision": world_runtime.hidden_supervision_metadata(),
+            "reopen_events": list(belief_runtime.reopen_events),
+            "decision_history": decision_history,
+            "question_id": question_id,
+            "initial_input_hash": initial_input_hash,
+            "decision_event_id": decision_event_id,
+            "selected_decision_event": selected_decision_event,
+            "decision_prefix_hash": decision_prefix_hash,
+            "runtime_state_digest": frozen_runtime_digest,
+            "decision_group_id": decision_group_id,
+            "sibling_group_id": sibling_group_id,
+            "sibling_weight": 1.0,
+            "content_signature": aux_content_signature,
+            "branch_events": list(branch_events),
+            "branch_prefix_hash": diagnostic_metadata.get("bayestool_branch_prefix_hash"),
+            "branch_action_key": diagnostic_metadata.get("bayestool_branch_action_key"),
+            "branch_q_features": diagnostic_metadata.get("bayestool_branch_q_features", {}),
+            "branch_horizon": diagnostic_metadata.get("bayestool_branch_horizon", 0),
+            "shared_prefix": bool(diagnostic_metadata.get("bayestool_branch_shared_prefix")),
+            "context_sampling": world_runtime.context_metadata(),
+            "schedule_metadata": world_runtime.schedule_metadata(),
+        }
+        sample.metadata["bayes_aux_state"] = aux_state
+        sample.metadata["bayes_aux_prompt"] = aux_prompt
+        sample.metadata["bayes_content_signature"] = aux_content_signature
+        sample.metadata["bayes_branch_events"] = list(branch_events)
+        if bool(getattr(bayestool_config, "use_persistent_session_belief", True)):
+            sample.metadata["bayestool_session_belief"] = belief_runtime.export_replay_record()
+        else:
+            sample.metadata.pop("bayestool_session_belief", None)
+        sample.metadata["coupling_id"] = bayes_coupling_id
+        sample.metadata["world_id"] = world_runtime.spec.world_id
+        sample.metadata["latent_world_id"] = world_runtime.spec.latent_world_id
+        sample.metadata["latent_seed"] = int(world_runtime.spec.latent_seed)
+        sample.metadata["world_slot"] = int(world_runtime.spec.world_slot)
+        sample.metadata["replica_id"] = int(world_runtime.spec.replica_id)
+        sample.metadata["world_slot_role"] = world_slot_role
+        sample.metadata["variant_id"] = variant_id
+        sample.metadata["slot_weight"] = slot_weight
+        sample.metadata["policy_version"] = policy_version
+        sample.metadata["decision_group_size"] = decision_group_size
+        sample.metadata["sibling_group_id"] = sibling_group_id
+        sample.metadata["question_id"] = question_id
+        sample.metadata["initial_input_hash"] = initial_input_hash
+        sample.metadata["decision_event_id"] = decision_event_id
+        sample.metadata["decision_prefix_hash"] = decision_prefix_hash
+        sample.metadata["selected_decision_event"] = selected_decision_event
+        sample.metadata["runtime_state_digest"] = frozen_runtime_digest
+        sample.metadata["decision_group_id"] = decision_group_id
+        sample.metadata["belief_model_version"] = belief_runtime.belief_model_version
+        sample.metadata["bayes_q_head_version"] = bayestool_q_version
+        sample.metadata["bayes_supervision"] = world_runtime.hidden_supervision_metadata()
+        if export_canonical_replay is not None:
+            replay = export_canonical_replay(
+                sample.metadata,
+                trajectory_id=str(sample.metadata.get("rollout_id") or f"sample-{sample.index}"),
+            )
+            sample.metadata["belief_replay"] = replay
+            sample.metadata["belief_replay_validation_errors"] = []
     sample.metadata["premature_final"] = bool(navigation_state.get("premature_final"))
     sample.metadata["duplicate_page_calls"] = int(navigation_state.get("duplicate_page_calls", 0))
     sample.metadata["duplicate_region_calls"] = int(navigation_state.get("duplicate_region_calls", 0))
@@ -3636,8 +6802,17 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
     )
 
     _set_rollout_status(sample, terminal_status, reason=terminal_reason)
+    if bool(sample.metadata.get("question_skipped")):
+        # A semantically incomplete realization cannot be repaired by mixing
+        # it with another question.  Keep the trajectory for diagnostics but
+        # remove it from RL grouping/weight statistics.
+        sample.valid_for_rl = False
+        sample.remove_sample = True
+        sample.metadata["valid_for_rl"] = False
+        sample.metadata["exclude_from_group_statistics"] = True
+        sample.metadata["question_skipped"] = True
 
-    if getattr(args, "prm_enable", False):
+    if getattr(args, "prm_enable", False) and not bayestool_enabled:
         if prm_pending_tasks:
             prm_results = await asyncio.gather(*[task for _, task in prm_pending_tasks], return_exceptions=True)
             for (step_idx, _), result in zip(prm_pending_tasks, prm_results, strict=False):
@@ -3674,6 +6849,9 @@ async def generate(args, sample: Sample, sampling_params, evaluation: bool = Fal
         "step_token_spans": [[item["token_start"], item["token_end"]] for item in step_wise_steps],
         "step_scores": [item["prm_score"] for item in step_wise_steps],
     }
+    if branch_children:
+        sample.metadata["bayestool_branch_child_count"] = len(branch_children)
+        return [sample, *branch_children]
     return sample
 
 
@@ -3792,6 +6970,12 @@ def _trajectory_metrics(metadata: dict[str, Any]) -> dict[str, Any]:
         "evidence_reward": evidence_reward,
         "tool_selection_reward": tool_selection_reward,
         "tool_cost": tool_cost,
+        "latency_cost": float(metadata.get("latency_cost", 0.0) or 0.0),
+        "text_token_cost": float(metadata.get("text_token_cost", 0.0) or 0.0),
+        "image_token_cost": float(metadata.get("image_token_cost", 0.0) or 0.0),
+        "normalized_latency_cost": float(metadata.get("normalized_latency_cost", metadata.get("latency_cost", 0.0)) or 0.0),
+        "normalized_text_token_cost": float(metadata.get("normalized_text_token_cost", metadata.get("text_token_cost", 0.0)) or 0.0),
+        "normalized_image_token_cost": float(metadata.get("normalized_image_token_cost", metadata.get("image_token_cost", 0.0)) or 0.0),
         "process_reward": process_reward,
         "had_evidence_guard_recovery": bool(metadata.get("had_evidence_guard_recovery", navigation.get("had_evidence_guard_recovery", False))),
         "rejected_final_count": int(metadata.get("rejected_final_count", navigation.get("rejected_final_count", 0)) or 0),
@@ -3869,6 +7053,16 @@ def _reward_consistency_errors(result: dict[str, Any], metadata: dict[str, Any])
 
 async def reward_func(args, sample, **kwargs):
     """Reward a grounded document answer with optional step-wise PRM scores."""
+    if isinstance(sample, (list, tuple)):
+        # slime's batched_async_rm calls custom reward functions with the
+        # whole pending batch.  Keep the actual reward calculation below
+        # single-sample so utility, consistency, and exclusion metadata remain
+        # attached to the corresponding Sample, then return the same-order
+        # reward list expected by the rollout manager.
+        rewards = await asyncio.gather(
+            *(reward_func(args, item, **kwargs) for item in sample)
+        )
+        return list(rewards)
     if not isinstance(sample, Sample):
         raise TypeError("Sample must be an instance of Sample class.")
 
@@ -3949,18 +7143,60 @@ async def reward_func(args, sample, **kwargs):
     result["rollout_status"] = rollout_status or "completed"
     trajectory_metrics = _trajectory_metrics(metadata)
     result.update(trajectory_metrics)
-    answer_reward = float(result["score"])
-    process_weight = float(getattr(args, "process_reward_weight", 0.1))
-    cost_weight = float(getattr(args, "tool_cost_weight", 0.05))
-    total_reward = answer_reward + process_weight * float(trajectory_metrics["process_reward"])
-    total_reward -= cost_weight * float(trajectory_metrics["tool_cost"])
+    bayes_mode = bool(metadata.get("bayestool", {}).get("enabled")) if isinstance(metadata.get("bayestool"), dict) else False
+    if bayes_mode and compute_bayestool_utility is not None:
+        configured_tool_budget = getattr(args, "bayestool_tool_budget", None)
+        if configured_tool_budget is None:
+            configured_tool_budget = metadata.get("tool_budget")
+        if configured_tool_budget is None:
+            configured_tool_budget = TOOL_CONFIGS.get("max_tool_calls", 8)
+        configured_tool_budget = max(1, int(configured_tool_budget))
+        utility_metadata = dict(metadata)
+        utility_metadata.update(
+            {
+                "tool_call_count": result["tool_call_count"],
+                "tool_budget": configured_tool_budget,
+                "duplicate_page_calls": trajectory_metrics.get("duplicate_page_calls", 0),
+                "duplicate_region_calls": trajectory_metrics.get("duplicate_region_calls", 0),
+                "unnecessary_tool_calls": trajectory_metrics.get("unnecessary_tool_calls", 0),
+                "no_information_gain_calls": trajectory_metrics.get("no_information_gain_calls", 0),
+            }
+        )
+        utility_quality = float(result.get("quality", 0.0))
+        if bool(result.get("abstention")) and bool(result.get("abstention_justified")):
+            # A justified abstention is explicitly safer than an unsupported
+            # answer, but remains below a correct final answer.
+            utility_quality = 0.425
+        bayes_utility = compute_bayestool_utility(
+            utility_metadata,
+            utility_quality,
+            tool_budget=configured_tool_budget,
+        )
+        metadata["bayestool_utility"] = bayes_utility
+        result["bayestool_utility"] = bayes_utility
+        answer_reward = float(result["score"])
+        total_reward = float(bayes_utility["utility"])
+    else:
+        answer_reward = float(result["score"])
+        process_weight = float(getattr(args, "process_reward_weight", 0.1))
+        cost_weight = float(getattr(args, "tool_cost_weight", 0.05))
+        total_reward = answer_reward + process_weight * float(trajectory_metrics["process_reward"])
+        total_reward -= cost_weight * float(trajectory_metrics["tool_cost"])
     result["answer_reward"] = answer_reward
     result["total_reward"] = total_reward
-    result["score"] = max(-1.0, min(1.0, total_reward))
+    if bayes_mode:
+        # BayesTool utility is the un-clipped RL return.  The utility helper
+        # records ``utility_clipped`` separately for dashboards; clipping the
+        # reward here would collapse distinct high-cost trajectories before
+        # sibling-relative advantages are computed.
+        result["score"] = total_reward
+        result["score_clipped"] = max(-1.0, min(1.0, total_reward))
+    else:
+        result["score"] = max(-1.0, min(1.0, total_reward))
 
     outcome_reward = float(result["score"])
 
-    if getattr(args, "prm_enable", False):
+    if getattr(args, "prm_enable", False) and not bayes_mode:
         prm_metadata = sample.metadata.get("prm", {}) if isinstance(sample.metadata, dict) else {}
         prm_step_mean = float(prm_metadata.get("step_mean_score", 0.0))
 

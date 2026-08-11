@@ -177,6 +177,132 @@ def get_seqlen_balanced_partitions(seqlen_list: list[int], k_partitions: int, eq
     return _check_and_sort_partitions(partitions)
 
 
+def build_fsdp_modality_aligned_order(
+    modality_flags: list[bool],
+    dp_size: int,
+    global_batch_size: int,
+) -> list[int]:
+    """Reorder mixed VLM/text samples into FSDP-safe global batches.
+
+    FSDP data-parallel ranks must enter the same model submodules in the same
+    order.  A global batch that contains visual inputs on only some ranks can
+    therefore deadlock in a Qwen-VL visual/text forward.  The returned order
+    places visual samples first in a batch and makes both modality counts
+    multiples of ``dp_size``.  ``-1`` denotes a zero-loss visual dummy and
+    ``-2`` denotes a zero-loss text dummy; non-negative values are original
+    sample indices.
+
+    The helper intentionally preserves every original sample.  At most the
+    dummies needed to complete modality-aligned global batches are added.
+    """
+    if (
+        dp_size <= 1
+        or global_batch_size <= 0
+        or global_batch_size % dp_size != 0
+        or not modality_flags
+        or all(modality_flags)
+        or not any(modality_flags)
+    ):
+        return list(range(len(modality_flags)))
+
+    visual_indices = [index for index, is_visual in enumerate(modality_flags) if is_visual]
+    text_indices = [index for index, is_visual in enumerate(modality_flags) if not is_visual]
+    result: list[int] = []
+    visual_cursor = 0
+    text_cursor = 0
+
+    while visual_cursor < len(visual_indices) or text_cursor < len(text_indices):
+        remaining_visual = len(visual_indices) - visual_cursor
+        real_visual_count = min(remaining_visual, global_batch_size)
+        aligned_visual_count = (
+            ((real_visual_count + dp_size - 1) // dp_size) * dp_size if real_visual_count else 0
+        )
+        aligned_visual_count = min(global_batch_size, aligned_visual_count)
+
+        result.extend(visual_indices[visual_cursor : visual_cursor + real_visual_count])
+        visual_cursor += real_visual_count
+        result.extend([-1] * (aligned_visual_count - real_visual_count))
+
+        text_slots = global_batch_size - aligned_visual_count
+        real_text_count = min(text_slots, len(text_indices) - text_cursor)
+        result.extend(text_indices[text_cursor : text_cursor + real_text_count])
+        text_cursor += real_text_count
+        result.extend([-2] * (text_slots - real_text_count))
+
+    return result
+
+
+def build_fsdp_modality_aligned_order_for_batches(
+    modality_flags: list[bool],
+    batch_sizes: list[int],
+    dp_size: int,
+) -> tuple[list[int], list[int]]:
+    """Align visual/text lanes without crossing question-level batches.
+
+    The legacy helper treats one rollout as one fixed-size batch and can move
+    records from adjacent questions across an optimizer boundary.  BayesTool
+    supplies a manifest of complete question batches instead.  This helper
+    applies the same modality alignment independently to each manifest entry
+    and returns the padded sizes that the FSDP actor must consume.
+    """
+
+    if dp_size <= 0:
+        raise ValueError(f"dp_size must be positive, got {dp_size}")
+    if sum(batch_sizes) != len(modality_flags):
+        raise ValueError(
+            f"batch_sizes must cover every sample: sum={sum(batch_sizes)} samples={len(modality_flags)}"
+        )
+    order: list[int] = []
+    aligned_sizes: list[int] = []
+    cursor = 0
+    for batch_size in batch_sizes:
+        if batch_size <= 0 or batch_size % dp_size != 0:
+            raise ValueError(
+                f"BayesTool batch size must be positive and divisible by dp_size: "
+                f"batch_size={batch_size} dp_size={dp_size}"
+            )
+        indices = list(range(cursor, cursor + batch_size))
+        cursor += batch_size
+        visual = [index for index in indices if modality_flags[index]]
+        text = [index for index in indices if not modality_flags[index]]
+        if not visual or not text:
+            order.extend(indices)
+            aligned_sizes.append(batch_size)
+            continue
+        aligned_visual = ((len(visual) + dp_size - 1) // dp_size) * dp_size
+        aligned_text = ((len(text) + dp_size - 1) // dp_size) * dp_size
+        order.extend(visual)
+        order.extend([-1] * (aligned_visual - len(visual)))
+        order.extend(text)
+        order.extend([-2] * (aligned_text - len(text)))
+        aligned_sizes.append(aligned_visual + aligned_text)
+    return order, aligned_sizes
+
+
+def get_fsdp_modality_aligned_partitions(
+    num_samples: int,
+    dp_size: int,
+    global_batch_size: int,
+) -> list[list[int]]:
+    """Split modality-aligned global batches with identical per-rank order."""
+    if dp_size <= 0 or global_batch_size <= 0 or global_batch_size % dp_size != 0:
+        raise ValueError(
+            f"FSDP modality alignment requires positive sizes with global_batch_size divisible by dp_size; "
+            f"got num_samples={num_samples}, dp_size={dp_size}, global_batch_size={global_batch_size}"
+        )
+    if num_samples % global_batch_size != 0:
+        raise ValueError(
+            f"FSDP modality-aligned samples must fill complete global batches; "
+            f"got num_samples={num_samples}, global_batch_size={global_batch_size}"
+        )
+
+    partitions = [[] for _ in range(dp_size)]
+    for batch_start in range(0, num_samples, global_batch_size):
+        for rank in range(dp_size):
+            partitions[rank].extend(range(batch_start + rank, batch_start + global_batch_size, dp_size))
+    return partitions
+
+
 def get_reverse_idx(idx_map):
     reverse_idx_map = copy.deepcopy(idx_map)
 

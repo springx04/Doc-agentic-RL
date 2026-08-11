@@ -1,4 +1,5 @@
 import itertools
+import json
 import logging
 import multiprocessing
 import os
@@ -6,7 +7,7 @@ import random
 import time
 from copy import copy
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 import ray
@@ -28,12 +29,37 @@ from slime.utils.metric_utils import (
     dict_add_prefix,
 )
 from slime.utils.misc import Box, group_by, load_function
-from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
+from slime.utils.seqlen_balancing import (
+    build_fsdp_modality_aligned_order,
+    build_fsdp_modality_aligned_order_for_batches,
+    get_fsdp_modality_aligned_partitions,
+    get_seqlen_balanced_partitions,
+)
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
 from .reward_statistics import normalize_group_rewards
 from .utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, Lock
+
+try:
+    from bayestool.grouping import (
+        QuestionRolloutPlan,
+        WORLD_SLOT_ROLES,
+        compute_hierarchical_loss_weights,
+        slot_role_from_metadata,
+        validate_bayestool_question_records,
+        validate_question_rollout_plan_records,
+    )
+    from bayestool.batching import assign_equal_cardinality_lpt, pack_questions_by_cost
+except ImportError:  # pragma: no cover - baseline Slime runs without BayesTool
+    QuestionRolloutPlan = None
+    WORLD_SLOT_ROLES = ("healthy", "local_degradation", "shared_family_fault", "change")
+    compute_hierarchical_loss_weights = None
+    slot_role_from_metadata = None
+    validate_bayestool_question_records = None
+    validate_question_rollout_plan_records = None
+    assign_equal_cardinality_lpt = None
+    pack_questions_by_cost = None
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -49,6 +75,754 @@ def _sample_excluded_from_rl(sample: Sample) -> bool:
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
     status = str(metadata.get("rollout_status", ""))
     return bool(metadata.get("exclude_from_group_statistics")) or metadata.get("valid_for_rl") is False or status in _RL_EXCLUDED_STATUSES
+
+
+def _bayes_question_id(sample: Sample) -> str:
+    """Read the stable question key carried by rollout metadata."""
+
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    nested = metadata.get("bayestool") if isinstance(metadata.get("bayestool"), Mapping) else {}
+    for key in ("question_id", "meta_trajectory_id", "task_id"):
+        value = metadata.get(key) or nested.get(key)
+        if value is not None and str(value).strip():
+            return str(value)
+    episode = metadata.get("episode_content_id") or nested.get("episode_content_id")
+    question_index = metadata.get("meta_question_index", nested.get("meta_question_index"))
+    if episode is not None and question_index is not None:
+        return f"{episode}:q{question_index}"
+    coupling = metadata.get("coupling_id") or nested.get("coupling_id")
+    if coupling is not None and str(coupling).strip():
+        return str(coupling)
+    return f"sample:{sample.index}"
+
+
+def _bayes_decision_group_id(sample: Sample) -> str:
+    """Return a strict group key; never fall back to a world alone."""
+
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    nested = metadata.get("bayestool") if isinstance(metadata.get("bayestool"), Mapping) else {}
+    value = metadata.get("decision_group_id") or nested.get("decision_group_id")
+    if value:
+        return str(value)
+    legacy = metadata.get("sibling_group_id") or nested.get("sibling_group_id")
+    if legacy:
+        return f"legacy:{_bayes_question_id(sample)}:{legacy}"
+    return f"unpaired:{_bayes_question_id(sample)}:{sample.index}"
+
+
+def _bayes_metadata_value(metadata: Mapping[str, Any], key: str, default: Any = "") -> Any:
+    """Read strict Bayes metadata without assuming a nested mapping exists."""
+
+    nested = metadata.get("bayestool") if isinstance(metadata.get("bayestool"), Mapping) else {}
+    value = metadata.get(key)
+    if value is None or value == "":
+        value = nested.get(key, default)
+    return default if value is None else value
+
+
+def _bayes_group_is_valid(samples: list[Sample], indices: list[int]) -> tuple[bool, list[str]]:
+    """Validate one decision group before it can contribute policy loss."""
+
+    errors: list[str] = []
+    if len(indices) not in {4, 8}:
+        errors.append(f"group_size={len(indices)}")
+    metadata = [samples[index].metadata if isinstance(samples[index].metadata, dict) else {} for index in indices]
+    questions = {_bayes_question_id(samples[index]) for index in indices}
+    worlds = {str(_bayes_metadata_value(row, "latent_world_id", "")) for row in metadata}
+    events = {str(_bayes_metadata_value(row, "selected_decision_event", "")) for row in metadata}
+    prefixes = {str(_bayes_metadata_value(row, "decision_prefix_hash", "")) for row in metadata}
+    initial_inputs = {str(_bayes_metadata_value(row, "initial_input_hash", "")) for row in metadata}
+    roles = {
+        str(slot_role_from_metadata(row) if slot_role_from_metadata is not None else _bayes_metadata_value(row, "world_slot_role", ""))
+        for row in metadata
+    }
+    variants = {str(_bayes_metadata_value(row, "variant_id", "base")) for row in metadata}
+    runtimes = {str(_bayes_metadata_value(row, "runtime_state_digest", "")) for row in metadata}
+    policies = {str(_bayes_metadata_value(row, "policy_version", "")) for row in metadata}
+    declared_k: set[int] = set()
+    for row in metadata:
+        value = _bayes_metadata_value(row, "decision_group_size", None)
+        if value is not None:
+            try:
+                declared_k.add(int(value))
+            except (TypeError, ValueError):
+                errors.append("invalid_declared_group_size")
+    if len(questions) != 1:
+        errors.append("cross_question")
+    if len(worlds) != 1 or "" in worlds:
+        errors.append("cross_latent_world")
+    if len(events) != 1 or "" in events:
+        errors.append("selected_decision_event_not_frozen")
+    if len(prefixes) != 1 or "" in prefixes:
+        errors.append("cross_decision_prefix")
+    if len(initial_inputs) != 1 or "" in initial_inputs:
+        errors.append("initial_input_not_frozen")
+    if len(roles) != 1 or "" in roles:
+        errors.append("world_slot_role_missing")
+    if len(variants) != 1:
+        errors.append("cross_variant")
+    if len(runtimes) != 1 or "" in runtimes:
+        errors.append("runtime_state_not_frozen")
+    if len(policies) != 1 or "" in policies:
+        errors.append("policy_version_not_frozen")
+    if declared_k and declared_k != {len(indices)}:
+        errors.append("declared_group_size_mismatch")
+    if len(indices) not in {4, 8}:
+        errors.append("group_size_not_allowed")
+    sample_ids = {
+        str(
+            _bayes_metadata_value(row, "sample_id", "")
+            or _bayes_metadata_value(row, "trajectory_id", "")
+            or _bayes_metadata_value(row, "rollout_index", "")
+            or _bayes_metadata_value(row, "sample_index", "")
+            or samples[index].index
+            or _bayes_metadata_value(row, "rollout_id", "")
+        )
+        for index, row in zip(indices, metadata, strict=True)
+    }
+    if len(sample_ids) != len(indices):
+        errors.append("duplicate_independent_sample")
+    if any(_sample_excluded_from_rl(samples[index]) for index in indices):
+        errors.append("infrastructure_invalid")
+    return not errors, errors
+
+
+def _validate_bayes_question_plan(
+    samples: list[Sample],
+    indices: list[int],
+    question_id: str,
+) -> dict[str, Any]:
+    """Validate one question against the producer's frozen realization plan."""
+
+    errors: list[str] = []
+    if QuestionRolloutPlan is None or validate_question_rollout_plan_records is None:
+        return {"valid": False, "errors": ["question_plan_validator_unavailable"]}
+    active = [samples[index] for index in indices if not _sample_excluded_from_rl(samples[index])]
+    raw_plans: list[Mapping[str, Any]] = []
+    fingerprints: set[str] = set()
+    for sample in active:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        raw_plan = _bayes_metadata_value(metadata, "question_rollout_plan", None)
+        if not isinstance(raw_plan, Mapping):
+            errors.append("missing_question_rollout_plan")
+            continue
+        raw_plans.append(raw_plan)
+        # Each realization is finalized by its own primary/branch rollout,
+        # so selected event/prefix/digest fields may legitimately differ
+        # between serialized copies of the same question plan.  The structural
+        # manifest (roles, variants, K, latent worlds, policy and slot weights)
+        # must remain identical; group-local metadata below checks the actual
+        # selected node and frozen runtime digest.
+        structural_plan = json.loads(json.dumps(raw_plan, ensure_ascii=False, default=str))
+        for realization in structural_plan.get("realizations", []):
+            if isinstance(realization, dict):
+                for key in ("selected_decision_event", "decision_prefix_hash", "runtime_state_digest"):
+                    realization.pop(key, None)
+        fingerprints.add(json.dumps(structural_plan, ensure_ascii=False, sort_keys=True, default=str))
+    if len(fingerprints) > 1:
+        errors.append("question_rollout_plan_not_frozen")
+    if not raw_plans:
+        return {"valid": False, "errors": errors or ["missing_question_rollout_plan"]}
+    try:
+        plan = QuestionRolloutPlan.from_mapping(raw_plans[0])
+    except (TypeError, ValueError, KeyError) as exc:
+        return {"valid": False, "errors": [*errors, f"invalid_question_rollout_plan:{exc}"]}
+    if plan.question_id != question_id:
+        errors.append(f"question_plan_id_mismatch:{plan.question_id}!={question_id}")
+    records = [sample for sample in active]
+    plan_report = validate_question_rollout_plan_records(records, plan, max_records=48)
+    if not plan_report.get("valid"):
+        errors.extend(str(value) for value in plan_report.get("plan_errors", []))
+        if not plan_report.get("valid") and not plan_report.get("plan_errors"):
+            errors.append("question_plan_record_validation_failed")
+    return {
+        "valid": not errors and bool(plan_report.get("valid")),
+        "errors": errors,
+        "plan": plan,
+        "report": plan_report,
+    }
+
+
+def _sample_bayes_train_cost(
+    sample: Sample,
+    *,
+    visual_alpha: float = 1.0,
+    overhead_beta: float = 0.25,
+) -> dict[str, float]:
+    """Estimate the forward/backward cost without using model labels."""
+
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    if metadata.get("dummy_removed_sample"):
+        return {
+            "text_loss_tokens": 0.0,
+            "visual_tokens": 0.0,
+            "sequence_overhead": 0.0,
+            "estimated_train_cost": 0.0,
+        }
+
+    def _non_negative(value: Any, default: float) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return default
+        return result if np.isfinite(result) and result >= 0.0 else default
+
+    loss_mask = sample.loss_mask or []
+    text_loss_tokens = _non_negative(
+        metadata.get("text_loss_tokens"),
+        float(sum(1 for value in loss_mask if value)) if loss_mask else float(sample.response_length),
+    )
+    visual_tokens = _non_negative(
+        metadata.get("visual_tokens", metadata.get("image_tokens")),
+        0.0,
+    )
+    if visual_tokens == 0.0 and isinstance(sample.multimodal_train_inputs, Mapping):
+        # Processor metadata varies by model.  Prefer a leading item dimension
+        # over raw pixel numel so image resolution does not dominate the cost.
+        for key, value in sample.multimodal_train_inputs.items():
+            if not isinstance(value, torch.Tensor) or value.numel() == 0:
+                continue
+            key_lower = str(key).casefold()
+            if "pixel" in key_lower or "image" in key_lower or "vision" in key_lower:
+                visual_tokens += float(value.shape[0] if value.ndim else value.numel())
+        visual_tokens = max(0.0, visual_tokens)
+    sequence_overhead = _non_negative(
+        metadata.get("sequence_overhead"),
+        float(max(0, len(sample.tokens) - int(text_loss_tokens))),
+    )
+    visual_alpha = max(0.0, float(visual_alpha))
+    overhead_beta = max(0.0, float(overhead_beta))
+    estimated = text_loss_tokens + visual_alpha * visual_tokens + overhead_beta * sequence_overhead
+    values = {
+        "text_loss_tokens": text_loss_tokens,
+        "visual_tokens": visual_tokens,
+        "sequence_overhead": sequence_overhead,
+        "estimated_train_cost": estimated,
+    }
+    if isinstance(sample.metadata, dict):
+        sample.metadata.update(values)
+    return values
+
+
+def _build_cost_aware_question_batches(
+    ready_questions: list[tuple[str, list[int]]],
+    question_costs: Mapping[str, float],
+    *,
+    questions_per_step: int,
+    max_questions_per_step: int,
+    target_global_train_cost: float | None,
+) -> tuple[list[list[tuple[str, list[int]]]], float, str]:
+    """Pack whole questions by estimated cost using a bounded greedy LPT pass."""
+    if pack_questions_by_cost is None:
+        raise RuntimeError("BayesTool cost batching helper is unavailable")
+    return pack_questions_by_cost(
+        ready_questions,
+        question_costs,
+        questions_per_step=questions_per_step,
+        max_questions_per_step=max_questions_per_step,
+        target_global_train_cost=target_global_train_cost,
+    )
+
+
+def _build_bayes_round_manifest(
+    samples: list[Sample],
+    batch_sizes: list[int],
+    *,
+    dp_size: int,
+    visual_alpha: float = 1.0,
+    overhead_beta: float = 0.25,
+) -> list[dict[str, Any]]:
+    """Create a rank-stable equal-cardinality LPT manifest for each round."""
+
+    if dp_size <= 0:
+        raise ValueError(f"dp_size must be positive, got {dp_size}")
+    if sum(int(value) for value in batch_sizes) != len(samples):
+        raise ValueError(
+            "BayesTool round manifest sizes must cover final samples: "
+            f"sum={sum(int(value) for value in batch_sizes)} samples={len(samples)}"
+        )
+    manifest: list[dict[str, Any]] = []
+    cursor = 0
+    for round_index, raw_batch_size in enumerate(batch_sizes):
+        batch_size = int(raw_batch_size)
+        if batch_size <= 0 or batch_size % dp_size:
+            raise ValueError(
+                f"BayesTool round size must be positive and divisible by dp_size: {batch_size}/{dp_size}"
+            )
+        indices = list(range(cursor, cursor + batch_size))
+        cursor += batch_size
+        costs = {
+            index: _sample_bayes_train_cost(
+                samples[index], visual_alpha=visual_alpha, overhead_beta=overhead_beta
+            )["estimated_train_cost"]
+            for index in indices
+        }
+        local_count = batch_size // dp_size
+        if assign_equal_cardinality_lpt is None:
+            raise RuntimeError("BayesTool LPT helper is unavailable")
+        # Equal local cardinality preserves the existing FSDP collective
+        # contract; LPT minimizes cost skew subject to that hard constraint.
+        rank_indices, rank_costs = assign_equal_cardinality_lpt(
+            indices,
+            costs,
+            dp_size=dp_size,
+        )
+        question_ids = sorted(
+            {
+                _bayes_question_id(samples[index])
+                for index in indices
+                if not (isinstance(samples[index].metadata, dict) and samples[index].metadata.get("dummy_removed_sample"))
+            }
+        )
+        max_cost = max(rank_costs, default=0.0)
+        min_cost = min(rank_costs, default=0.0)
+        manifest.append(
+            {
+                "round_index": round_index,
+                "global_sample_indices": indices,
+                "question_ids": question_ids,
+                "global_sample_count": batch_size,
+                "local_sample_count": local_count,
+                "rank_sample_indices": rank_indices,
+                "rank_costs": rank_costs,
+                "global_cost": float(sum(rank_costs)),
+                "max_rank_cost": float(max_cost),
+                "min_rank_cost": float(min_cost),
+                "rank_cost_imbalance": float((max_cost - min_cost) / max_cost) if max_cost else 0.0,
+                "dummy_sample_count": sum(
+                    1
+                    for index in indices
+                    if isinstance(samples[index].metadata, dict)
+                    and samples[index].metadata.get("dummy_removed_sample")
+                ),
+            }
+        )
+    return manifest
+
+
+def _prepare_bayes_question_batches(
+    samples: list[Sample],
+    *,
+    dp_size: int,
+    questions_per_step: int = 2,
+    max_questions_per_step: int = 8,
+    target_global_train_cost: float | None = None,
+    visual_alpha: float = 1.0,
+    overhead_beta: float = 0.25,
+) -> tuple[list[Sample], list[int], dict[str, Any]]:
+    """Keep complete questions and produce a multi-question batch manifest.
+
+    This is deliberately fail-closed.  A question with an incomplete world
+    group is skipped; it is never repaired with another question, a dummy, or
+    a copied rollout.  Dummies may be added later solely for FSDP modality
+    alignment and are not part of this manifest.
+    """
+
+    groups: dict[str, list[int]] = {}
+    questions: dict[str, list[int]] = {}
+    for index, sample in enumerate(samples):
+        if _sample_excluded_from_rl(sample):
+            continue
+        group_id = _bayes_decision_group_id(sample)
+        groups.setdefault(group_id, []).append(index)
+        questions.setdefault(_bayes_question_id(sample), []).append(index)
+
+    valid_groups: set[str] = set()
+    violations: list[dict[str, Any]] = []
+    for group_id, indices in groups.items():
+        valid, errors = _bayes_group_is_valid(samples, indices)
+        if valid:
+            valid_groups.add(group_id)
+        else:
+            violations.append({"group_id": group_id, "size": len(indices), "errors": errors})
+
+    ready_questions: list[tuple[str, list[int]]] = []
+    question_costs: dict[str, float] = {}
+    skipped_questions: list[dict[str, Any]] = []
+    question_plans_validated = 0
+    for question_id, indices in questions.items():
+        question_groups = {_bayes_decision_group_id(samples[index]) for index in indices}
+        missing = sorted(question_groups - valid_groups)
+        role_variant_pairs = {
+            (
+                str(
+                    slot_role_from_metadata(samples[index].metadata or {})
+                    if slot_role_from_metadata is not None
+                    else _bayes_metadata_value(samples[index].metadata or {}, "world_slot_role", "")
+                ),
+                str(_bayes_metadata_value(samples[index].metadata or {}, "variant_id", "base")),
+            )
+            for index in indices
+        }
+        roles = {role for role, _ in role_variant_pairs}
+        # A ready question is the semantic atom: four mandatory realization
+        # roles, optionally two variants, and exactly one complete group per
+        # role/variant.  No other question is used to repair a missing group.
+        question_errors: list[str] = []
+        if missing:
+            question_errors.append("invalid_groups")
+        if not 4 <= len(question_groups) <= 6:
+            question_errors.append("realization_count")
+        if len(indices) > 48:
+            question_errors.append("records_over_48")
+        if not set(WORLD_SLOT_ROLES).issubset(roles):
+            question_errors.append("missing_required_world_slot_role")
+        if len(question_groups) != len(role_variant_pairs):
+            question_errors.append("group_count_not_equal_realizations")
+        plan_validation = _validate_bayes_question_plan(samples, indices, question_id)
+        if not plan_validation["valid"]:
+            question_errors.extend(plan_validation["errors"])
+        else:
+            question_plans_validated += 1
+        if question_errors:
+            skipped_questions.append(
+                {
+                    "question_id": question_id,
+                    "group_count": len(question_groups),
+                    "invalid_groups": missing,
+                    "errors": question_errors,
+                    "plan_report": plan_validation.get("report", {}),
+                }
+            )
+            continue
+        ordered = sorted(indices)
+        if len(ordered) % dp_size:
+            skipped_questions.append(
+                {"question_id": question_id, "group_count": len(question_groups), "reason": "not_dp_divisible"}
+            )
+            continue
+        question_costs[question_id] = sum(
+            _sample_bayes_train_cost(
+                samples[index], visual_alpha=visual_alpha, overhead_beta=overhead_beta
+            )["estimated_train_cost"]
+            for index in ordered
+        )
+        ready_questions.append((question_id, ordered))
+
+    if not ready_questions:
+        # The rollout scheduler may have received only failed questions in
+        # this fetch.  Return an empty manifest so it can fetch the next
+        # questions; do not synthesize a K group or abort the whole rollout.
+        return [], [], {
+            "question_count": 0,
+            "questions_in_step_target": max(1, min(int(questions_per_step), int(max_questions_per_step))),
+            "questions_in_step_histogram": {},
+            "batch_sizes": [],
+            "question_ids_by_batch": [],
+            "group_count": len(groups),
+            "valid_group_count": len(valid_groups),
+            "violations": violations,
+            "skipped_questions": skipped_questions,
+            "question_plans_validated": question_plans_validated,
+            "question_costs": question_costs,
+            "target_global_train_cost": target_global_train_cost,
+            "no_ready_questions": True,
+        }
+
+    packed_questions, cost_target, cost_target_source = _build_cost_aware_question_batches(
+        ready_questions,
+        question_costs,
+        questions_per_step=questions_per_step,
+        max_questions_per_step=max_questions_per_step,
+        target_global_train_cost=target_global_train_cost,
+    )
+    ordered_indices: list[int] = []
+    batch_sizes: list[int] = []
+    question_ids_by_batch: list[list[str]] = []
+    for chunk in packed_questions:
+        chunk_indices = [index for _, indices in chunk for index in indices]
+        chunk_size = len(chunk_indices)
+        if chunk_size % dp_size:
+            raise ValueError(f"complete BayesTool question batch is not divisible by dp_size: {chunk_size}/{dp_size}")
+        ordered_indices.extend(chunk_indices)
+        batch_sizes.append(chunk_size)
+        question_ids_by_batch.append([question_id for question_id, _ in chunk])
+
+    reordered = [samples[index] for index in ordered_indices]
+    questions_in_step_histogram: dict[str, int] = {}
+    for question_ids in question_ids_by_batch:
+        key = str(len(question_ids))
+        questions_in_step_histogram[key] = questions_in_step_histogram.get(key, 0) + 1
+    report = {
+        "question_count": len(ready_questions),
+        "questions_in_step_target": max(1, min(int(questions_per_step), int(max_questions_per_step))),
+        "questions_in_step_histogram": questions_in_step_histogram,
+        "batch_sizes": list(batch_sizes),
+        "question_ids_by_batch": question_ids_by_batch,
+        "group_count": len(groups),
+        "valid_group_count": len(valid_groups),
+        "violations": violations,
+        "skipped_questions": skipped_questions,
+        "question_plans_validated": question_plans_validated,
+        "question_costs": question_costs,
+        "target_global_train_cost": cost_target,
+        "cost_target_source": cost_target_source,
+        "estimated_global_batch_costs": [
+            float(sum(question_costs.get(question_id, 0.0) for question_id in question_ids))
+            for question_ids in question_ids_by_batch
+        ],
+    }
+    return reordered, batch_sizes, report
+
+
+def _clone_multimodal_train_inputs(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Copy processor tensors without changing the visual input contract.
+
+    FSDP data-parallel ranks must execute the same Qwen-VL visual/text module
+    path for a collective.  A padding sample therefore needs a real visual
+    processor payload when the retained rollout batch contains one.  Tensor
+    values are cloned so later packing cannot mutate the source sample; other
+    processor fields are shallow-copied because they are immutable metadata.
+    """
+    if not value:
+        return None
+    copied: dict[str, Any] = {}
+    for key, item in value.items():
+        if isinstance(item, torch.Tensor):
+            copied[key] = item.detach().clone()
+        else:
+            copied[key] = copy(item)
+    return copied or None
+
+
+def _make_zero_loss_dummy_samples(count: int, template: Sample | None = None) -> list[Sample]:
+    """Pad a rollout batch while preserving a homogeneous VLM input path.
+
+    The template is an actual retained rollout, never a synthetic answer.  A
+    dummy reuses its prompt/vision tokens and processor tensors, but all
+    response loss-mask entries are zero and it is explicitly marked removed.
+    Thus the padding keeps FSDP collectives aligned without contributing a
+    policy-gradient signal.
+    """
+    result: list[Sample] = []
+    for offset in range(count):
+        if template is None:
+            tokens = [0, 0]
+            response_length = 1
+            train_inputs = None
+            source_index = None
+        else:
+            tokens = list(template.tokens)
+            response_length = max(1, int(template.response_length))
+            train_inputs = _clone_multimodal_train_inputs(template.multimodal_train_inputs)
+            source_index = template.index
+        result.append(
+            Sample(
+                group_index=-(offset + 1),
+                index=-(offset + 1),
+                tokens=tokens,
+                response_length=response_length,
+                loss_mask=[0] * response_length,
+                rollout_log_probs=[0.0] * response_length,
+                multimodal_train_inputs=train_inputs,
+                reward={"score": 0.0},
+                remove_sample=True,
+                status=Sample.Status.FAILED,
+                metadata={
+                    "dummy_removed_sample": True,
+                    "dummy_visual_template_index": source_index,
+                },
+            )
+        )
+    return result
+
+
+def _bayestool_apply_meta_suffix_returns(
+    samples: list[Sample],
+    trajectory_rewards: list[float],
+    args: Any,
+) -> list[float]:
+    """Replace per-question utility with the explicit meta-episode suffix return.
+
+    A generated meta episode has one primary trajectory per question and may
+    additionally contain shared-prefix branch siblings for that question.
+    The primary trajectory supplies the future-question suffix; each sibling
+    keeps its own current-question utility.  This is the finite-sample form of
+    ``G_i = U_i + gamma * sum_{j>i} gamma^(j-i-1) U_j`` and does not mix
+    questions from different documents or episodes.
+    """
+
+    adjusted = [float(value) for value in trajectory_rewards]
+    grouped: dict[str, dict[int, list[int]]] = {}
+    for index, sample in enumerate(samples):
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        episode_id = metadata.get("meta_episode_id")
+        question_index = metadata.get("meta_question_index")
+        if episode_id is None or question_index is None:
+            continue
+        try:
+            question = int(question_index)
+        except (TypeError, ValueError):
+            continue
+        grouped.setdefault(str(episode_id), {}).setdefault(question, []).append(index)
+
+    try:
+        discount = float(getattr(args, "bayestool_meta_discount", 0.95) or 0.95)
+    except (TypeError, ValueError):
+        discount = 0.95
+    discount = max(0.0, min(1.0, discount))
+
+    for episode_id, questions in grouped.items():
+        primary_utility: dict[int, float] = {}
+
+        def trajectory_utility(index: int) -> float:
+            metadata = samples[index].metadata if isinstance(samples[index].metadata, dict) else {}
+            utility = metadata.get("bayestool_utility")
+            if isinstance(utility, Mapping) and utility.get("utility") is not None:
+                try:
+                    return float(utility["utility"])
+                except (TypeError, ValueError):
+                    pass
+            return float(trajectory_rewards[index])
+
+        for question, indices in questions.items():
+            valid_indices = [index for index in indices if not _sample_excluded_from_rl(samples[index])]
+            if not valid_indices:
+                continue
+            primary = next(
+                (
+                    index
+                    for index in valid_indices
+                    if not bool((samples[index].metadata or {}).get("bayestool_branch_child"))
+                ),
+                valid_indices[0],
+            )
+            primary_utility[question] = trajectory_utility(primary)
+        running_suffix = 0.0
+        future_suffix: dict[int, float] = {}
+        for question in sorted(primary_utility, reverse=True):
+            future_suffix[question] = running_suffix
+            running_suffix = primary_utility[question] + discount * running_suffix
+        for question, indices in questions.items():
+            if question not in future_suffix:
+                continue
+            suffix = discount * future_suffix[question]
+            for index in indices:
+                if _sample_excluded_from_rl(samples[index]):
+                    continue
+                adjusted[index] = trajectory_utility(index) + suffix
+                metadata = samples[index].metadata if isinstance(samples[index].metadata, dict) else {}
+                metadata["bayestool_meta_utility"] = trajectory_utility(index)
+                metadata["bayestool_meta_suffix_return"] = float(adjusted[index])
+                metadata["meta_utility"] = trajectory_utility(index)
+                metadata["meta_suffix_return"] = float(adjusted[index])
+                metadata["bayestool_meta_discount"] = discount
+                metadata["meta_episode_id"] = episode_id
+                samples[index].metadata = metadata
+    return adjusted
+
+
+def _bayestool_feature_rows(value: Any) -> list[dict[str, Any]]:
+    """Expand one branch feature payload into one row per posterior particle."""
+
+    if not isinstance(value, Mapping):
+        return []
+    particle_rows = value.get("particle_records")
+    base = {
+        key: value.get(key)
+        for key in ("task_features", "particle_features", "action_features", "budget_features")
+    }
+    if isinstance(particle_rows, (list, tuple)) and particle_rows:
+        rows: list[dict[str, Any]] = []
+        for particle in particle_rows:
+            if not isinstance(particle, Mapping):
+                continue
+            row = dict(base)
+            row.update({key: particle.get(key, row.get(key)) for key in row})
+            if particle.get("particle_id") is not None:
+                row["particle_id"] = particle.get("particle_id")
+            rows.append(row)
+        return rows
+    return [base]
+
+
+def _bayestool_attach_branch_records(
+    samples: list[Sample],
+    trajectory_rewards: list[float],
+) -> None:
+    """Materialize completed sibling utilities as BayesQ replay records."""
+
+    records_by_sample: dict[int, list[dict[str, Any]]] = {}
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for index, sample in enumerate(samples):
+        if _sample_excluded_from_rl(sample):
+            continue
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        nested = metadata.get("bayestool") if isinstance(metadata.get("bayestool"), Mapping) else {}
+        feature_payload = metadata.get("bayestool_branch_q_features")
+        if not isinstance(feature_payload, Mapping):
+            feature_payload = nested.get("branch_q_features")
+        rows = _bayestool_feature_rows(feature_payload)
+        prefix_hash = metadata.get("bayestool_branch_prefix_hash") or nested.get("branch_prefix_hash")
+        sibling_group_id = (
+            metadata.get("bayestool_branch_sibling_group_id")
+            or metadata.get("sibling_group_id")
+            or nested.get("sibling_group_id")
+        )
+        if not rows or not prefix_hash or not sibling_group_id:
+            continue
+        action_key = metadata.get("bayestool_branch_action_key") or nested.get("branch_action_key")
+        base_record = {
+            "coupling_id": str(metadata.get("coupling_id") or nested.get("coupling_id") or ""),
+            "sibling_group_id": str(sibling_group_id),
+            "prefix_hash": str(prefix_hash),
+            "world_id": str(metadata.get("world_id") or nested.get("world_id") or ""),
+            "belief_version": int(
+                (metadata.get("belief_snapshot") or nested.get("belief_snapshot") or {}).get("version", 0)
+                if isinstance(metadata.get("belief_snapshot", nested.get("belief_snapshot", {})), Mapping)
+                else 0
+            ),
+            "action_key": str(action_key or ""),
+            "utility": float(
+                (metadata.get("bayestool_utility") or {}).get("utility", trajectory_rewards[index])
+                if isinstance(metadata.get("bayestool_utility"), Mapping)
+                else trajectory_rewards[index]
+            ),
+            "horizon": int(metadata.get("bayestool_branch_horizon") or nested.get("branch_horizon") or 0),
+            "is_policy_action": not bool(metadata.get("bayestool_branch_child")),
+        }
+        sample_records: list[dict[str, Any]] = []
+        for row in rows:
+            if any(row.get(key) is None for key in ("task_features", "particle_features", "action_features", "budget_features")):
+                continue
+            record = dict(base_record)
+            record.update(
+                {
+                    "task_features": list(row["task_features"]),
+                    "particle_features": list(row["particle_features"]),
+                    "action_features": list(row["action_features"]),
+                    "budget_features": list(row["budget_features"]),
+                }
+            )
+            if row.get("particle_id") is not None:
+                record["particle_id"] = int(row["particle_id"])
+            sample_records.append(record)
+            grouped.setdefault((str(sibling_group_id), str(prefix_hash)), []).append(record)
+        if sample_records:
+            records_by_sample[index] = sample_records
+
+    for records in grouped.values():
+        if not records:
+            continue
+        oracle = max(records, key=lambda item: (float(item["utility"]), str(item.get("action_key", ""))))
+        policy_records = [item for item in records if bool(item.get("is_policy_action"))]
+        policy_utility = float(policy_records[0]["utility"]) if policy_records else None
+        for record in records:
+            record["oracle_action"] = str(oracle.get("action_key", ""))
+            record["oracle_utility"] = float(oracle["utility"])
+            record["policy_utility"] = policy_utility
+            record["relative_regret"] = (
+                float(oracle["utility"]) - policy_utility if policy_utility is not None else None
+            )
+            record.pop("is_policy_action", None)
+
+    for index, sample in enumerate(samples):
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        if index in records_by_sample:
+            metadata["bayes_branch_records"] = records_by_sample[index]
+        else:
+            metadata.setdefault("bayes_branch_records", [])
+        sample.metadata = metadata
 
 
 @ray.remote
@@ -162,11 +936,50 @@ class RolloutManager:
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
-        data, metrics = self._get_rollout_data(rollout_id=rollout_id)
-        self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
-        _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
-        data = self._convert_samples_to_train_data(data)
-        return self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
+        # A failed explicit BayesTool question is removed from RL statistics;
+        # it must not turn into an empty actor step.  The data source is a
+        # cursor, so asking for another raw rollout with the same coordinator
+        # rollout_id advances to the next questions while keeping the
+        # optimizer/checkpoint identity stable.  Bound retries so a broken
+        # dataset or backend cannot spin forever.
+        max_empty_retries = max(
+            0,
+            int(getattr(self.args, "bayestool_empty_rollout_retry_limit", 4) or 0),
+        )
+        empty_retries = 0
+        while True:
+            data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+            self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
+            _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
+            train_data = self._convert_samples_to_train_data(data)
+            if self.args.advantage_estimator != "bayes_grpo" or train_data.get("tokens"):
+                return self._split_train_data_by_dp(train_data, self.train_parallel_config["dp_size"])
+
+            report = train_data.get("bayes_grouping_report") or {}
+            if not report.get("no_ready_questions"):
+                # This should be unreachable for an empty Bayes manifest.  A
+                # defensive failure is preferable to handing malformed data
+                # to the trainer and silently advancing global_step.
+                raise RuntimeError(
+                    "BayesTool produced an empty train manifest without no_ready_questions; "
+                    "refusing to execute an empty optimizer step"
+                )
+            skipped = report.get("skipped_questions") or []
+            empty_retries += 1
+            logger.warning(
+                "BayesTool rollout %s has no ready question (retry %d/%d, skipped=%d); "
+                "fetching a subsequent question batch",
+                rollout_id,
+                empty_retries,
+                max_empty_retries,
+                len(skipped),
+            )
+            if empty_retries > max_empty_retries:
+                raise RuntimeError(
+                    "BayesTool exceeded the consecutive empty-rollout retry limit "
+                    f"({max_empty_retries}) for coordinator rollout {rollout_id}; "
+                    f"skipped_questions={len(skipped)} violations={len(report.get('violations') or [])}"
+                )
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:
@@ -265,7 +1078,7 @@ class RolloutManager:
             while isinstance(data[0], list):
                 data = list(itertools.chain.from_iterable(data))
 
-            if not self.args.disable_rollout_trim_samples:
+            if not self.args.disable_rollout_trim_samples and self.args.advantage_estimator != "bayes_grpo":
                 global_batch_size = self.args.global_batch_size
                 target_steps_per_rollout = getattr(self.args, "num_steps_per_rollout", None)
                 # dynamic_history can expand one rollout into many step-wise samples.
@@ -292,6 +1105,15 @@ class RolloutManager:
                     data = data[:trim_len]
                     logger.info(f"trim number of samples from {origin_data_length} to {trim_len}")
                 logger.info(f"Final collected {len(data)} samples from rollout to train")
+            elif self.args.advantage_estimator == "bayes_grpo":
+                # Question/group completeness is checked after reward/tool
+                # metadata has been attached.  Trimming here by a fixed sample
+                # count can cut K=4/K=8 or split a question across optimizer
+                # steps, so BayesTool data is passed intact to the planner.
+                logger.info(
+                    "BayesTool rollout trim disabled: collected=%s; deferring question-level filtering",
+                    len(data),
+                )
 
         return data, metrics
 
@@ -363,6 +1185,15 @@ class RolloutManager:
         for index, is_excluded in enumerate(excluded):
             if is_excluded:
                 rewards[index] = 0.0
+        if self.args.advantage_estimator == "bayes_grpo":
+            trajectory_rewards = [float(value) for value in raw_rewards]
+            raw_rewards = _bayestool_apply_meta_suffix_returns(samples, trajectory_rewards, self.args)
+            _bayestool_attach_branch_records(samples, trajectory_rewards)
+            # Bayes-ARPO computes the weighted sibling baseline exactly once
+            # in the actor loss from raw trajectory utilities.  Keep the
+            # public reward tensor raw as well; otherwise downstream code can
+            # accidentally consume a second, already-normalized baseline.
+            return raw_rewards, raw_rewards
         if not self.args.rewards_normalization:
             return raw_rewards, rewards
 
@@ -645,18 +1476,11 @@ class RolloutManager:
             for sample in samples:
                 if _sample_excluded_from_rl(sample):
                     sample.remove_sample = True
-            if any(sample.multimodal_train_inputs is not None for sample in samples):
-                missing_mm_indices = []
-                for sample in samples:
-                    if sample.multimodal_train_inputs is None and not sample.remove_sample:
-                        sample.remove_sample = True
-                        missing_mm_indices.append(sample.index)
-                if missing_mm_indices:
-                    logger.warning(
-                        "Marked %d samples as non-trainable due to missing multimodal_train_inputs: indices=%s",
-                        len(missing_mm_indices),
-                        missing_mm_indices[:20],
-                    )
+            # FSDP's multimodal packer explicitly supports a mixed batch:
+            # visual samples carry a tensor dict while text-only samples carry
+            # ``None`` and are placed in separate homogeneous packs.  Do not
+            # discard valid text-only trajectories merely because another
+            # sibling requested a visual observation.
 
         def _drop_removed_samples(samples: list[Sample]) -> list[Sample]:
             """
@@ -664,34 +1488,187 @@ class RolloutManager:
             """
             return [sample for sample in samples if not sample.remove_sample]
 
-        def _make_dummy_samples(count: int) -> list[Sample]:
-            reward = {self.args.reward_key or "score": 0.0}
-            return [
-                Sample(
-                    group_index=-(i + 1),
-                    index=-(i + 1),
-                    tokens=[0, 0],
-                    response_length=1,
-                    loss_mask=[0],
-                    rollout_log_probs=[0.0],
-                    reward=reward,
-                    remove_sample=True,
-                    status=Sample.Status.FAILED,
-                    metadata={"dummy_removed_sample": True},
-                )
-                for i in range(count)
-            ]
-
         _mark_removed_samples(samples)
         samples = _drop_removed_samples(samples)
         samples = self._drop_constant_reward_groups(samples)
         dp_size = self.train_parallel_config["dp_size"]
-        if len(samples) < dp_size:
-            logger.warning(
-                "Injecting %d dummy samples.",
-                dp_size - len(samples),
+        bayes_batch_sizes: list[int] | None = None
+        bayes_grouping_report: dict[str, Any] | None = None
+        bayes_round_manifest: list[dict[str, Any]] | None = None
+        if self.args.advantage_estimator == "bayes_grpo":
+            samples, bayes_batch_sizes, bayes_grouping_report = _prepare_bayes_question_batches(
+                samples,
+                dp_size=dp_size,
+                questions_per_step=int(getattr(self.args, "bayestool_questions_per_step", 2) or 2),
+                max_questions_per_step=int(getattr(self.args, "bayestool_max_questions_per_step", 8) or 8),
+                target_global_train_cost=getattr(self.args, "bayestool_target_global_train_cost", None),
+                visual_alpha=float(getattr(self.args, "bayestool_cost_visual_alpha", 1.0) or 1.0),
+                overhead_beta=float(getattr(self.args, "bayestool_cost_overhead_beta", 0.25) or 0.25),
             )
-            samples.extend(_make_dummy_samples(dp_size - len(samples)))
+            logger.info(
+                "BAYESTOOL_QUESTION_BATCH_PLAN questions=%s batches=%s batch_sizes=%s skipped=%s violations=%s",
+                bayes_grouping_report["question_count"],
+                len(bayes_batch_sizes),
+                bayes_batch_sizes,
+                len(bayes_grouping_report["skipped_questions"]),
+                len(bayes_grouping_report["violations"]),
+            )
+            if bayes_grouping_report.get("no_ready_questions"):
+                # No usable question arrived in this fetch.  Preserve an
+                # empty manifest so the scheduler can request more data;
+                # never pad this into a fake Bayes group.
+                return {
+                    "tokens": [],
+                    "response_lengths": [],
+                    "rewards": [],
+                    "raw_reward": [],
+                    "truncated": [],
+                    "group_indices": [],
+                    "sample_indices": [],
+                    "bayes_batch_sizes": [],
+                    "bayes_question_ids": [],
+                    "bayes_grouping_report": bayes_grouping_report,
+                    "bayes_weight_report": {"batches": []},
+                    "bayes_group_ids": [],
+                    "bayes_sibling_weights": [],
+                    "bayes_sibling_baselines": [],
+                    "bayes_advantages": [],
+                    "bayes_loss_weights": [],
+                    "bayes_aux_records": [],
+                    "bayes_branch_records": [],
+                    "action_rewards": [],
+                    "action_token_spans": [],
+                    "rejected_action_indices": [],
+                    "loss_masks": [],
+                }
+        effective_global_batch_size = int(
+            getattr(
+                self,
+                "_dynamic_global_batch_size",
+                getattr(self.args, "global_batch_size", dp_size),
+            )
+        )
+        if bayes_batch_sizes:
+            # This value remains a compatibility fallback for non-manifest
+            # code paths.  The actor consumes the per-step manifest below.
+            effective_global_batch_size = max(bayes_batch_sizes)
+        effective_global_batch_size = max(dp_size, effective_global_batch_size)
+        fsdp_modality_aligned = False
+
+        # Qwen-VL's visual and text-only forwards do not execute the same
+        # FSDP-wrapped submodules.  Keep both real modalities, but arrange
+        # every global batch so each rank sees the same modality sequence.
+        # Missing lanes are filled by zero-loss dummies, not by fabricated RL
+        # rewards or extra policy-gradient signal.
+        is_fsdp = getattr(self.args, "train_backend", None) == "fsdp"
+        modality_flags = [
+            isinstance(sample.multimodal_train_inputs, dict) and bool(sample.multimodal_train_inputs)
+            for sample in samples
+        ]
+        aligned_bayes_batch_sizes = list(bayes_batch_sizes) if bayes_batch_sizes else None
+        if is_fsdp and bayes_batch_sizes:
+            modality_order, aligned_bayes_batch_sizes = build_fsdp_modality_aligned_order_for_batches(
+                modality_flags,
+                bayes_batch_sizes,
+                dp_size=dp_size,
+            )
+        elif is_fsdp:
+            modality_order = build_fsdp_modality_aligned_order(
+                modality_flags,
+                dp_size=dp_size,
+                global_batch_size=effective_global_batch_size,
+            )
+        else:
+            modality_order = list(range(len(samples)))
+        if modality_order != list(range(len(samples))):
+            visual_template = next(
+                (
+                    sample
+                    for sample in samples
+                    if isinstance(sample.multimodal_train_inputs, dict)
+                    and sample.multimodal_train_inputs
+                ),
+                None,
+            )
+            visual_dummies = iter(_make_zero_loss_dummy_samples(modality_order.count(-1), visual_template))
+            text_dummies = iter(_make_zero_loss_dummy_samples(modality_order.count(-2), None))
+            aligned_samples: list[Sample] = []
+            for index in modality_order:
+                if index == -1:
+                    aligned_samples.append(next(visual_dummies))
+                elif index == -2:
+                    aligned_samples.append(next(text_dummies))
+                else:
+                    aligned_samples.append(samples[index])
+            logger.warning(
+                "Aligning mixed FSDP modalities: real_samples=%d visual=%d text=%d aligned_samples=%d "
+                "visual_dummies=%d text_dummies=%d global_batch_size=%d dp_size=%d",
+                len(samples),
+                sum(modality_flags),
+                len(samples) - sum(modality_flags),
+                len(aligned_samples),
+                modality_order.count(-1),
+                modality_order.count(-2),
+                effective_global_batch_size,
+                dp_size,
+            )
+            samples = aligned_samples
+            fsdp_modality_aligned = True
+            if aligned_bayes_batch_sizes is not None:
+                bayes_batch_sizes = aligned_bayes_batch_sizes
+
+        # FSDP receives one partition per data-parallel rank and assumes that
+        # every rank has the same number of samples in each global batch.  A
+        # rollout can lose infrastructure-invalid samples after the pre-trim
+        # in ``_get_rollout_data``; padding only up to ``dp_size`` then leaves
+        # a tail such as 15 samples for a global batch of 8.  That produces
+        # uneven rank partitions and can make dynamic microbatch packing ask a
+        # one-sample rank for two packs.  Pad to the effective global batch
+        # size so the existing zero-loss dummy semantics remain explicit and
+        # all FSDP ranks execute identical collective schedules.
+        # In the modality-aligned path the sample order and padding are
+        # already complete global batches; do not add a second padding pass.
+        dummy_count = (-len(samples)) % effective_global_batch_size
+        if len(samples) < effective_global_batch_size:
+            dummy_count = effective_global_batch_size - len(samples)
+        if bayes_batch_sizes:
+            # The per-question planner already covers the complete real
+            # dataset.  Any alignment dummies were inserted per manifest
+            # batch above; a second global padding pass would change question
+            # boundaries and is forbidden.
+            dummy_count = 0
+        if dummy_count and not fsdp_modality_aligned:
+            visual_template = next(
+                (
+                    sample
+                    for sample in samples
+                    if isinstance(sample.multimodal_train_inputs, dict)
+                    and sample.multimodal_train_inputs
+                ),
+                None,
+            )
+            logger.warning(
+                "Injecting %d zero-loss dummy samples to align %d samples with global_batch_size=%d (visual_template=%s).",
+                dummy_count,
+                len(samples),
+                effective_global_batch_size,
+                visual_template.index if visual_template is not None else None,
+            )
+            samples.extend(_make_zero_loss_dummy_samples(dummy_count, visual_template))
+
+        if bayes_batch_sizes:
+            bayes_round_manifest = _build_bayes_round_manifest(
+                samples,
+                list(bayes_batch_sizes),
+                dp_size=dp_size,
+                visual_alpha=float(getattr(self.args, "bayestool_cost_visual_alpha", 1.0) or 1.0),
+                overhead_beta=float(getattr(self.args, "bayestool_cost_overhead_beta", 0.25) or 0.25),
+            )
+            if bayes_grouping_report is not None:
+                bayes_grouping_report["round_manifest"] = bayes_round_manifest
+                bayes_grouping_report["rank_costs_by_round"] = [
+                    item["rank_costs"] for item in bayes_round_manifest
+                ]
 
         raw_rewards, rewards = self._post_process_rewards(samples)
 
@@ -709,6 +1686,126 @@ class RolloutManager:
             "group_indices": [sample.group_index for sample in samples],
             "sample_indices": [sample.index for sample in samples],
         }
+        if bayes_batch_sizes:
+            train_data["bayes_batch_sizes"] = list(bayes_batch_sizes)
+            train_data["bayes_question_ids"] = [_bayes_question_id(sample) for sample in samples]
+            train_data["bayes_grouping_report"] = bayes_grouping_report or {}
+            train_data["bayes_round_manifest"] = bayes_round_manifest or []
+        if fsdp_modality_aligned:
+            train_data["_fsdp_modality_aligned"] = True
+            if bayes_batch_sizes:
+                train_data["_fsdp_bayes_batch_sizes"] = list(bayes_batch_sizes)
+            else:
+                train_data["_fsdp_global_batch_size"] = effective_global_batch_size
+
+        if self.args.advantage_estimator == "bayes_grpo":
+            def bayes_group_id(sample: Sample) -> str:
+                metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+                nested = metadata.get("bayestool")
+                value = metadata.get("decision_group_id")
+                if not value and isinstance(nested, Mapping):
+                    value = nested.get("decision_group_id")
+                if value:
+                    return str(value)
+                # Keep old records isolated by question.  A world/coupling
+                # fallback alone is explicitly forbidden because it mixes
+                # different questions into one advantage baseline.
+                legacy = metadata.get("sibling_group_id")
+                if not legacy and isinstance(nested, Mapping):
+                    legacy = nested.get("sibling_group_id")
+                return (
+                    f"legacy:{_bayes_question_id(sample)}:{legacy}"
+                    if legacy
+                    else f"unpaired:{_bayes_question_id(sample)}:{sample.index}"
+                )
+
+            train_data["bayes_group_ids"] = [
+                bayes_group_id(sample)
+                for sample in samples
+            ]
+            train_data["bayes_sibling_weights"] = [
+                float(
+                    ((sample.metadata if isinstance(sample.metadata, dict) else {}).get("bayestool") or {}).get(
+                        "sibling_weight",
+                        (sample.metadata if isinstance(sample.metadata, dict) else {}).get("sibling_weight", 1.0),
+                    )
+                )
+                for sample in samples
+            ]
+            train_data["coupling_ids"] = [str((sample.metadata or {}).get("coupling_id", "")) for sample in samples]
+            train_data["world_ids"] = [str((sample.metadata or {}).get("world_id", "")) for sample in samples]
+            train_data["sibling_group_ids"] = list(train_data["bayes_group_ids"])
+            # Compute the sibling baseline once over the complete rollout,
+            # before data-parallel partitioning.  Computing it in each FSDP
+            # rank would see only one/few siblings and silently collapse the
+            # GRPO signal to zero.
+            group_to_indices: dict[str, list[int]] = {}
+            for index, group_id in enumerate(train_data["bayes_group_ids"]):
+                metadata = samples[index].metadata if isinstance(samples[index].metadata, dict) else {}
+                if bool(metadata.get("dummy_removed_sample")):
+                    continue
+                group_to_indices.setdefault(str(group_id), []).append(index)
+            baselines = [0.0] * len(samples)
+            bayes_advantages = [0.0] * len(samples)
+            for indices in group_to_indices.values():
+                weights = [max(0.0, float(train_data["bayes_sibling_weights"][index])) for index in indices]
+                denominator = sum(weights) or float(len(indices))
+                baseline = sum(
+                    weight * float(raw_rewards[index]) for index, weight in zip(indices, weights, strict=True)
+                ) / denominator
+                for index in indices:
+                    baselines[index] = baseline
+                    bayes_advantages[index] = float(raw_rewards[index]) - baseline
+            train_data["bayes_sibling_baselines"] = baselines
+            train_data["bayes_advantages"] = bayes_advantages
+            # Hierarchical normalization is computed before DP partitioning:
+            # question -> slot variant -> realization group -> independent
+            # continuation.  Thus K=4 and K=8 have the same group mass, and
+            # adding a variant shares only its slot's fixed 0.25 mass.
+            loss_weights = [0.0] * len(samples)
+            bayes_weight_report: dict[str, Any] = {"batches": []}
+            if bayes_batch_sizes:
+                cursor = 0
+                for batch_number, batch_size in enumerate(bayes_batch_sizes):
+                    batch_indices = list(range(cursor, cursor + batch_size))
+                    cursor += batch_size
+                    batch_records = [samples[index] for index in batch_indices]
+                    question_count = len(
+                        {
+                            _bayes_question_id(record)
+                            for record in batch_records
+                            if not bool(
+                                isinstance(record.metadata, dict)
+                                and record.metadata.get("dummy_removed_sample")
+                            )
+                        }
+                    )
+                    if compute_hierarchical_loss_weights is None:
+                        raise RuntimeError("BayesTool hierarchical grouping module is unavailable")
+                    batch_weights, weight_report = compute_hierarchical_loss_weights(
+                        batch_records,
+                        question_count=max(1, question_count),
+                        validate=True,
+                    )
+                    for index, weight in zip(batch_indices, batch_weights, strict=True):
+                        loss_weights[index] = float(weight)
+                    bayes_weight_report["batches"].append(
+                        {"batch_index": batch_number, "batch_size": batch_size, **weight_report}
+                    )
+            train_data["bayes_loss_weights"] = loss_weights
+            train_data["bayes_weight_report"] = bayes_weight_report
+            train_data["bayes_aux_records"] = [
+                list((sample.metadata or {}).get("bayes_aux_records", []))
+                if isinstance(sample.metadata, dict)
+                else []
+                for sample in samples
+            ]
+            train_data["bayes_branch_records"] = [
+                list((sample.metadata or {}).get("bayes_branch_records", []))
+                if isinstance(sample.metadata, dict)
+                else []
+                for sample in samples
+            ]
 
         # Carry action-level diagnostics into the trainer.  The ordinary
         # sample loss mask remains the rollout's public/diagnostic mask; the
@@ -825,7 +1922,71 @@ class RolloutManager:
         total_lengths = [len(t) for t in data["tokens"]]
         data["total_lengths"] = total_lengths
 
-        if self.args.balance_data:
+        if data.get("bayes_round_manifest"):
+            round_manifest = data["bayes_round_manifest"]
+            partitions = [[] for _ in range(dp_size)]
+            seen: list[int] = []
+            for round_item in round_manifest:
+                rank_indices = round_item.get("rank_sample_indices") if isinstance(round_item, Mapping) else None
+                global_indices = round_item.get("global_sample_indices") if isinstance(round_item, Mapping) else None
+                if not isinstance(rank_indices, list) or len(rank_indices) != dp_size:
+                    raise ValueError("BayesTool round manifest must contain one rank_sample_indices list per DP rank")
+                if not isinstance(global_indices, list):
+                    raise ValueError("BayesTool round manifest is missing global_sample_indices")
+                flattened = [int(index) for rank in rank_indices for index in rank]
+                expected = [int(index) for index in global_indices]
+                if sorted(flattened) != sorted(expected):
+                    raise ValueError("BayesTool round manifest rank assignments do not cover the global round exactly")
+                if len({len(rank) for rank in rank_indices}) != 1:
+                    raise ValueError("BayesTool LPT round must preserve equal local sample counts")
+                for rank, rank_indices_for_rank in enumerate(rank_indices):
+                    partitions[rank].extend(int(index) for index in rank_indices_for_rank)
+                seen.extend(flattened)
+            if sorted(seen) != list(range(len(total_lengths))):
+                raise ValueError(
+                    "BayesTool round manifest does not partition every sample exactly once: "
+                    f"covered={len(seen)} samples={len(total_lengths)}"
+                )
+        elif data.get("_fsdp_modality_aligned") and data.get("_fsdp_bayes_batch_sizes"):
+            batch_sizes = [int(value) for value in data["_fsdp_bayes_batch_sizes"]]
+            partitions = [[] for _ in range(dp_size)]
+            cursor = 0
+            for batch_size in batch_sizes:
+                if batch_size <= 0 or batch_size % dp_size:
+                    raise ValueError(
+                        f"invalid FSDP BayesTool batch manifest entry {batch_size} for dp_size={dp_size}"
+                    )
+                for rank in range(dp_size):
+                    partitions[rank].extend(range(cursor + rank, cursor + batch_size, dp_size))
+                cursor += batch_size
+            if cursor != len(total_lengths):
+                raise ValueError(
+                    f"FSDP BayesTool manifest covers {cursor} samples but data has {len(total_lengths)}"
+                )
+        elif data.get("bayes_batch_sizes"):
+            batch_sizes = [int(value) for value in data["bayes_batch_sizes"]]
+            partitions = [[] for _ in range(dp_size)]
+            cursor = 0
+            for batch_size in batch_sizes:
+                if batch_size <= 0 or batch_size % dp_size:
+                    raise ValueError(
+                        f"invalid BayesTool batch manifest entry {batch_size} for dp_size={dp_size}"
+                    )
+                for rank in range(dp_size):
+                    partitions[rank].extend(range(cursor + rank, cursor + batch_size, dp_size))
+                cursor += batch_size
+            if cursor != len(total_lengths):
+                raise ValueError(
+                    f"BayesTool manifest covers {cursor} samples but data has {len(total_lengths)}"
+                )
+        elif data.get("_fsdp_modality_aligned"):
+            global_batch_size = int(data["_fsdp_global_batch_size"])
+            partitions = get_fsdp_modality_aligned_partitions(
+                len(total_lengths),
+                dp_size=dp_size,
+                global_batch_size=global_batch_size,
+            )
+        elif self.args.balance_data:
             # Equal-size partitioning requires divisibility by dp_size.
             # Dynamic rollout/history can produce tail batches that violate this.
             use_equal_size = (len(total_lengths) % dp_size) == 0
@@ -846,6 +2007,7 @@ class RolloutManager:
             rollout_data = {}
             partition = partitions[i]
             rollout_data["partition"] = partition
+            rollout_data["_partition"] = list(partition)
             for key in [
                 "tokens",
                 "multimodal_train_inputs",
@@ -872,11 +2034,31 @@ class RolloutManager:
                 "action_rewards",
                 "action_token_spans",
                 "rejected_action_indices",
+                "bayes_group_ids",
+                "bayes_advantages",
+                "bayes_sibling_baselines",
+                "bayes_sibling_weights",
+                "bayes_loss_weights",
+                "bayes_question_ids",
+                "coupling_ids",
+                "world_ids",
+                "sibling_group_ids",
+                "bayes_aux_records",
+                "bayes_branch_records",
             ]:
                 if key not in data:
                     continue
                 val = [data[key][j] for j in partition]
                 rollout_data[key] = val
+            for key in [
+                "bayes_batch_sizes",
+                "bayes_grouping_report",
+                "bayes_weight_report",
+                "bayes_round_manifest",
+                "_fsdp_bayes_batch_sizes",
+            ]:
+                if key in data:
+                    rollout_data[key] = data[key]
             # keys that need to be splited at train side
             for key in [
                 "raw_reward",

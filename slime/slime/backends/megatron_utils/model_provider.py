@@ -184,6 +184,18 @@ def get_model_provider_func(
             )
 
         provider.finalize()
+        # Slime's Megatron backend calls the bridge provider's ``provide``
+        # method directly from its existing model/DDP setup.  The official
+        # bridge ``provide_distributed_model`` path normally sets this private
+        # collection before calling ``provide``; populate the same collection
+        # here so multimodal providers (including Qwen3-VL) receive the
+        # initialized TP/PP/CP/embedding groups without bypassing the bridge.
+        from megatron.core.process_groups_config import ProcessGroupCollection
+
+        provider._pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        from .qwen3_vl_compat import install_qwen3_vl_packed_mrope_compat
+
+        install_qwen3_vl_packed_mrope_compat(provider)
         return provider.provide
 
     def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:

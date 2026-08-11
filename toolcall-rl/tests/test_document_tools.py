@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import sys
 
+import pytest
 from PIL import Image
 
 TOOLCALL_DIR = Path(__file__).resolve().parents[1]
@@ -283,6 +284,103 @@ def test_ocr_backend_failure_keeps_visual_input_as_partial_result(monkeypatch, t
     assert result["text"] == ""
     assert result["image_path"] == str(image_path)
     assert "libGL.so.1" in result["error"]
+
+
+def test_auto_ocr_does_not_fall_through_to_network_easyocr(monkeypatch, tmp_path):
+    image_path = tmp_path / "auto-ocr.png"
+    Image.new("RGB", (32, 32), "white").save(image_path)
+
+    class FailingRapidOCR:
+        def __call__(self, path):
+            raise RuntimeError("rapidocr failed")
+
+    monkeypatch.setitem(document_tools._OCR_ENGINES, "rapidocr", FailingRapidOCR())
+    monkeypatch.setenv("OPENCLAW_OCR_AUTO_BACKENDS", "rapidocr")
+    monkeypatch.delenv("OPENCLAW_OCR_ALLOW_EASYOCR", raising=False)
+    with pytest.raises(RuntimeError, match="rapidocr failed"):
+        document_tools._run_ocr(image_path, lang="en", engine="auto")
+    assert "easyocr" not in document_tools._OCR_ENGINES
+
+
+def test_ocr_prepares_headless_runtime_before_backend_import(monkeypatch, tmp_path):
+    image_path = tmp_path / "headless-canary.png"
+    Image.new("RGB", (32, 32), "white").save(image_path)
+    calls: list[bool] = []
+
+    class WorkingRapidOCR:
+        def __call__(self, path):
+            return [[[[0, 0], [1, 0], [1, 1], [0, 1]], ["LOCAL-OCR", 0.99]]]
+
+    monkeypatch.setattr(
+        document_tools,
+        "prepare_headless_ocr_runtime",
+        lambda: calls.append(True),
+    )
+    monkeypatch.setitem(document_tools._OCR_ENGINES, "rapidocr", WorkingRapidOCR())
+    engine, lines = document_tools._run_ocr(image_path, lang="en", engine="rapidocr")
+
+    assert calls == [True]
+    assert engine == "rapidocr"
+    assert lines[0]["text"] == "LOCAL-OCR"
+
+
+def test_auto_ocr_uses_only_provisioned_local_fallbacks(monkeypatch, tmp_path):
+    image_path = tmp_path / "offline-fallback.png"
+    Image.new("RGB", (32, 32), "white").save(image_path)
+
+    class FailingRapidOCR:
+        def __call__(self, path):
+            raise RuntimeError("rapidocr failed")
+
+    monkeypatch.setitem(document_tools._OCR_ENGINES, "rapidocr", FailingRapidOCR())
+    monkeypatch.setenv("OPENCLAW_OCR_AUTO_BACKENDS", "rapidocr,paddleocr,easyocr")
+    monkeypatch.setenv("OPENCLAW_PADDLEOCR_CACHE_DIR", str(tmp_path / "empty-cache"))
+    with pytest.raises(RuntimeError) as exc_info:
+        document_tools._run_ocr(image_path, lang="en", engine="auto")
+    message = str(exc_info.value)
+    assert "rapidocr failed" in message
+    assert "refusing to download" in message
+    assert "paddleocr" not in document_tools._OCR_ENGINES
+    assert "easyocr" not in document_tools._OCR_ENGINES
+
+
+def test_auto_ocr_uses_local_pdf_text_when_image_ocr_fails(monkeypatch, tmp_path):
+    import fitz
+
+    pdf_path = tmp_path / "selectable.pdf"
+    with fitz.open() as document:
+        page = document.new_page()
+        page.insert_text((72, 72), "PDF-TEXT-FALLBACK-42")
+        document.save(str(pdf_path))
+
+    class FailingRapidOCR:
+        def __call__(self, path):
+            raise RuntimeError("rapidocr failed")
+
+    monkeypatch.setitem(document_tools._OCR_ENGINES, "rapidocr", FailingRapidOCR())
+    monkeypatch.setenv("OPENCLAW_OCR_AUTO_BACKENDS", "rapidocr")
+    result = json.loads(
+        document_tools.ocr_region(
+            {
+                "document_path": str(pdf_path),
+                "page_number": 1,
+                "bbox": [0, 0, 1000, 1000],
+                "unit": "pixel",
+            }
+        )
+    )
+    assert result["status"] == "ok"
+    assert result["engine"] == "pdf_text_fallback"
+    assert "PDF-TEXT-FALLBACK-42" in result["text"]
+
+
+def test_easyocr_fallback_is_local_only_and_never_downloads_by_default(monkeypatch, tmp_path):
+    image_path = tmp_path / "easy-ocr.png"
+    Image.new("RGB", (32, 32), "white").save(image_path)
+
+    monkeypatch.setenv("OPENCLAW_PADDLEOCR_CACHE_DIR", str(tmp_path / "empty-cache"))
+    with pytest.raises(RuntimeError, match="refusing to download"):
+        document_tools._run_ocr(image_path, lang="en", engine="easyocr")
 
 
 def test_region_tools_pad_extreme_aspect_for_vlm(tmp_path):
