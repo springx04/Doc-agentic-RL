@@ -20,7 +20,9 @@ def git_repo(tmp_path: Path) -> Path:
     subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@localhost"], cwd=root, check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Code Tests"], cwd=root, check=True, capture_output=True)
-    subprocess.run(["git", "add", "-A"], cwd=root, check=True, capture_output=True)
+    # The fixture defines the complete task baseline.  Host-level Git excludes
+    # must not silently omit its test files on a CI or remote smoke node.
+    subprocess.run(["git", "add", "-f", "-A"], cwd=root, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True, capture_output=True)
     return root
 
