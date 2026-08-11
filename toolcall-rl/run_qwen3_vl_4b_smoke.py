@@ -37,9 +37,19 @@ EVAL_DATA = TOOLCALL_DIR / "qwen3_vl_smoke_eval.jsonl"
 DOCUMENT = TOOLCALL_DIR / "qwen3_vl_smoke_document.txt"
 DOCUMENT_ROOT: Path | None = None
 DOCUMENT_PROBE: Path | None = DOCUMENT
-OUTPUT_DIR = (PROJECT / "outputs" / "qwen3-vl-4b-openclaw-smoke-20260717-07").resolve()
+OUTPUT_DIR = Path(
+    os.environ.get(
+        "OPENCLAW_SMOKE_OUTPUT_DIR",
+        str(PROJECT / "outputs" / "qwen3-vl-4b-openclaw-smoke-20260811-2gpu-r19"),
+    )
+).resolve()
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
-RAY_TEMP_DIR = (WORKSPACE / ".ray" / "q3v4b07").resolve()
+RAY_TEMP_DIR = Path(
+    os.environ.get(
+        "OPENCLAW_SMOKE_RAY_TEMP_DIR",
+        str(WORKSPACE / ".ray" / "q3v4b-20260811-2gpu-r19"),
+    )
+).resolve()
 NUMA_RUNTIME_DIR = (WORKSPACE / "envs" / "openclaw-rl-qwen3vl-numa-20260717-01").resolve()
 NUMA_LIBRARY = NUMA_RUNTIME_DIR / "lib" / "libnuma.so.1"
 NUMA_MANIFEST = NUMA_RUNTIME_DIR / "openclaw_numa_manifest.json"
@@ -503,31 +513,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-# Imported allowlisted launchers may still carry an older diagnostic name.
-# Redirect validation and execution to a fresh immutable output directory.
-_validate_before_run12_redirect = validate
-
-
-def validate() -> dict[str, Any]:
-    global OUTPUT_DIR, CHECKPOINT_DIR, RAY_TEMP_DIR
-    if OUTPUT_DIR.name in {
-        "qwen3-vl-4b-docvqa-real-rl-test-20260720-05",
-        "qwen3-vl-4b-docvqa-real-rl-test-20260720-11",
-    }:
-        OUTPUT_DIR = OUTPUT_DIR.with_name("qwen3-vl-4b-docvqa-real-rl-test-20260720-12")
-        CHECKPOINT_DIR, RAY_TEMP_DIR = OUTPUT_DIR / "checkpoints", WORKSPACE / ".ray" / "q3v4b-real-20260720-12"
-    return _validate_before_run12_redirect()
-_validate_before_run23_redirect = validate
-
-def validate() -> dict[str, Any]:
-    global OUTPUT_DIR, CHECKPOINT_DIR, RAY_TEMP_DIR
-    if OUTPUT_DIR.name in {
-        "qwen3-vl-4b-docvqa-real-rl-test-20260720-05",
-        "qwen3-vl-4b-docvqa-real-rl-test-20260720-11",
-        "qwen3-vl-4b-docvqa-real-rl-test-20260720-12",
-    }:
-        OUTPUT_DIR = OUTPUT_DIR.with_name("qwen3-vl-4b-docvqa-real-rl-test-20260723-01")
-        CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
-        RAY_TEMP_DIR = WORKSPACE / ".ray" / "q3v4b-real-20260723-01"
-    return _validate_before_run23_redirect()
