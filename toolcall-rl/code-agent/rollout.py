@@ -165,6 +165,70 @@ async def _capture_branch_checkpoint(
     )
 
 
+async def capture_initial_branch_checkpoint(
+    sample: Mapping[str, Any],
+    *,
+    code_env_client: Any,
+    code_config: CodeConfig | None = None,
+    world: Any,
+) -> Any:
+    """Capture the root decision state for one concrete hidden world.
+
+    Stage C must branch *within* a world, not treat the four required worlds
+    as one GRPO group.  This helper makes the pre-action state explicit and
+    closes its parent lease before callers allocate independent child leases.
+    """
+
+    config = code_config or DEFAULT_CODE_CONFIG
+    public_sample = _public_sample(sample)
+    public_instance = public_sample["metadata"]["public_instance"]
+    instance_id = str(public_instance.get("instance_id") or "unknown-instance")
+    image_name = str(public_instance.get("image_name") or "")
+    base_revision = public_instance.get("base_revision")
+    problem = str(public_sample.get("text") or public_instance.get("problem_statement") or "")
+    try:
+        from .bayestool.task_state import CodeTaskStateView
+    except ImportError:  # pragma: no cover - direct PYTHONPATH execution
+        from bayestool.task_state import CodeTaskStateView
+
+    task_state = CodeTaskStateView(
+        instance_id,
+        problem,
+        str(public_instance.get("task_kind") or "bugfix"),
+        remaining_tool_budget=config.tool_budget,
+    )
+    belief = CodeBeliefFilter()
+    visible = build_policy_visible_belief(task_state, belief).to_prompt(
+        max_chars=config.belief_prompt_max_chars
+    )
+    messages = _prompt_messages(public_sample, visible)
+    lease = await code_env_client.allocate(
+        image_name, instance_id, cwd="/testbed", base_revision=base_revision
+    )
+    try:
+        runtime = CodeWorldRuntime(
+            world=world,
+            client=code_env_client,
+            lease_id=lease.lease_id,
+            cwd=lease.cwd,
+            task_state=task_state,
+            registry=DEFAULT_REGISTRY,
+        )
+        return await _capture_branch_checkpoint(
+            client=code_env_client,
+            lease=lease,
+            task_state=task_state,
+            runtime=runtime,
+            belief=belief,
+            messages=messages,
+            token_ids=[],
+            loss_mask=[],
+            log_probs=[],
+        )
+    finally:
+        await code_env_client.close(lease.lease_id)
+
+
 class CodeRollout:
     def __init__(self, *, settings: RolloutSettings | None = None, registry=DEFAULT_REGISTRY):
         self.settings = settings or RolloutSettings()
@@ -179,6 +243,7 @@ class CodeRollout:
         code_config: CodeConfig | None = None,
         world: Any = None,
         eval_script: str | None = None,
+        evaluator_patch: str = "",
         seed: int = 0,
         data_source: str = "",
         interaction_lease: Any = None,
@@ -353,9 +418,21 @@ class CodeRollout:
                 except Exception:
                     failure_origin = "real_infrastructure"
 
-        if eval_script is not None and candidate_patch and failure_origin != "real_infrastructure":
+        if candidate_patch and failure_origin != "real_infrastructure":
             evaluator_result = await CleanEvaluator(code_env_client).evaluate(
-                EvaluatorRequest(image_name=image_name, instance_id=instance_id, patch=candidate_patch, eval_script=eval_script, base_revision=base_revision, cwd="/testbed", timeout=config.evaluation_timeout)
+                EvaluatorRequest(
+                    image_name=image_name,
+                    instance_id=instance_id,
+                    patch=candidate_patch,
+                    # Only offline tests and isolated Stage smoke provide
+                    # these explicit values. Production Slime never does:
+                    # CleanEvaluator resolves its private catalog itself.
+                    eval_script=eval_script,
+                    evaluator_patch=evaluator_patch,
+                    base_revision=base_revision,
+                    cwd="/testbed",
+                    timeout=config.evaluation_timeout,
+                )
             )
             resolved = bool(evaluator_result.resolved)
             if evaluator_result.failure_origin == "real_infrastructure":
@@ -415,4 +492,4 @@ async def generate_code_trajectory(sample: Mapping[str, Any], model_client: Code
     return {**trajectory.to_sample(), "messages": [message.__dict__ for message in trajectory.messages], "trainer_only_metadata": trajectory.trainer_only_metadata}
 
 
-__all__ = ["CodeModelClient", "CodeRollout", "RolloutSettings", "generate_code_trajectory"]
+__all__ = ["CodeModelClient", "CodeRollout", "RolloutSettings", "capture_initial_branch_checkpoint", "generate_code_trajectory"]

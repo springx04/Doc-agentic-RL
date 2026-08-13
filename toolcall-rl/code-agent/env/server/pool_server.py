@@ -144,11 +144,11 @@ class CodeEnvPool:
         lease = self._lease(lease_id)
         return self._post_json(f"{lease.node_url}/container/diff", {"container_id": lease.container_id, "cwd": cwd}, timeout=60)
 
-    def evaluate(self, *, lease_id: str, patch: str, eval_script: str, cwd: str, timeout: int) -> dict[str, Any]:
+    def evaluate(self, *, lease_id: str, patch: str, eval_script: str, cwd: str, timeout: int, evaluator_patch: str = "") -> dict[str, Any]:
         lease = self._lease(lease_id)
         return self._post_json(
             f"{lease.node_url}/container/evaluate",
-            {"container_id": lease.container_id, "patch": patch, "eval_script": eval_script, "cwd": cwd, "timeout": timeout},
+            {"container_id": lease.container_id, "patch": patch, "eval_script": eval_script, "cwd": cwd, "timeout": timeout, "evaluator_patch": evaluator_patch},
             timeout=timeout + 60,
         )
 
@@ -225,7 +225,7 @@ def create_app(pool: CodeEnvPool) -> Flask:
             elif operation == "diff":
                 result = pool.diff(lease_id=lease_id, cwd=str(data.get("cwd") or "/testbed"))
             elif operation == "evaluate":
-                result = pool.evaluate(lease_id=lease_id, patch=str(data.get("patch") or ""), eval_script=str(data.get("eval_script") or ""), cwd=str(data.get("cwd") or "/testbed"), timeout=int(data.get("timeout", 300)))
+                result = pool.evaluate(lease_id=lease_id, patch=str(data.get("patch") or ""), eval_script=str(data.get("eval_script") or ""), cwd=str(data.get("cwd") or "/testbed"), timeout=int(data.get("timeout", 300)), evaluator_patch=str(data.get("evaluator_patch") or ""))
             else:
                 pool.close(lease_id)
                 result = {"ok": True}

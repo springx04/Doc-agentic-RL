@@ -175,10 +175,11 @@ class CodeEnvClient:
         *,
         cwd: str | None = None,
         timeout: int = 300,
+        evaluator_patch: str = "",
     ) -> CodeEvalResult:
         result = await self._post(
             "/evaluate",
-            {"lease_id": lease_id, "patch": patch, "eval_script": eval_script, "cwd": cwd or self._lease_cwd(lease_id), "timeout": timeout},
+            {"lease_id": lease_id, "patch": patch, "eval_script": eval_script, "cwd": cwd or self._lease_cwd(lease_id), "timeout": timeout, "evaluator_patch": evaluator_patch},
             timeout=float(timeout) + 120.0,
         )
         if not result.get("ok", False):
@@ -266,11 +267,15 @@ class LocalCodeEnvClient:
         executor = self._require(lease_id)
         return await executor.reset_to_patch(patch)
 
-    async def evaluate(self, lease_id: str, patch: str, eval_script: str, *, cwd: str | None = None, timeout: int = 300) -> CodeEvalResult:
+    async def evaluate(self, lease_id: str, patch: str, eval_script: str, *, cwd: str | None = None, timeout: int = 300, evaluator_patch: str = "") -> CodeEvalResult:
         executor = self._require(lease_id)
         reset = await executor.reset_to_patch("")
         if not reset.ok:
             return CodeEvalResult(False, False, reset.returncode, reset.output, "reset failed", lease_id, "real_infrastructure")
+        if evaluator_patch:
+            evaluator_applied = await executor.apply_patch(evaluator_patch)
+            if not evaluator_applied.ok:
+                return CodeEvalResult(False, False, evaluator_applied.returncode, evaluator_applied.output, "evaluator-private patch apply failed", lease_id, evaluator_applied.failure_origin)
         applied = await executor.apply_patch(patch)
         if not applied.ok:
             return CodeEvalResult(True, False, applied.returncode, applied.output, "patch apply failed", lease_id)

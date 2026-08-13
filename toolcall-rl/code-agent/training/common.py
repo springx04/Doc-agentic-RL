@@ -79,8 +79,15 @@ def evaluator_script_for_instance(instance: SWEInstance, override: str | None = 
     return None
 
 
+def evaluator_patch_for_instance(instance: SWEInstance) -> str:
+    """Return the hidden official test patch for clean evaluation only."""
+
+    value = instance.evaluator_private.values.get("test_patch")
+    return str(value) if isinstance(value, str) else ""
+
+
 def choose_seed(seed: int, index: int) -> int:
     return random.Random(seed + index * 1009).randrange(0, 2**31 - 1)
 
 
-__all__ = ["ScriptedModelClient", "choose_seed", "default_sample", "evaluator_script_for_instance", "load_instances", "make_local_client", "repository_public_context", "write_json"]
+__all__ = ["ScriptedModelClient", "choose_seed", "default_sample", "evaluator_patch_for_instance", "evaluator_script_for_instance", "load_instances", "make_local_client", "repository_public_context", "write_json"]
