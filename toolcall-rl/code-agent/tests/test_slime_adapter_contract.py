@@ -9,7 +9,7 @@ def test_multiturn_training_sequence_keeps_observations_as_zero_loss_context():
     client._latest_full_ids = [10, 11, 21, 22, 30, 31, 41]
     client._action_spans = [(0, 2, [-1.0, -1.1]), (4, 1, [-1.2])]
     tokens, mask, logprobs = client.training_sequence()
-    assert tokens == [21, 22, 30, 31, 41]
+    assert tokens == [10, 11, 21, 22, 30, 31, 41]
     assert mask == [1, 1, 0, 0, 1]
     assert logprobs == [-1.0, -1.1, 0.0, 0.0, -1.2]
 

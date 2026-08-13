@@ -95,7 +95,7 @@ class SGLangCodeModelClient:
         }
 
     def training_sequence(self) -> tuple[list[int], list[int], list[float]]:
-        """Return the full multi-turn suffix with tool observations masked off.
+        """Return full tokens plus a trainable suffix with observations off.
 
         The trainer must replay the same observation-conditioned context used
         during generation.  Only action spans receive loss weight one; all
@@ -105,12 +105,18 @@ class SGLangCodeModelClient:
         if self._initial_prompt_ids is None or self._latest_full_ids is None:
             raise RuntimeError("Code generation produced no tokenized trajectory")
         prefix = len(self._initial_prompt_ids)
-        tokens = self._latest_full_ids[prefix:]
-        mask = [0] * len(tokens)
-        logprobs = [0.0] * len(tokens)
+        # FSDP packs the full input but expects response_length/loss_mask and
+        # rollout logprobs to describe only its trailing response segment.
+        # Retaining the initial task prompt here is essential: otherwise the
+        # actor recomputes later action probabilities without the condition
+        # that the rollout server used.
+        tokens = list(self._latest_full_ids)
+        suffix_length = len(tokens) - prefix
+        mask = [0] * suffix_length
+        logprobs = [0.0] * suffix_length
         for start, length, action_logprobs in self._action_spans:
             end = start + length
-            if start < 0 or end > len(tokens) or len(action_logprobs) != length:
+            if start < 0 or end > suffix_length or len(action_logprobs) != length:
                 raise RuntimeError("Code action token span is inconsistent with the final multi-turn sequence")
             mask[start:end] = [1] * length
             logprobs[start:end] = action_logprobs
