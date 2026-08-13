@@ -24,6 +24,8 @@ python "${CODE_SLIME_ROOT}/train.py" \
   --rollout-function-path slime.rollout.sglang_rollout.generate_rollout \
   --custom-generate-function-path slime_adapter.generate \
   --custom-rm-path slime_adapter.reward_func \
+  --custom-convert-samples-to-train-data-path slime_train_data.convert_samples_to_train_data \
+  --bayestool-enable \
   --num-rollout "${CODE_NUM_ROLLOUTS:-25}" \
   --rollout-batch-size "${CODE_ROLLOUT_BATCH_SIZE:-4}" \
   --n-samples-per-prompt 1 \

@@ -274,6 +274,7 @@ async def generate_stage_c(args: Any, sample: Sample, sampling_params: Mapping[s
                     child.metadata = {
                         **dict(sample.metadata or {}),
                         "environment": "code",
+                        "instance_id": instance_id,
                         "valid_for_rl": bool(metadata.get("valid_for_rl", False)),
                         "coupling_id": world.coupling_id,
                         "latent_world_id": world.latent_world_id,
@@ -282,6 +283,7 @@ async def generate_stage_c(args: Any, sample: Sample, sampling_params: Mapping[s
                         "decision_group_size": group_size,
                         "selected_decision_event": "root",
                         "decision_prefix_hash": parent.decision_prefix_hash,
+                        "repo_state_digest": parent.repo.repo_state_digest,
                         "initial_input_hash": parent.repo.repo_state_digest,
                         "runtime_state_digest": parent.runtime_state_digest,
                         "variant_id": sibling.variant_id,
