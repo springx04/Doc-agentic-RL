@@ -232,7 +232,12 @@ class LocalCodeEnvClient:
         subprocess.run(["git", "init", "-q"], cwd=destination, capture_output=True, check=True)
         subprocess.run(["git", "config", "user.email", "code-agent@localhost"], cwd=destination, capture_output=True, check=True)
         subprocess.run(["git", "config", "user.name", "Code Agent"], cwd=destination, capture_output=True, check=True)
-        subprocess.run(["git", "add", "-A"], cwd=destination, capture_output=True, check=True)
+        # The host may have a global excludes file (for example one that
+        # ignores generated-looking test names).  A lease baseline must
+        # contain every file copied from the task repository: otherwise a
+        # later clean evaluation can delete an ignored-but-required test or
+        # source file.  ``-f`` applies only to this disposable repository.
+        subprocess.run(["git", "add", "-f", "-A"], cwd=destination, capture_output=True, check=True)
         subprocess.run(["git", "commit", "-qm", "local lease base"], cwd=destination, capture_output=True, check=True)
         lease_id = uuid.uuid4().hex
         lease = CodeLease(lease_id, instance_id, image, str(destination), base_revision, "local", "active", time.time(), time.time())
