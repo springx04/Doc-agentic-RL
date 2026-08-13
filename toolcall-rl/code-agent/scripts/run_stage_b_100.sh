@@ -15,7 +15,9 @@ if [ "${CODE_NUM_ROLLOUTS:-25}" -ne 25 ] || [ "${CODE_ROLLOUT_BATCH_SIZE:-4}" -n
   exit 2
 fi
 
-export PYTHONPATH="${CODE_SLIME_ROOT}:${CODE_SLIME_ROOT}/../toolcall-rl/code-agent${PYTHONPATH:+:${PYTHONPATH}}"
+CODE_AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CODE_GPU_COUNT="${CODE_GPU_COUNT:-2}"
+export PYTHONPATH="${CODE_SLIME_ROOT}:${CODE_AGENT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export CODE_EVALUATOR_MANIFEST
 export CODE_STAGE="${CODE_STAGE:-C}"
 export CODE_STAGE_C_GROUP_SIZE="${CODE_STAGE_C_GROUP_SIZE:-4}"
@@ -31,6 +33,11 @@ python "${CODE_SLIME_ROOT}/train.py" \
   --custom-rm-path slime_adapter.reward_func \
   --custom-convert-samples-to-train-data-path slime_train_data.convert_samples_to_train_data \
   --train-backend fsdp \
+  --actor-num-gpus-per-node "${CODE_GPU_COUNT}" \
+  --num-gpus-per-node "${CODE_GPU_COUNT}" \
+  --rollout-num-gpus "${CODE_GPU_COUNT}" \
+  --rollout-num-gpus-per-engine 1 \
+  --colocate \
   --use-rollout-logprobs \
   --num-rollout "${CODE_NUM_ROLLOUTS:-25}" \
   --rollout-batch-size "${CODE_ROLLOUT_BATCH_SIZE:-4}" \

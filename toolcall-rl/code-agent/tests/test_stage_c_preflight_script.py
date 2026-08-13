@@ -19,3 +19,6 @@ def test_stage_c_launcher_is_code_only_and_uses_full_expanded_batch():
     assert "--global-batch-size \"${CODE_GLOBAL_BATCH_SIZE:-64}\"" in script
     assert "--bayestool-enable" not in script
     assert "25 rollouts x 4 tasks" in script
+    assert "--colocate" in script
+    assert "--actor-num-gpus-per-node \"${CODE_GPU_COUNT}\"" in script
+    assert script.index('CODE_AGENT_DIR=') < script.index('export PYTHONPATH=')
