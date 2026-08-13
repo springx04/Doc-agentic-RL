@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any
 
 try:
@@ -20,6 +21,16 @@ class EvaluatorRequest:
     base_revision: str | None = None
     cwd: str = "/testbed"
     timeout: int = 300
+    evaluator_patch: str = ""
+
+
+_PATCH_PATH_RE = re.compile(r"^(?:---|\+\+\+)\s+(?:a/|b/)?([^\t\n]+)", re.M)
+
+
+def patch_paths(patch: str) -> set[str]:
+    """Return repository-relative files changed by a unified patch."""
+
+    return {path.strip() for path in _PATCH_PATH_RE.findall(patch) if path.strip() and path.strip() != "/dev/null"}
 
 
 class CleanEvaluator:
@@ -37,14 +48,20 @@ class CleanEvaluator:
                 cwd=request.cwd,
                 base_revision=request.base_revision,
             )
+            # The official hidden test patch is applied only in this clean
+            # evaluator lease.  Reject candidate edits to the same paths so a
+            # policy cannot gain reward by changing withheld tests.
+            if request.evaluator_patch and patch_paths(request.patch) & patch_paths(request.evaluator_patch):
+                return CodeEvalResult(ok=True, resolved=False, output="candidate patch overlaps evaluator-private test paths", lease_id=lease.lease_id)
             # The remote evaluate endpoint resets before applying the patch;
-            # local clients implement the same contract explicitly.
+            # both backends apply evaluator_patch only after that reset.
             result = await self.client.evaluate(
                 lease.lease_id,
                 request.patch,
                 request.eval_script,
                 cwd=lease.cwd,
                 timeout=request.timeout,
+                evaluator_patch=request.evaluator_patch,
             )
             return result
         except Exception as exc:
@@ -83,4 +100,4 @@ async def evaluate_clean_patch(
     )
 
 
-__all__ = ["CleanEvaluator", "EvaluatorRequest", "evaluate_clean_patch"]
+__all__ = ["CleanEvaluator", "EvaluatorRequest", "evaluate_clean_patch", "patch_paths"]

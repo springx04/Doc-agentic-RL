@@ -65,3 +65,53 @@ def test_local_lease_baseline_includes_files_ignored_by_host_config(git_repo, tm
         await client.close(lease.lease_id)
 
     asyncio.run(run())
+
+
+def test_clean_evaluator_applies_private_test_patch_without_exposing_it(git_repo):
+    evaluator_patch = """diff --git a/hidden_oracle.py b/hidden_oracle.py
+new file mode 100644
+--- /dev/null
++++ b/hidden_oracle.py
+@@ -0,0 +1,2 @@
++from app import VALUE
++
++assert VALUE == 2
+"""
+    candidate_patch = """diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -1 +1 @@
+-VALUE = 1
++VALUE = 2
+"""
+
+    async def run():
+        result = await CleanEvaluator(LocalCodeEnvClient(git_repo)).evaluate(
+            EvaluatorRequest("local", "private-test", candidate_patch, "python -c \"import hidden_oracle\"", timeout=60, evaluator_patch=evaluator_patch)
+        )
+        assert result.ok and result.resolved
+        assert "hidden_oracle" not in result.output
+
+    asyncio.run(run())
+
+
+def test_clean_evaluator_rejects_candidate_patch_to_private_test_path(git_repo):
+    private_test_patch = """diff --git a/test_app.py b/test_app.py
+--- a/test_app.py
++++ b/test_app.py
+@@ -1,4 +1,4 @@
+ from app import VALUE
+ 
+ def test_value():
+-    assert VALUE == 2
++    assert VALUE == 3
+"""
+
+    async def run():
+        result = await CleanEvaluator(LocalCodeEnvClient(git_repo)).evaluate(
+            EvaluatorRequest("local", "private-path", private_test_patch, "python -m pytest -q", timeout=60, evaluator_patch=private_test_patch)
+        )
+        assert result.ok and not result.resolved
+        assert "evaluator-private" in result.output
+
+    asyncio.run(run())

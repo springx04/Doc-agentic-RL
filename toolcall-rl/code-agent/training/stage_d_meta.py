@@ -14,7 +14,7 @@ try:
     from ..data.manifests import load_and_validate_capabilities
     from ..env.client import LocalCodeEnvClient
     from ..rollout import generate_code_trajectory
-    from .common import ScriptedModelClient, default_sample, evaluator_script_for_instance, load_instances, repository_public_context, write_json
+    from .common import ScriptedModelClient, default_sample, evaluator_patch_for_instance, evaluator_script_for_instance, load_instances, repository_public_context, write_json
     from ..bayestool.world_sampler import public_sampling_context, sample_required_worlds
 except ImportError:  # pragma: no cover
     from bayestool.belief import CodeBeliefFilter
@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover
     from data.manifests import load_and_validate_capabilities
     from env.client import LocalCodeEnvClient
     from rollout import generate_code_trajectory
-    from training.common import ScriptedModelClient, default_sample, evaluator_script_for_instance, load_instances, repository_public_context, write_json
+    from training.common import ScriptedModelClient, default_sample, evaluator_patch_for_instance, evaluator_script_for_instance, load_instances, repository_public_context, write_json
     from bayestool.world_sampler import public_sampling_context, sample_required_worlds
 
 
@@ -37,7 +37,7 @@ class PersistentCodeSession:
         # patch, inspection, or path-local state crosses task boundaries.
         context = public_sampling_context(**repository_public_context(repository_root, tool_budget=DEFAULT_CODE_CONFIG.tool_budget))
         world = sample_required_worlds(instance_id=instance.public.instance_id, image_name=instance.public.image_name or "local", base_revision=instance.public.base_revision, context=context, rollout_seed=seed)[0]
-        result = await generate_code_trajectory(default_sample(instance), model_client, LocalCodeEnvClient(repository_root), DEFAULT_CODE_CONFIG, world=world, eval_script=evaluator_script_for_instance(instance), seed=seed, data_source=instance.public.data_source)
+        result = await generate_code_trajectory(default_sample(instance), model_client, LocalCodeEnvClient(repository_root), DEFAULT_CODE_CONFIG, world=world, eval_script=evaluator_script_for_instance(instance), evaluator_patch=evaluator_patch_for_instance(instance), seed=seed, data_source=instance.public.data_source)
         for event in result.get("trainer_only_metadata", {}).get("events", []):
             tool = str(event.get("tool") or event.get("tool_name") or "")
             if tool:

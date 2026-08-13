@@ -142,13 +142,18 @@ def create_app() -> "Flask":
         data = request.get_json(force=True) or {}
         container_id = str(data.get("container_id") or data.get("lease_id") or "")
         patch = str(data.get("patch") or "")
+        evaluator_patch = str(data.get("evaluator_patch") or "")
         script = str(data.get("eval_script") or "")
         cwd = str(data.get("cwd") or "/testbed")
         timeout = int(data.get("timeout", 300))
-        if not _patch_valid(patch):
+        if not _patch_valid(patch) or (evaluator_patch and not _patch_valid(evaluator_patch)):
             return jsonify({"ok": True, "resolved": False, "error": "invalid patch"})
         encoded = base64.b64encode(patch.encode("utf-8")).decode("ascii")
-        apply_command = f"git reset --hard HEAD && git clean -fd && python -c \"import base64,pathlib;pathlib.Path('/tmp/code-agent.patch').write_bytes(base64.b64decode('{encoded}'))\" && git apply --intent-to-add --whitespace=nowarn /tmp/code-agent.patch"
+        evaluator_encoded = base64.b64encode(evaluator_patch.encode("utf-8")).decode("ascii")
+        apply_command = f"git reset --hard HEAD && git clean -fd && python -c \"import base64,pathlib;pathlib.Path('/tmp/code-agent-evaluator.patch').write_bytes(base64.b64decode('{evaluator_encoded}'));pathlib.Path('/tmp/code-agent.patch').write_bytes(base64.b64decode('{encoded}'))\""
+        if evaluator_patch:
+            apply_command += " && git apply --intent-to-add --whitespace=nowarn /tmp/code-agent-evaluator.patch"
+        apply_command += " && git apply --intent-to-add --whitespace=nowarn /tmp/code-agent.patch"
         applied = _docker("exec", "-w", cwd, container_id, "bash", "-lc", apply_command, timeout=120)
         if applied.returncode != 0:
             return jsonify({"ok": True, "resolved": False, "apply_returncode": applied.returncode, "error": applied.stderr})

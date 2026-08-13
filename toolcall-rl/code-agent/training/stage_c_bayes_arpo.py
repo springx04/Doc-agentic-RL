@@ -19,7 +19,7 @@ try:
     from ..data.manifests import load_and_validate_capabilities
     from ..env.client import LocalCodeEnvClient
     from ..rollout import CodeRollout, generate_code_trajectory
-    from .common import ScriptedModelClient, default_sample, evaluator_script_for_instance, load_instances, repository_public_context, write_json
+    from .common import ScriptedModelClient, default_sample, evaluator_patch_for_instance, evaluator_script_for_instance, load_instances, repository_public_context, write_json
 except ImportError:  # pragma: no cover
     from bayestool.grouping import decision_group_id, decision_prefix_hash, validate_decision_group
     from bayestool.world_sampler import public_sampling_context, sample_required_worlds
@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover
     from data.manifests import load_and_validate_capabilities
     from env.client import LocalCodeEnvClient
     from rollout import CodeRollout, generate_code_trajectory
-    from training.common import ScriptedModelClient, default_sample, evaluator_script_for_instance, load_instances, repository_public_context, write_json
+    from training.common import ScriptedModelClient, default_sample, evaluator_patch_for_instance, evaluator_script_for_instance, load_instances, repository_public_context, write_json
 
 
 async def run_stage_c_smoke(
@@ -82,7 +82,7 @@ async def run_stage_c_smoke(
         try:
             for sibling in siblings:
                 model = model_factory()
-                trajectory = await generate_code_trajectory(default_sample(instance), model, client, DEFAULT_CODE_CONFIG, world=world, eval_script=evaluator_script_for_instance(instance, eval_script), seed=seed, interaction_lease=sibling.lease, branch_checkpoint=sibling.checkpoint, data_source=instance.public.data_source)
+                trajectory = await generate_code_trajectory(default_sample(instance), model, client, DEFAULT_CODE_CONFIG, world=world, eval_script=evaluator_script_for_instance(instance, eval_script), evaluator_patch=evaluator_patch_for_instance(instance), seed=seed, interaction_lease=sibling.lease, branch_checkpoint=sibling.checkpoint, data_source=instance.public.data_source)
                 row = {
                     "environment": "code", "instance_id": world.instance_id, "latent_world_id": world.latent_world_id, "world_slot_role": world.world_slot_role,
                     "coupling_id": world.coupling_id, "decision_group_id": group_id, "variant_id": sibling.variant_id, "repo_state_digest": parent_repo.repo_state_digest,

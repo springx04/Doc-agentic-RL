@@ -179,6 +179,7 @@ class CodeRollout:
         code_config: CodeConfig | None = None,
         world: Any = None,
         eval_script: str | None = None,
+        evaluator_patch: str = "",
         seed: int = 0,
         data_source: str = "",
         interaction_lease: Any = None,
@@ -355,7 +356,7 @@ class CodeRollout:
 
         if eval_script is not None and candidate_patch and failure_origin != "real_infrastructure":
             evaluator_result = await CleanEvaluator(code_env_client).evaluate(
-                EvaluatorRequest(image_name=image_name, instance_id=instance_id, patch=candidate_patch, eval_script=eval_script, base_revision=base_revision, cwd="/testbed", timeout=config.evaluation_timeout)
+                EvaluatorRequest(image_name=image_name, instance_id=instance_id, patch=candidate_patch, eval_script=eval_script, base_revision=base_revision, cwd="/testbed", timeout=config.evaluation_timeout, evaluator_patch=evaluator_patch)
             )
             resolved = bool(evaluator_result.resolved)
             if evaluator_result.failure_origin == "real_infrastructure":
