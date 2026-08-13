@@ -21,10 +21,26 @@ if ! command -v docker >/dev/null 2>&1; then
   apt-get update
   apt-get install -y --no-install-recommends docker.io python3-venv git ca-certificates
 fi
-systemctl enable --now docker 2>/dev/null || service docker start 2>/dev/null || true
-docker info >/dev/null
 
 mkdir -p "$CODE_RUNTIME_ROOT" "$CODE_OUTPUT_DIR" "$(dirname "$CODE_REPO_ROOT")"
+CODE_DOCKER_SOCKET="${CODE_DOCKER_SOCKET:-${CODE_RUNTIME_ROOT}/docker.sock}"
+CODE_DOCKER_DATA_ROOT="${CODE_DOCKER_DATA_ROOT:-${CODE_RUNTIME_ROOT}/docker-data}"
+CODE_DOCKER_EXEC_ROOT="${CODE_DOCKER_EXEC_ROOT:-${CODE_RUNTIME_ROOT}/docker-exec}"
+if ! docker -H "unix://${CODE_DOCKER_SOCKET}" info >/dev/null 2>&1; then
+  rm -f "$CODE_DOCKER_SOCKET"
+  nohup dockerd \
+    --host "unix://${CODE_DOCKER_SOCKET}" \
+    --data-root "$CODE_DOCKER_DATA_ROOT" \
+    --exec-root "$CODE_DOCKER_EXEC_ROOT" \
+    --pidfile "${CODE_RUNTIME_ROOT}/dockerd.pid" \
+    --iptables=false --ip-masq=false --bridge=none --storage-driver=vfs \
+    >"${CODE_RUNTIME_ROOT}/dockerd.log" 2>&1 &
+  for _ in $(seq 1 30); do
+    if docker -H "unix://${CODE_DOCKER_SOCKET}" info >/dev/null 2>&1; then break; fi
+    sleep 1
+  done
+fi
+docker -H "unix://${CODE_DOCKER_SOCKET}" info >/dev/null
 if [ ! -d "$CODE_REPO_ROOT/.git" ]; then
   git clone --filter=blob:none --no-checkout "$CODE_REPOSITORY_URL" "$CODE_REPO_ROOT"
 fi
@@ -48,6 +64,7 @@ export CODE_SLIME_ROOT='$CODE_SLIME_ROOT'
 export CODE_OUTPUT_DIR='$CODE_OUTPUT_DIR'
 export CODE_ENV_SERVER_URL='http://127.0.0.1:18091'
 export CODE_EXEC_SERVER_URLS='http://127.0.0.1:18092'
+export DOCKER_HOST='unix://$CODE_DOCKER_SOCKET'
 export PATH='$CODE_VENV/bin':\$PATH
 EOF
 echo "code_runtime_provisioned=$CODE_RUNTIME_ROOT"
