@@ -12,6 +12,8 @@ set -euo pipefail
 
 export PYTHONPATH="${CODE_SLIME_ROOT}:${CODE_SLIME_ROOT}/../toolcall-rl/code-agent${PYTHONPATH:+:${PYTHONPATH}}"
 export CODE_EVALUATOR_MANIFEST
+export CODE_STAGE="${CODE_STAGE:-C}"
+export CODE_STAGE_C_GROUP_SIZE="${CODE_STAGE_C_GROUP_SIZE:-4}"
 mkdir -p "${CODE_OUTPUT_DIR}" "${CODE_OUTPUT_DIR}/checkpoints" "${CODE_OUTPUT_DIR}/logs"
 
 python "${CODE_SLIME_ROOT}/train.py" \
@@ -25,6 +27,7 @@ python "${CODE_SLIME_ROOT}/train.py" \
   --num-rollout "${CODE_NUM_ROLLOUTS:-25}" \
   --rollout-batch-size "${CODE_ROLLOUT_BATCH_SIZE:-4}" \
   --n-samples-per-prompt 1 \
+  --advantage-estimator bayes_grpo \
   --rollout-max-response-len "${CODE_MAX_RESPONSE_TOKENS:-4096}" \
   --save "${CODE_OUTPUT_DIR}/checkpoints" \
   --save-interval "${CODE_SAVE_INTERVAL:-5}" \
