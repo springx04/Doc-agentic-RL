@@ -101,7 +101,7 @@ def test_clean_evaluator_rejects_candidate_patch_to_private_test_path(git_repo):
 +++ b/test_app.py
 @@ -1,4 +1,4 @@
  from app import VALUE
- 
+
  def test_value():
 -    assert VALUE == 2
 +    assert VALUE == 3
